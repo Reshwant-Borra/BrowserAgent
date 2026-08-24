@@ -12,12 +12,14 @@ browser backend.
 - [Playwright](https://playwright.dev/python/) (installed as a dependency; browser binaries installed separately, see below)
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) built with server support (`llama-server`)
 - A Qwen3-8B GGUF model (Q4_K_M or Q5_K_M recommended for 8-12GB VRAM)
+- Optional: [Ollama](https://ollama.com/) for the `ollama` backend
 
 ## Installation
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # macOS/Linux
+# .venv\Scripts\activate      # Windows
 pip install -e ".[dev]"
 ```
 
@@ -40,11 +42,33 @@ llama-server -m /path/to/your/qwen3-8b-Q4_K_M.gguf --host 127.0.0.1 --port 8080
 `config/default.yaml` points at `http://127.0.0.1:8080` by default; override with
 `BROWSER_AGENT_MODEL__ENDPOINT=http://host:port` or `--config path/to/other.yaml`.
 
+### Starting Ollama
+
+llama.cpp remains the default backend. To use Ollama on macOS:
+
+```bash
+brew install ollama
+brew services start ollama
+ollama pull qwen3:8b
+```
+
+Run tests or tasks with the Ollama backend selected:
+
+```bash
+export BROWSER_AGENT_MODEL__BACKEND=ollama
+export BROWSER_AGENT_MODEL__ENDPOINT=http://127.0.0.1:11434
+export BROWSER_AGENT_MODEL__MODEL_NAME=qwen3:8b
+pytest -m model
+```
+
+Ollama support uses native JSON Schema structured output for action decisions; llama.cpp
+support continues to use the existing GBNF grammar.
+
 ## Running the test suite
 
 ```bash
 pytest -m "not model"     # deterministic unit + integration tests (no live model server needed)
-pytest -m model           # live smoke test against a running llama.cpp server (see below)
+pytest -m model           # live smoke test against the configured local model backend
 ```
 
 Integration tests spin up Playwright against a local static fixture site
@@ -52,7 +76,7 @@ Integration tests spin up Playwright against a local static fixture site
 and drive the real agent loop with a *scripted* (non-live) model client
 (`tests/integration/fake_llama.py`) — this proves the deterministic machinery (observation,
 verification, recovery, event sourcing) works correctly without depending on model quality.
-Only `pytest -m model` tests exercise an actual Qwen3-8B/llama.cpp call end-to-end.
+Only `pytest -m model` tests exercise an actual local-model call end-to-end.
 
 ## Starting an agent task
 

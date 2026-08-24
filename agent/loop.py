@@ -36,7 +36,7 @@ from agent.schemas import (
 from agent import verifier as verifier_mod
 from browser.page_model import ElementRef, PageObservation
 from browser.playwright_backend import PlaywrightBackend
-from inference.llama_client import LlamaClient, ModelUnavailableError
+from inference.llama_client import ModelUnavailableError, create_inference_client
 from memory.event_store import EventStore, EventType
 from memory.models import TaskRecord, TaskState
 from memory.task_state import TaskStateStore
@@ -54,7 +54,7 @@ class AgentLoop:
 
         self.event_store = EventStore(self.db_path)
         self.state_store = TaskStateStore(self.event_store)
-        self.llama = LlamaClient(config.model.endpoint, config.model.temperature, config.model.request_timeout_s)
+        self.llama = create_inference_client(config)
         self.browser = PlaywrightBackend(
             self.profile_dir, config.browser.headless, config.browser.action_timeout_ms,
             config.context.max_page_chars, config.context.max_visible_text_items,
@@ -209,7 +209,8 @@ class AgentLoop:
                           output_tokens=completion.predicted_tokens, prompt_ms=completion.prompt_ms,
                           predicted_ms=completion.predicted_ms, total_latency_ms=completion.total_latency_ms,
                           recovery_level=state.recovery_level, page_element_count=observation.element_count,
-                          page_char_count=observation.char_count, endpoint=self.llama.endpoint)
+                          page_char_count=observation.char_count, endpoint=self.llama.endpoint,
+                          model_backend=self.config.model.backend, model_name=self.config.model.model_name)
 
         try:
             decision = parse_model_output(completion.text)

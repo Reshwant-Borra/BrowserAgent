@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, get_type_hints
 
 import yaml
 
@@ -18,9 +18,11 @@ _ENV_PREFIX = "BROWSER_AGENT_"
 
 @dataclass
 class ModelConfig:
+    backend: str = "llama_cpp"
     endpoint: str = "http://127.0.0.1:8080"
     model_name: str = "qwen3-8b"
     temperature: float = 0.1
+    context_window: int = 8192
     max_output_tokens: int = 256
     max_output_tokens_deep_recovery: int = 512
     request_timeout_s: float = 30.0
@@ -91,7 +93,7 @@ def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _coerce(dataclass_type: type, values: dict[str, Any]):
-    field_types = {f.name: f.type for f in dataclass_type.__dataclass_fields__.values()}
+    field_types = get_type_hints(dataclass_type)
     coerced = {}
     for k, v in values.items():
         if k not in field_types:
