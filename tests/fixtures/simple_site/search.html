@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Search</title></head>
+<body>
+  <h1>Search</h1>
+  <input type="text" id="q" placeholder="Search" />
+  <button id="go" onclick="doSearch()">Search</button>
+  <div id="results"></div>
+  <script>
+    const data = [
+      {name: "alpha", href: "/alpha_detail.html"},
+      {name: "beta", href: "/beta_detail.html"},
+    ];
+    function doSearch() {
+      const q = document.getElementById('q').value.toLowerCase();
+      const results = document.getElementById('results');
+      results.innerHTML = '';
+      data.filter(d => d.name.includes(q)).forEach(d => {
+        const a = document.createElement('a');
+        a.href = d.href;
+        a.textContent = 'Result: ' + d.name;
+        results.appendChild(a);
+      });
+    }
+  </script>
+</body>
+</html>

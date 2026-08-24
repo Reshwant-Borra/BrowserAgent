@@ -1,0 +1,206 @@
+"""Compact browser-state extraction.
+
+One `page.evaluate()` round trip gathers every interactive element and a bounded set of
+visible text snippets in a single JS pass (cheaper and simpler than N Playwright
+round trips). The same CANONICAL_INTERACTIVE_SELECTOR string is used here to enumerate
+elements and later by `playwright_backend.py` to re-resolve `(selector, nth)` back to a
+live locator — the two sides only ever agree on element identity because they query the
+same DOM with the same selector, never because a handle was cached across observations.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+from browser.page_model import ElementRef, PageObservation, SelectorHint
+from browser.state_hash import compute_state_hash
+
+CANONICAL_INTERACTIVE_SELECTOR = (
+    "a[href], button, input:not([type=hidden]), select, textarea, "
+    "[role=button], [role=link], [role=checkbox], [role=radio], "
+    "[role=tab], [role=menuitem], [role=combobox], [role=textbox]"
+)
+
+CANONICAL_TEXT_SELECTOR = "h1, h2, h3, h4, h5, h6, p, li, span"
+
+CANONICAL_MODAL_SELECTOR = '[role="dialog"]'
+
+# Executed in the page context. Returns plain-JSON-serializable data only.
+_EXTRACTION_JS = """
+([interactiveSel, textSel, modalSel]) => {
+  function isVisible(el) {
+    if (el.hasAttribute('hidden')) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    if (el.offsetParent === null && style.position !== 'fixed') return false;
+    return true;
+  }
+
+  function accessibleName(el) {
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel) return ariaLabel.trim();
+
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const parts = labelledBy.split(/\\s+/).map(id => {
+        const ref = document.getElementById(id);
+        return ref ? ref.textContent.trim() : '';
+      }).filter(Boolean);
+      if (parts.length) return parts.join(' ');
+    }
+
+    if (el.id) {
+      const label = document.querySelector(`label[for="${el.id}"]`);
+      if (label && label.textContent.trim()) return label.textContent.trim();
+    }
+    const parentLabel = el.closest('label');
+    if (parentLabel && parentLabel.textContent.trim()) return parentLabel.textContent.trim();
+
+    const placeholder = el.getAttribute('placeholder');
+    if (placeholder) return placeholder.trim();
+
+    const title = el.getAttribute('title');
+    if (title) return title.trim();
+
+    if (el.tagName === 'INPUT' && (el.type === 'image')) {
+      const alt = el.getAttribute('alt');
+      if (alt) return alt.trim();
+    }
+
+    if (el.tagName === 'INPUT' && ['submit', 'button'].includes(el.type) && el.value) {
+      return el.value.trim();
+    }
+
+    const text = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (text) return text.slice(0, 120);
+
+    return el.tagName.toLowerCase();
+  }
+
+  function roleOf(el) {
+    const explicit = el.getAttribute('role');
+    if (explicit) return explicit;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'a') return 'link';
+    if (tag === 'button') return 'button';
+    if (tag === 'select') return 'select';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'input') {
+      const t = (el.getAttribute('type') || 'text').toLowerCase();
+      if (t === 'checkbox') return 'checkbox';
+      if (t === 'radio') return 'radio';
+      if (['submit', 'button', 'image'].includes(t)) return 'button';
+      return 'textbox';
+    }
+    return tag;
+  }
+
+  const interactiveNodes = Array.from(document.querySelectorAll(interactiveSel));
+  const elements = [];
+  interactiveNodes.forEach((el, idx) => {
+    if (!isVisible(el)) return;
+    const role = roleOf(el);
+    const disabled = el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+    const checked = (role === 'checkbox' || role === 'radio') ? !!el.checked : null;
+    const selected = el.getAttribute('aria-selected') === 'true';
+    let options = null;
+    let value = null;
+    if (el.tagName === 'SELECT') {
+      options = Array.from(el.options).map(o => o.textContent.trim());
+      const sel = el.options[el.selectedIndex];
+      value = sel ? sel.textContent.trim() : null;
+    } else if (el.tagName === 'INPUT' && el.type === 'password') {
+      value = null; // never surface password field contents
+    }
+    const sensitive = el.tagName === 'INPUT' && el.type === 'password';
+    elements.push({
+      nth: idx,
+      role,
+      name: accessibleName(el),
+      href: el.tagName === 'A' ? el.getAttribute('href') : null,
+      disabled,
+      checked,
+      selected,
+      options,
+      value,
+      sensitive,
+    });
+  });
+
+  const interactiveSet = new Set(interactiveNodes);
+  const textNodes = Array.from(document.querySelectorAll(textSel));
+  const visibleText = [];
+  const seen = new Set();
+  for (const el of textNodes) {
+    if (!isVisible(el)) continue;
+    let insideInteractive = false;
+    let p = el.parentElement;
+    while (p) {
+      if (interactiveSet.has(p)) { insideInteractive = true; break; }
+      p = p.parentElement;
+    }
+    if (insideInteractive) continue;
+    const direct = Array.from(el.childNodes)
+      .filter(n => n.nodeType === Node.TEXT_NODE)
+      .map(n => n.textContent.trim())
+      .join(' ')
+      .trim();
+    const text = direct || el.textContent.replace(/\\s+/g, ' ').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    visibleText.push(text.slice(0, 200));
+    if (visibleText.length >= 40) break;
+  }
+
+  const modalPresent = !!document.querySelector(modalSel);
+
+  return {
+    url: window.location.href,
+    title: document.title,
+    elements,
+    visibleText,
+    modalPresent,
+  };
+}
+"""
+
+
+async def extract_observation(page: Any, max_chars: int, max_visible_text_items: int) -> PageObservation:
+    """`page` is a playwright.async_api.Page. Returns a fully-populated PageObservation,
+    including its state_hash, computed here so callers never forget to hash."""
+    raw: dict = await page.evaluate(
+        _EXTRACTION_JS,
+        [CANONICAL_INTERACTIVE_SELECTOR, CANONICAL_TEXT_SELECTOR, CANONICAL_MODAL_SELECTOR],
+    )
+
+    elements: list[ElementRef] = []
+    for i, e in enumerate(raw["elements"], start=1):
+        elements.append(ElementRef(
+            id=i,
+            role=e["role"],
+            name=e["name"],
+            value=e.get("value"),
+            disabled=e["disabled"],
+            selected=e["selected"],
+            checked=e["checked"],
+            options=e["options"],
+            href=e["href"],
+            sensitive=e.get("sensitive", False),
+            selector_hint=SelectorHint(css=CANONICAL_INTERACTIVE_SELECTOR, nth=e["nth"]),
+        ))
+
+    visible_text = raw["visibleText"]
+    state_hash = compute_state_hash(raw["url"], raw["title"], elements, visible_text)
+
+    obs = PageObservation(
+        url=raw["url"],
+        title=raw["title"],
+        elements=elements,
+        visible_text=visible_text,
+        modal_present=raw["modalPresent"],
+        state_hash=state_hash,
+        element_count=len(elements),
+    )
+    rendered = obs.render_compact(max_chars, max_visible_text_items)
+    obs.char_count = len(rendered)
+    obs.truncated = rendered.endswith("...[truncated]")
+    return obs

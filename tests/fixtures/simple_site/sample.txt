@@ -1,0 +1,1 @@
+This is a sample file used by browser-agent's download integration test.

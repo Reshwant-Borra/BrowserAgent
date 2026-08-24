@@ -1,0 +1,112 @@
+# browser-agent
+
+A fully local, small-LLM-driven browser automation agent. Phases 1-3 (see
+[`ARCHITECTURE.md`](ARCHITECTURE.md) and [`docs/IMPLEMENTATION_PLAN_PHASES_1_3.md`](docs/IMPLEMENTATION_PLAN_PHASES_1_3.md)):
+a compact-observation decision loop, deterministic verification/recovery, and event-sourced
+crash-safe state — driven by Qwen3-8B running locally via llama.cpp, with Playwright as the
+browser backend.
+
+## Requirements
+
+- Python 3.11+
+- [Playwright](https://playwright.dev/python/) (installed as a dependency; browser binaries installed separately, see below)
+- [llama.cpp](https://github.com/ggml-org/llama.cpp) built with server support (`llama-server`)
+- A Qwen3-8B GGUF model (Q4_K_M or Q5_K_M recommended for 8-12GB VRAM)
+
+## Installation
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+pip install -e ".[dev]"
+```
+
+### Installing Playwright browsers
+
+```bash
+playwright install chromium
+```
+
+### Starting llama.cpp
+
+Build `llama-server` from the [llama.cpp](https://github.com/ggml-org/llama.cpp) repository,
+then run it against your own GGUF model path — this project never assumes a hard-coded model
+location:
+
+```bash
+llama-server -m /path/to/your/qwen3-8b-Q4_K_M.gguf --host 127.0.0.1 --port 8080
+```
+
+`config/default.yaml` points at `http://127.0.0.1:8080` by default; override with
+`BROWSER_AGENT_MODEL__ENDPOINT=http://host:port` or `--config path/to/other.yaml`.
+
+## Running the test suite
+
+```bash
+pytest -m "not model"     # deterministic unit + integration tests (no live model server needed)
+pytest -m model           # live smoke test against a running llama.cpp server (see below)
+```
+
+Integration tests spin up Playwright against a local static fixture site
+(`tests/fixtures/simple_site/`, served by `tests/conftest.py`'s `fixture_site_url` fixture)
+and drive the real agent loop with a *scripted* (non-live) model client
+(`tests/integration/fake_llama.py`) — this proves the deterministic machinery (observation,
+verification, recovery, event sourcing) works correctly without depending on model quality.
+Only `pytest -m model` tests exercise an actual Qwen3-8B/llama.cpp call end-to-end.
+
+## Starting an agent task
+
+```bash
+browser-agent run "Find the assignment"
+```
+
+Prints the new `task_id` and the final status once the task completes, blocks, or the
+step budget (`--max-steps`, default 200) is exhausted.
+
+## Resuming a task
+
+```bash
+browser-agent resume <task_id>
+```
+
+Reloads persisted state (rebuilding it from the event log if the derived `task_state` row is
+missing or stale), reconciles any action that was ambiguously interrupted by a prior crash
+(see `agent/loop.py`'s `_reconcile_pending_intent`), reconnects the persistent browser
+profile, and continues.
+
+## Inspecting task status
+
+```bash
+browser-agent status <task_id>
+```
+
+## Configuration
+
+See `config/default.yaml`. Any value can be overridden with an environment variable of the
+form `BROWSER_AGENT_<SECTION>__<KEY>` (e.g. `BROWSER_AGENT_BROWSER__HEADLESS=true`).
+
+## Known limitations (intentional — see ARCHITECTURE.md for the phased roadmap)
+
+Phases 1-3 deliberately do **not** include:
+
+- vision / screenshot-based observation (accessibility/interactive-element extraction only)
+- embeddings or any vector search
+- semantic long-term memory (facts/skills beyond the current task's event log)
+- page-delta/diff observations (every step re-extracts a full compact observation; this is
+  intentional so token-cost data can be gathered before deciding whether deltas are worth
+  the added drift risk — see ARCHITECTURE.md §"Page deltas")
+- website-specific skill learning
+- a larger secondary "planner" model or planner/executor model-swapping
+- fine-tuning of any kind
+
+These are explicitly out of scope for this round and belong to Phase 4+, to be justified by
+the metrics this implementation now collects (see `docs/PHASE1_REPORT.md`).
+
+## Known operational constraints
+
+- One task = one browser profile directory (`runtime/tasks/<task_id>/browser_profile`);
+  running the same task_id concurrently from two processes will contend for Playwright's
+  persistent-context profile lock.
+- The CLI's consequential-action approval prompt (`input()`) blocks the event loop while
+  waiting for a human response — acceptable since only one task runs per process.
+- `runtime/` (browser profiles, task databases, logs, downloads) is gitignored; never commit it.

@@ -1,0 +1,35 @@
+[project]
+name = "browser-agent"
+version = "0.1.0"
+description = "Fully local, small-LLM-driven browser automation agent (Phases 1-3: decision loop, verification/recovery, event-sourced crash recovery)."
+requires-python = ">=3.11"
+dependencies = [
+    "playwright>=1.45",
+    "pydantic>=2.6",
+    "httpx>=0.27",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "psutil>=5.9",  # test-only: reaping orphaned browser processes after the Phase 3 kill test
+]
+
+[project.scripts]
+browser-agent = "cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["agent", "browser", "inference", "memory", "cli"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "model: requires a live local llama.cpp server (not run by default)",
+]
+testpaths = ["tests"]

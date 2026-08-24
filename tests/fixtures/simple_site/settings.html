@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Settings</title></head>
+<body>
+  <h1>Settings</h1>
+  <label for="mode">Mode</label>
+  <select id="mode" onchange="onModeChange()">
+    <option value="basic">Basic</option>
+    <option value="advanced">Advanced</option>
+  </select>
+  <div id="advanced-settings" hidden>
+    <h2>Advanced settings</h2>
+    <p>Extra options appear here.</p>
+  </div>
+  <script>
+    function onModeChange() {
+      const mode = document.getElementById('mode').value;
+      document.getElementById('advanced-settings').hidden = (mode !== 'advanced');
+    }
+  </script>
+</body>
+</html>

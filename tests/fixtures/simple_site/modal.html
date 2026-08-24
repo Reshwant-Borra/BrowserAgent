@@ -1,0 +1,12 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Modal Page</title></head>
+<body>
+  <h1>Modal Page</h1>
+  <button id="open-modal" onclick="document.getElementById('dlg').hidden = false">Open Modal</button>
+  <div id="dlg" role="dialog" hidden>
+    <p>This is an in-page modal (not a native browser dialog).</p>
+    <button id="close-modal" onclick="document.getElementById('dlg').hidden = true">Close</button>
+  </div>
+</body>
+</html>

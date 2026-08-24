@@ -1,0 +1,40 @@
+# GBNF grammar for the outer ModelDecision JSON shape (llama.cpp grammar-constrained decoding).
+#
+# Scope note (see docs/IMPLEMENTATION_PLAN_PHASES_1_3.md): this grammar guarantees the
+# action enum, target shape, confidence range, and a length-capped optional reason string.
+# `params` and `expected_result` are constrained to well-formed generic JSON objects here;
+# their action-specific field shapes are enforced afterward by agent/schemas.py + semantic
+# validation in agent/decision.py (defense-in-depth layers 3-4, not the grammar).
+
+root ::= "{" ws
+  "\"action\"" ws ":" ws action-value ws ","  ws
+  "\"target\""  ws ":" ws target-value  ws "," ws
+  "\"params\""  ws ":" ws object        ws "," ws
+  "\"expected_result\"" ws ":" ws object ws "," ws
+  "\"confidence\"" ws ":" ws confidence
+  (ws "," ws "\"reason\"" ws ":" ws reason-string)?
+  ws "}"
+
+action-value ::= "\"open_url\"" | "\"click\"" | "\"type\"" | "\"select\"" | "\"scroll\""
+                | "\"back\"" | "\"extract\"" | "\"download\"" | "\"wait\"" | "\"finish\""
+
+target-value ::= integer | "null"
+
+confidence ::= "0" "." [0-9]+ | "1" "." "0"+ | "0" | "1"
+
+reason-string ::= "\"" [^"\\]{0,120} "\""
+
+integer ::= "-"? [0-9]+
+number  ::= "-"? [0-9]+ ("." [0-9]+)?
+
+string ::= "\"" ( [^"\\] | "\\" ["\\/bfnrt] )* "\""
+
+value ::= string | number | "true" | "false" | "null" | object | array
+
+kv ::= string ws ":" ws value
+
+object ::= "{" ws (kv (ws "," ws kv)*)? ws "}"
+
+array ::= "[" ws (value (ws "," ws value)*)? ws "]"
+
+ws ::= [ \t\n]*

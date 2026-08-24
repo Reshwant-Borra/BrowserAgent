@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Delayed-nav Page</title></head>
+<body>
+  <h1>Delayed-nav Page</h1>
+  <button id="go-delayed" onclick="goSoon()">Continue</button>
+  <script>
+    function goSoon() {
+      setTimeout(() => { window.location.href = '/delayed_target.html'; }, 800);
+    }
+  </script>
+</body>
+</html>

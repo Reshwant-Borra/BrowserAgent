@@ -1,0 +1,60 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Models (never commit weights)
+models/
+*.gguf
+*.ggml
+*.bin
+
+# Runtime data (browser profiles, task DBs, downloads, logs) — may contain
+# session cookies, local task history, or other non-shareable state.
+runtime/*
+!runtime/.gitkeep
+*.sqlite3
+*.sqlite3-journal
+*.db
+*.db-journal
+
+# Browser profiles / Playwright state / cookies / session data
+browser_profile/
+.playwright/
+playwright-report/
+test-results/
+storage_state.json
+*.auth.json
+cookies.json
+
+# Downloads
+downloads/
+
+# Logs and generated metrics containing task data
+*.log
+logs/
+metrics/
+*.metrics.json
+
+# Secrets / credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials.json
+credentials/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
