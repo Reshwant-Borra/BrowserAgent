@@ -12,15 +12,26 @@ from __future__ import annotations
 import json
 from typing import Optional
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from agent.schemas import (
     ActionType,
+    BackAction,
+    ClickAction,
     DecisionValidationError,
+    DownloadAction,
+    ExtractAction,
+    FinishAction,
     ModelDecision,
+    ModelAction,
+    OpenUrlAction,
+    ScrollAction,
+    SelectAction,
     TARGETED_ACTIONS,
+    TypeAction,
     UNTARGETED_ACTIONS,
     ValidationErrorKind,
+    WaitAction,
 )
 from browser.page_model import PageObservation
 
@@ -28,6 +39,8 @@ _TYPE_TO_ROLE = {
     ActionType.TYPE: {"textbox"},
     ActionType.SELECT: {"select", "combobox"},
 }
+
+_ACTION_ADAPTER = TypeAdapter(ModelAction)
 
 
 def parse_model_output(raw_text: str) -> ModelDecision:
@@ -41,9 +54,44 @@ def parse_model_output(raw_text: str) -> ModelDecision:
         raise DecisionValidationError(ValidationErrorKind.MALFORMED_JSON, str(e)) from e
 
     try:
-        return ModelDecision.model_validate(data)
+        if isinstance(data, dict) and "params" in data:
+            return ModelDecision.model_validate(data)
+        action = _ACTION_ADAPTER.validate_python(data)
+        return normalize_model_action(action)
     except ValidationError as e:
         raise DecisionValidationError(ValidationErrorKind.SCHEMA_INVALID, str(e)) from e
+
+
+def normalize_model_action(action: ModelAction) -> ModelDecision:
+    """Convert the action-specific model I/O contract into the executor contract."""
+    if isinstance(action, OpenUrlAction):
+        return ModelDecision(action=ActionType.OPEN_URL, params={"url": action.url}, verification_mode="action_default")
+    if isinstance(action, ClickAction):
+        return ModelDecision(action=ActionType.CLICK, target=action.target, verification_mode="action_default")
+    if isinstance(action, TypeAction):
+        return ModelDecision(action=ActionType.TYPE, target=action.target, params={"text": action.text}, verification_mode="action_default")
+    if isinstance(action, SelectAction):
+        return ModelDecision(action=ActionType.SELECT, target=action.target, params={"value": action.value}, verification_mode="action_default")
+    if isinstance(action, ScrollAction):
+        return ModelDecision(action=ActionType.SCROLL, params={"direction": action.direction}, verification_mode="action_default")
+    if isinstance(action, BackAction):
+        return ModelDecision(action=ActionType.BACK, verification_mode="action_default")
+    if isinstance(action, ExtractAction):
+        return ModelDecision(action=ActionType.EXTRACT, target=action.target, verification_mode="action_default")
+    if isinstance(action, DownloadAction):
+        return ModelDecision(action=ActionType.DOWNLOAD, target=action.target, verification_mode="action_default")
+    if isinstance(action, WaitAction):
+        params = {
+            k: v for k, v in {
+                "for_text": action.for_text,
+                "url_contains": action.url_contains,
+                "ms": action.ms,
+            }.items() if v is not None
+        }
+        return ModelDecision(action=ActionType.WAIT, params=params, verification_mode="action_default")
+    if isinstance(action, FinishAction):
+        return ModelDecision(action=ActionType.FINISH, params={"result": action.result}, verification_mode="action_default")
+    raise DecisionValidationError(ValidationErrorKind.SCHEMA_INVALID, f"unsupported action: {action!r}")
 
 
 def validate_against_observation(decision: ModelDecision, observation: PageObservation) -> None:
@@ -78,6 +126,16 @@ def validate_against_observation(decision: ModelDecision, observation: PageObser
                 ValidationErrorKind.TARGET_TYPE_MISMATCH,
                 f"target {decision.target} ('{element.name}') is disabled",
             )
+        if action == ActionType.CLICK and _looks_like_download(element):
+            raise DecisionValidationError(
+                ValidationErrorKind.MODEL_INTENT_ERROR,
+                f"target {decision.target} ('{element.name}') appears to be a download; use action 'download'",
+            )
+        if action == ActionType.TYPE and element.value == decision.params.get("text"):
+            raise DecisionValidationError(
+                ValidationErrorKind.MODEL_INTENT_ERROR,
+                f"target {decision.target} ('{element.name}') already contains the requested text; choose the next action",
+            )
         if action == ActionType.SELECT:
             value = decision.params.get("value")
             if not value or (element.options is not None and value not in element.options):
@@ -96,3 +154,14 @@ def validate_against_observation(decision: ModelDecision, observation: PageObser
             raise DecisionValidationError(
                 ValidationErrorKind.SCHEMA_INVALID, "action 'type' requires a string params.text",
             )
+
+
+def _looks_like_download(element) -> bool:
+    name = (element.name or "").lower()
+    href = (element.href or "").lower()
+    if "download" in name:
+        return True
+    return href.endswith((
+        ".csv", ".json", ".pdf", ".txt", ".zip", ".gz", ".tar", ".xlsx", ".docx", ".pptx",
+        ".png", ".jpg", ".jpeg",
+    ))

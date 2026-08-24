@@ -12,8 +12,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Protocol
 
 import httpx
+from pydantic import TypeAdapter
 
-from agent.schemas import ModelDecision
+from agent.schemas import ModelAction
 
 
 class ModelUnavailableError(Exception):
@@ -175,10 +176,10 @@ class OllamaClient:
 def create_inference_client(config: Any) -> InferenceClient:
     backend = config.model.backend.lower()
     if backend == "llama_cpp":
-        return LlamaClient(config.model.endpoint, config.model.temperature, config.model.request_timeout_s)
+        return LlamaClient(active_model_endpoint(config), config.model.temperature, config.model.request_timeout_s)
     if backend == "ollama":
         return OllamaClient(
-            config.model.endpoint,
+            active_model_endpoint(config),
             config.model.model_name,
             config.model.temperature,
             config.model.request_timeout_s,
@@ -187,14 +188,20 @@ def create_inference_client(config: Any) -> InferenceClient:
     raise ValueError(f"unsupported model backend: {config.model.backend!r}")
 
 
-def _model_decision_json_schema() -> dict[str, Any]:
-    """Ollama structured output schema matching the existing GBNF's outer contract.
+def active_model_endpoint(config: Any) -> str:
+    explicit = getattr(config.model, "endpoint", "") or ""
+    if explicit:
+        return explicit
+    backend = config.model.backend.lower()
+    if backend == "llama_cpp":
+        return config.model.llamacpp_endpoint
+    if backend == "ollama":
+        return config.model.ollama_endpoint
+    raise ValueError(f"unsupported model backend: {config.model.backend!r}")
 
-    Pydantic marks fields with defaults as optional in JSON Schema, but the llama.cpp
-    grammar requires the top-level action object to include target, params,
-    expected_result, and confidence. Keep Ollama's constrained output equally strict at
-    that layer; action-specific validation still belongs to agent.decision.
-    """
-    schema = ModelDecision.model_json_schema()
-    schema["required"] = ["action", "target", "params", "expected_result", "confidence"]
+
+def _model_decision_json_schema() -> dict[str, Any]:
+    """Ollama structured output schema for the action-specific discriminated union."""
+    schema = TypeAdapter(ModelAction).json_schema()
+    schema["title"] = "BrowserAction"
     return schema
