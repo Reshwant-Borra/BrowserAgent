@@ -50,6 +50,7 @@ def replay_task(task_id: str, events: list[Event]) -> TaskState:
                 "target": action_payload.get("target"),
                 "action_fingerprint": action_payload.get("action_fingerprint"),
                 "url": action_payload.get("url"),
+                "result_data": action_payload.get("result_data") or {},
                 "verification": "pass" if passed else "fail",
             })
             state.recent_actions = state.recent_actions[-_RECENT_ACTIONS_CAP:]

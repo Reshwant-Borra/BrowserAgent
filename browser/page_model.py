@@ -75,6 +75,8 @@ class PageObservation(BaseModel):
             extra = ""
             if el.options:
                 extra = f" options={el.options}"
+            if el.value not in (None, "") and not el.sensitive:
+                extra += f' value="{el.value}"'
             lines.append(f'[{el.id}] {el.role} "{el.name}"{flag_str}{extra}')
         lines.append("")
         lines.append("VISIBLE TEXT")

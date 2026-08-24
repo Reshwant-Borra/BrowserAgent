@@ -110,6 +110,8 @@ _EXTRACTION_JS = """
       value = sel ? sel.textContent.trim() : null;
     } else if (el.tagName === 'INPUT' && el.type === 'password') {
       value = null; // never surface password field contents
+    } else if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
+      value = el.value || '';
     }
     const sensitive = el.tagName === 'INPUT' && el.type === 'password';
     elements.push({
