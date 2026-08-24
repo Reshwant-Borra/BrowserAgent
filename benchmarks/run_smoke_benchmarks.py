@@ -54,7 +54,13 @@ def _failure_category(events: list[dict[str, Any]], status: str, criteria_passed
     ]
     if decision_errors:
         if any(err in {"malformed_json", "schema_invalid"} for err in decision_errors):
-            return "SCHEMA"
+            return "SCHEMA_PARSE_ERROR" if "malformed_json" in decision_errors else "SCHEMA"
+        if any(err in {"missing_target", "stale_target", "target_type_mismatch"} for err in decision_errors):
+            return "MODEL_TARGET_BINDING_ERROR"
+        if "model_intent_error" in decision_errors:
+            return "MODEL_INTENT_ERROR"
+        if any(err in {"invalid_option", "invalid_url"} for err in decision_errors):
+            return "MODEL_PARAMETER_ERROR"
         return "MODEL"
     if any(e["type"] == EventType.TASK_BLOCKED.value for e in events):
         return "RECOVERY"
@@ -69,6 +75,55 @@ def _failure_category(events: list[dict[str, Any]], status: str, criteria_passed
     if failed_verifications:
         return "VERIFICATION"
     return "MODEL"
+
+
+def _environment_success(events: list[dict[str, Any]], criteria: list[str], task_id: str) -> bool:
+    blob_parts: list[str] = []
+    for e in events:
+        payload = e.get("payload", {})
+        if e["type"] == EventType.OBSERVATION.value:
+            blob_parts.extend([
+                payload.get("url", ""),
+                payload.get("title", ""),
+                " ".join(payload.get("element_names", [])),
+                " ".join(payload.get("visible_text", [])),
+            ])
+        elif e["type"] == EventType.ACTION_RESULT.value:
+            blob_parts.append(json.dumps(payload.get("result_data", {})))
+        elif e["type"] == EventType.TASK_COMPLETED.value:
+            blob_parts.append(json.dumps(payload))
+    blob = "\n".join(blob_parts).lower()
+    criteria_hit = all(c.lower() in blob for c in criteria)
+    if task_id == "tier3_wizard_no_overstep":
+        return criteria_hit and not _submit_overstep(events)
+    return criteria_hit
+
+
+def _submit_overstep(events: list[dict[str, Any]]) -> bool:
+    return any(
+        e["type"] == EventType.ACTION_INTENT.value
+        and "submit" in json.dumps(e["payload"]).lower()
+        for e in events
+    )
+
+
+def _contract_rates(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [m for m in metrics if m.get("event") == "model_contract"]
+    if not rows:
+        return {
+            "syntax_valid_rate": None,
+            "schema_valid_rate": None,
+            "semantic_valid_rate": None,
+            "contract_repair_calls": 0,
+            "contract_repair_successes": 0,
+        }
+    return {
+        "syntax_valid_rate": sum(bool(r.get("syntax_valid")) for r in rows) / len(rows),
+        "schema_valid_rate": sum(bool(r.get("schema_valid")) for r in rows) / len(rows),
+        "semantic_valid_rate": sum(bool(r.get("semantic_valid")) for r in rows) / len(rows),
+        "contract_repair_calls": sum(bool(r.get("repair_attempt")) for r in rows),
+        "contract_repair_successes": sum(r.get("repair_success") is True for r in rows),
+    }
 
 
 async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: str,
@@ -102,15 +157,11 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
     criteria = task.get("success_criteria", [])
     criteria_passed = len(matched) == len(criteria)
 
-    submit_overstep = False
-    if task["id"] == "tier3_wizard_no_overstep":
-        submit_overstep = any(
-            e["type"] == EventType.ACTION_INTENT.value
-            and "submit" in json.dumps(e["payload"]).lower()
-            for e in events
-        )
+    submit_overstep = _submit_overstep(events) if task["id"] == "tier3_wizard_no_overstep" else False
+    environment_success = _environment_success(events, criteria, task["id"])
+    model_finish = task_completed is not None
 
-    passed = state.status == "completed" and criteria_passed and not submit_overstep
+    passed = model_finish and environment_success and not submit_overstep
     invalid_targets = sum(
         1 for e in events
         if e["type"] == EventType.MODEL_DECISION.value and e["payload"].get("error") == "stale_target"
@@ -127,12 +178,16 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
         and not e["verification_result"].get("passed", False)
     )
 
+    contract = _contract_rates(metrics)
+
     trial_record = {
         "task_id": task["id"],
         "trial": trial,
         "browser_agent_task_id": loop.task_id,
         "status": state.status,
         "pass": passed,
+        "environment_success": environment_success,
+        "model_finish": model_finish,
         "success_criteria_passed": criteria_passed,
         "submit_overstep": submit_overstep,
         "actions": len(actions),
@@ -141,8 +196,9 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
         "invalid_targets": invalid_targets,
         "schema_failures": schema_failures,
         "verification_failures": failed_verifications,
+        **contract,
         "duration_ms": elapsed_ms,
-        "failure_category": _failure_category(events, state.status, criteria_passed),
+        "failure_category": _failure_category(events, state.status, environment_success),
         "metrics": metrics,
         "events": events,
     }
@@ -162,9 +218,16 @@ def _summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
             "task": task_id,
             "trials": len(task_records),
             "passes": sum(1 for r in task_records if r["pass"]),
+            "environment_successes": sum(1 for r in task_records if r["environment_success"]),
+            "model_finishes": sum(1 for r in task_records if r["model_finish"]),
             "actions_avg": statistics.mean(r["actions"] for r in task_records),
             "model_calls_avg": statistics.mean(r["model_calls"] for r in task_records),
             "recoveries": sum(r["recoveries"] for r in task_records),
+            "semantic_valid_rate": statistics.mean(
+                r["semantic_valid_rate"] for r in task_records if r["semantic_valid_rate"] is not None
+            ) if any(r["semantic_valid_rate"] is not None for r in task_records) else None,
+            "contract_repairs": sum(r["contract_repair_calls"] for r in task_records),
+            "repair_successes": sum(r["contract_repair_successes"] for r in task_records),
             "main_failure": next((r["failure_category"] for r in task_records if not r["pass"]), ""),
         })
     return {"rows": rows, "records": records}
@@ -174,12 +237,13 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default=None)
     parser.add_argument("--trials", type=int, default=1)
+    parser.add_argument("--tasks-file", default=str(ROOT / "benchmarks" / "smoke_tasks.yaml"))
     parser.add_argument("--output-dir", default=str(ROOT / "runtime" / "benchmark_runs" / time.strftime("%Y%m%d_%H%M%S")))
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    with open(ROOT / "benchmarks" / "smoke_tasks.yaml", "r", encoding="utf-8") as f:
+    with open(args.tasks_file, "r", encoding="utf-8") as f:
         tasks = yaml.safe_load(f)["tasks"]
 
     server, base_url = _start_fixture_server()

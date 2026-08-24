@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Preferences</title></head>
+<body>
+  <h1>Preferences</h1>
+  <label for="density">Density</label>
+  <select id="density" onchange="onDensityChange()">
+    <option value="comfortable">Comfortable</option>
+    <option value="compact">Compact</option>
+  </select>
+  <div id="compact-layout" hidden>
+    <h2>Compact layout enabled</h2>
+  </div>
+  <script>
+    function onDensityChange() {
+      const density = document.getElementById('density').value;
+      document.getElementById('compact-layout').hidden = (density !== 'compact');
+    }
+  </script>
+</body>
+</html>
