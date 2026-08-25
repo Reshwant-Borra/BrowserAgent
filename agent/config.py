@@ -52,6 +52,9 @@ class ContextConfig:
     retrieved_memory_top_k: int = 5
     enable_running_summary: bool = True
     enable_memory_retrieval: bool = True
+    enable_active_facts: bool = True
+    active_fact_tokens: int = 300
+    enforce_active_fact_constraints: bool = False
     summary_rebuild_interval: int = 4
 
 

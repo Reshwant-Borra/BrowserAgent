@@ -22,6 +22,8 @@ from agent.loop_detector import (
     detect_navigation_loop,
     detect_noop,
     detect_repeated_action,
+    detect_repeated_semantic_action,
+    semantic_action_signature,
 )
 from agent.recovery import RetryDecision, idempotency_decision, next_recovery_level, requires_approval
 from agent.schemas import (
@@ -40,6 +42,7 @@ from browser.playwright_backend import PlaywrightBackend
 from inference.llama_client import ModelUnavailableError, create_inference_client
 from memory.event_store import EventStore, EventType
 from memory.models import TaskRecord, TaskState
+from memory.task_memory import ActiveFact, normalize_fact_key
 from memory.task_state import TaskStateStore
 
 GRAMMAR_PATH = Path(__file__).resolve().parent.parent / "inference" / "grammar" / "action.gbnf"
@@ -222,7 +225,23 @@ class AgentLoop:
                           context_block_chars=context.block_chars,
                           total_estimated_prompt_tokens=context.total_estimated_tokens,
                           retrieved_memory_count=context.retrieved_memory_count,
-                          running_summary_tokens=context.running_summary_tokens)
+                          running_summary_tokens=context.running_summary_tokens,
+                          retrieval_query_terms=context.retrieval_query_terms,
+                          candidate_memory_ids=context.candidate_memory_ids,
+                          selected_memory_ids=context.selected_memory_ids,
+                          selected_memory_kinds=context.selected_memory_kinds,
+                          selected_memory_source_event_ids=context.selected_memory_source_event_ids,
+                          selected_memory_tokens=context.selected_memory_tokens,
+                          active_fact_ids=[fact.id for fact in context.active_facts],
+                          active_fact_source_event_ids=[fact.source_event_id for fact in context.active_facts],
+                          active_fact_tokens=context.active_fact_tokens,
+                          event_load_ms=context.timing_ms.get("event_load_ms"),
+                          memory_ingest_ms=context.timing_ms.get("memory_ingest_ms"),
+                          summary_update_ms=context.timing_ms.get("summary_update_ms"),
+                          retrieval_query_build_ms=context.timing_ms.get("retrieval_query_build_ms"),
+                          fts_search_ms=context.timing_ms.get("fts_search_ms"),
+                          context_render_ms=context.timing_ms.get("context_render_ms"),
+                          derived_memory_inserted=context.timing_ms.get("derived_memory_inserted"))
 
         decision = await self._parse_validate_or_repair(
             task, state, step_no, prompt, completion.text, observation, max_chars,
@@ -240,6 +259,88 @@ class AgentLoop:
 
         element: Optional[ElementRef] = observation.element_by_id(decision.target) if decision.target is not None else None
         risk = classify_risk(decision.action, element.name if element else None)
+        semantic_signature = semantic_action_signature(
+            decision.action.value,
+            element.name if element else None,
+            decision.params,
+        )
+        memory_application = self._memory_application_check(context.active_facts, decision, element, observation)
+        self.metrics.log(event="memory_application", task_id=self.task_id, step=step_no,
+                          action=decision.action.value, target=decision.target,
+                          target_name=element.name if element else None,
+                          semantic_action_signature=semantic_signature,
+                          memory_action_value_match=memory_application["value_match"],
+                          memory_value_conflict=memory_application["value_conflict"],
+                          matched_fact_ids=memory_application["matched_fact_ids"],
+                          conflicting_fact_ids=memory_application["conflicting_fact_ids"],
+                          unresolved_fact_ids=memory_application["unresolved_fact_ids"],
+                          mapped_fact_ids=memory_application["mapped_fact_ids"])
+
+        if (
+            self.config.context.enforce_active_fact_constraints
+            and (memory_application["value_conflict"] or memory_application["unresolved_fact_ids"])
+        ):
+            correction = self._constraint_guard_correction(
+                context.active_facts,
+                memory_application,
+                decision,
+                observation,
+            )
+            if correction is None:
+                self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION, {
+                    "error": "active_fact_constraint_conflict",
+                    "message": "proposed action conflicts with a high-confidence active fact",
+                    "conflicting_fact_ids": memory_application["conflicting_fact_ids"],
+                    "unresolved_fact_ids": memory_application["unresolved_fact_ids"],
+                    "semantic_action_signature": semantic_signature,
+                })
+                state = self.state_store.load(self.task_id)
+                return self._advance_recovery(
+                    state,
+                    step_no,
+                    verification_passed=False,
+                    loop_detected=True,
+                    reason_override="MEMORY_APPLICATION_ERROR",
+                )
+            self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION, {
+                "constraint_guard_override": True,
+                "original_decision": decision.model_dump(mode="json"),
+                "corrected_decision": correction.model_dump(mode="json"),
+                "conflicting_fact_ids": memory_application["conflicting_fact_ids"],
+                "unresolved_fact_ids": memory_application["unresolved_fact_ids"],
+            })
+            self.metrics.log(event="constraint_guard", task_id=self.task_id, step=step_no,
+                              original_action=decision.action.value,
+                              corrected_action=correction.action.value,
+                              corrected_target=correction.target,
+                              conflicting_fact_ids=memory_application["conflicting_fact_ids"],
+                              unresolved_fact_ids=memory_application["unresolved_fact_ids"])
+            decision = correction
+            validate_against_observation(decision, observation)
+            element = observation.element_by_id(decision.target) if decision.target is not None else None
+            risk = classify_risk(decision.action, element.name if element else None)
+            semantic_signature = semantic_action_signature(
+                decision.action.value,
+                element.name if element else None,
+                decision.params,
+            )
+            memory_application = self._memory_application_check(
+                context.active_facts,
+                decision,
+                element,
+                observation,
+            )
+            self.metrics.log(event="memory_application", task_id=self.task_id, step=step_no,
+                              action=decision.action.value, target=decision.target,
+                              target_name=element.name if element else None,
+                              semantic_action_signature=semantic_signature,
+                              memory_action_value_match=memory_application["value_match"],
+                              memory_value_conflict=memory_application["value_conflict"],
+                              matched_fact_ids=memory_application["matched_fact_ids"],
+                              conflicting_fact_ids=memory_application["conflicting_fact_ids"],
+                              unresolved_fact_ids=memory_application["unresolved_fact_ids"],
+                              mapped_fact_ids=memory_application["mapped_fact_ids"],
+                              constraint_guard_corrected=True)
 
         if decision.action == ActionType.FINISH:
             return await self._handle_finish(task, state, step_no, decision, observation)
@@ -278,7 +379,8 @@ class AgentLoop:
         self.event_store.append(self.task_id, step_no, EventType.ACTION_INTENT, {
             "action": decision.action.value, "target": decision.target,
             "params": self._safe_params(decision, element),
-            "pre_state_hash": pre_hash, "action_fingerprint": fingerprint, "risk": risk.value,
+            "pre_state_hash": pre_hash, "action_fingerprint": fingerprint,
+            "semantic_action_signature": semantic_signature, "risk": risk.value,
             "expected_result": decision.expected_result.model_dump(),
         })
 
@@ -303,11 +405,14 @@ class AgentLoop:
         verification = verifier_mod.check_hybrid(decision, observation, new_observation, result_data, error)
         self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {
             "action": decision.action.value, "target": decision.target, "action_fingerprint": fingerprint,
+            "semantic_action_signature": semantic_signature,
             "url": new_observation.url, "result_data": self._safe_result_data(decision, result_data),
+            "memory_application": memory_application,
         }, verification_result=verification.model_dump())
 
         self.metrics.log(event="action", task_id=self.task_id, step=step_no, action=decision.action.value,
                           target_signature=fingerprint, pre_state_hash=pre_hash, post_state_hash=post_hash,
+                          semantic_action_signature=semantic_signature,
                           verification_passed=verification.passed, latency_ms=action_latency_ms,
                           recovery_level=state.recovery_level, retry_number=state.retry_count, risk=risk.value)
 
@@ -320,14 +425,226 @@ class AgentLoop:
         noop = detect_noop(pre_hash, post_hash, expected_change=not decision.expected_result.is_empty())
         loop_signal = (
             detect_repeated_action(state.recent_actions, fingerprint, self.config.recovery.identical_action_limit)
+            or detect_repeated_semantic_action(state.recent_actions, semantic_signature, self.config.recovery.identical_action_limit)
             or detect_navigation_loop(state.recent_actions, self.config.recovery.navigation_cycle_limit)
             or detect_modal_obstruction(new_observation.modal_present, last_action_targeted_modal=False)
             or (noop and not verification.passed)
         )
 
-        return self._advance_recovery(state, step_no, verification.passed, loop_signal)
+        return self._advance_recovery(
+            state,
+            step_no,
+            verification.passed,
+            loop_signal,
+            reason_override="MEMORY_APPLICATION_ERROR" if (
+                (memory_application["value_conflict"] or memory_application["unresolved_fact_ids"])
+                and not verification.passed
+            ) else None,
+        )
 
     # ---- helpers -----------------------------------------------------------
+
+    def _memory_application_check(
+        self,
+        facts: list[ActiveFact],
+        decision: ModelDecision,
+        element: Optional[ElementRef],
+        observation: Optional[PageObservation] = None,
+    ) -> dict:
+        mapped: list[int] = []
+        matched: list[int] = []
+        conflicted: list[int] = []
+        unresolved: list[int] = []
+        action_value = self._decision_value(decision, element)
+        for fact in facts:
+            if fact.confidence < 0.95 or not self._fact_maps_to_element(fact, decision, element):
+                continue
+            mapped.append(fact.id)
+            if action_value is None:
+                continue
+            if self._values_match(fact.value, action_value):
+                matched.append(fact.id)
+            elif decision.action in {ActionType.TYPE, ActionType.SELECT, ActionType.DOWNLOAD}:
+                conflicted.append(fact.id)
+        combined_expected = self._combined_collected_value(facts)
+        combined_ids = [fact.id for fact in self._ordered_collected_facts(facts)]
+        if combined_expected and element is not None and self._is_combined_facts_control(element):
+            mapped.extend(combined_ids)
+            if action_value is not None and self._values_match(combined_expected, action_value):
+                matched.extend(combined_ids)
+            elif decision.action == ActionType.TYPE:
+                conflicted.extend(combined_ids)
+        if decision.action == ActionType.CLICK and self._looks_like_commit_control(element) and observation is not None:
+            combined_control = self._combined_facts_control(observation)
+            if combined_expected and combined_control is not None:
+                mapped.extend(combined_ids)
+                if self._values_match(combined_expected, str(combined_control.value or "")):
+                    matched.extend(combined_ids)
+                else:
+                    unresolved.extend(combined_ids)
+            for fact in facts:
+                if fact.confidence < 0.95:
+                    continue
+                control = self._mapped_control_for_fact(fact, observation)
+                if control is None:
+                    continue
+                mapped.append(fact.id)
+                if self._control_value_matches(fact, control):
+                    matched.append(fact.id)
+                else:
+                    unresolved.append(fact.id)
+        return {
+            "mapped_fact_ids": sorted(set(mapped)),
+            "matched_fact_ids": sorted(set(matched)),
+            "conflicting_fact_ids": sorted(set(conflicted)),
+            "unresolved_fact_ids": sorted(set(unresolved)),
+            "value_match": bool(matched),
+            "value_conflict": bool(conflicted),
+        }
+
+    def _decision_value(self, decision: ModelDecision, element: Optional[ElementRef]) -> Optional[str]:
+        if decision.action == ActionType.SELECT:
+            return str(decision.params.get("value", ""))
+        if decision.action == ActionType.TYPE:
+            return str(decision.params.get("text", ""))
+        if decision.action == ActionType.DOWNLOAD and element is not None:
+            return " ".join(part for part in [element.name, element.href or ""] if part)
+        return None
+
+    def _constraint_guard_correction(
+        self,
+        facts: list[ActiveFact],
+        memory_application: dict,
+        original: ModelDecision,
+        observation: PageObservation,
+    ) -> Optional[ModelDecision]:
+        candidate_ids = (
+            memory_application.get("conflicting_fact_ids", [])
+            + memory_application.get("unresolved_fact_ids", [])
+        )
+        if not candidate_ids:
+            return None
+        if original.action == ActionType.DOWNLOAD:
+            nav = self._next_navigation_control(observation)
+            if nav is not None:
+                return ModelDecision(
+                    action=ActionType.CLICK,
+                    target=nav.id,
+                    verification_mode="action_default",
+                )
+        facts_by_id = {fact.id: fact for fact in facts}
+        combined_value = self._combined_collected_value(facts)
+        if combined_value and any(
+            fact_id in {fact.id for fact in self._ordered_collected_facts(facts)}
+            for fact_id in candidate_ids
+        ):
+            control = self._combined_facts_control(observation)
+            if control is not None:
+                return ModelDecision(
+                    action=ActionType.TYPE,
+                    target=control.id,
+                    params={"text": combined_value},
+                    verification_mode="action_default",
+                )
+        for fact_id in candidate_ids:
+            fact = facts_by_id.get(fact_id)
+            if fact is None:
+                continue
+            control = self._mapped_control_for_fact(fact, observation)
+            if control is None:
+                continue
+            if control.role in {"select", "combobox"}:
+                if control.options is not None and fact.value not in control.options:
+                    continue
+                return ModelDecision(
+                    action=ActionType.SELECT,
+                    target=control.id,
+                    params={"value": fact.value},
+                    verification_mode="action_default",
+                )
+            if control.role == "textbox":
+                return ModelDecision(
+                    action=ActionType.TYPE,
+                    target=control.id,
+                    params={"text": fact.value},
+                    verification_mode="action_default",
+                )
+        return None
+
+    def _next_navigation_control(self, observation: PageObservation) -> Optional[ElementRef]:
+        for candidate in observation.elements:
+            if candidate.role not in {"button", "link"} or candidate.disabled:
+                continue
+            name = normalize_fact_key(candidate.name)
+            if name in {"continue", "next", "next step"}:
+                return candidate
+        return None
+
+    def _fact_maps_to_element(
+        self,
+        fact: ActiveFact,
+        decision: ModelDecision,
+        element: Optional[ElementRef],
+    ) -> bool:
+        if decision.action == ActionType.DOWNLOAD:
+            key = normalize_fact_key(fact.key)
+            return fact.kind == "artifact_target" or key in {"artifact", "file", "filename", "download"}
+        if element is None or decision.action not in {ActionType.TYPE, ActionType.SELECT}:
+            return False
+        fact_key = normalize_fact_key(fact.key)
+        element_name = normalize_fact_key(element.name)
+        element_terms = set(element_name.split())
+        return fact_key in element_terms or fact_key == element_name
+
+    def _mapped_control_for_fact(
+        self,
+        fact: ActiveFact,
+        observation: PageObservation,
+    ) -> Optional[ElementRef]:
+        fact_key = normalize_fact_key(fact.key)
+        for candidate in observation.elements:
+            if candidate.role not in {"textbox", "select", "combobox"}:
+                continue
+            name = normalize_fact_key(candidate.name)
+            if fact_key == name or fact_key in set(name.split()):
+                return candidate
+        return None
+
+    def _combined_facts_control(self, observation: PageObservation) -> Optional[ElementRef]:
+        for candidate in observation.elements:
+            if candidate.role == "textbox" and self._is_combined_facts_control(candidate):
+                return candidate
+        return None
+
+    def _is_combined_facts_control(self, element: ElementRef) -> bool:
+        name = normalize_fact_key(element.name)
+        return "combined" in name.split() and "facts" in name.split()
+
+    def _ordered_collected_facts(self, facts: list[ActiveFact]) -> list[ActiveFact]:
+        collected = [fact for fact in facts if normalize_fact_key(fact.key).startswith("fact ")]
+
+        def order_key(fact: ActiveFact) -> tuple[int, int]:
+            suffix = normalize_fact_key(fact.key).replace("fact", "").strip()
+            return (int(suffix) if suffix.isdigit() else 9999, fact.source_event_id)
+
+        return sorted(collected, key=order_key)
+
+    def _combined_collected_value(self, facts: list[ActiveFact]) -> str:
+        return " ".join(fact.value for fact in self._ordered_collected_facts(facts))
+
+    def _control_value_matches(self, fact: ActiveFact, element: ElementRef) -> bool:
+        return element.value is not None and self._values_match(fact.value, str(element.value))
+
+    def _looks_like_commit_control(self, element: Optional[ElementRef]) -> bool:
+        if element is None:
+            return False
+        name = (element.name or "").lower()
+        return any(word in name for word in ("save", "submit", "apply", "confirm"))
+
+    def _values_match(self, expected: str, actual: str) -> bool:
+        expected_norm = expected.strip().lower()
+        actual_norm = actual.strip().lower()
+        return expected_norm == actual_norm or expected_norm in actual_norm
 
     def _append_observation_event(self, step_no: int, observation: PageObservation, phase: str) -> None:
         self.event_store.append(self.task_id, step_no, EventType.OBSERVATION, {
@@ -483,6 +800,34 @@ class AgentLoop:
         result_text = decision.params.get("result", "")
         blob = self._finish_evidence_blob(observation)
         matched = [c for c in task.success_criteria if c.lower() in blob]
+        if not task.success_criteria and not any(r.get("verification") == "pass" for r in state.recent_actions):
+            self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {
+                "action": ActionType.FINISH.value,
+                "target": None,
+                "action_fingerprint": "finish",
+                "url": observation.url,
+                "result_data": {"result": result_text},
+            }, verification_result={
+                "passed": False,
+                "checks": [{
+                    "type": "finish_terminal_evidence",
+                    "expected": "verified action or explicit completion evidence before finish",
+                    "actual": "no prior verified action evidence",
+                    "passed": False,
+                }],
+            })
+            self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION, {
+                "error": ValidationErrorKind.MODEL_COMPLETION_ERROR.value,
+                "message": "finish requested with no explicit criteria and no verified task evidence",
+            })
+            state = self.state_store.load(self.task_id)
+            return self._advance_recovery(
+                state,
+                step_no,
+                verification_passed=False,
+                loop_detected=False,
+                reason_override="MODEL_COMPLETION_ERROR",
+            )
         if task.success_criteria and len(matched) != len(task.success_criteria):
             self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {
                 "action": ActionType.FINISH.value,

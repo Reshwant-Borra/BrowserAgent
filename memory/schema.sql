@@ -75,3 +75,31 @@ ON task_memories(task_id, source_event_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS task_memories_fts
 USING fts5(content, kind, content='task_memories', content_rowid='id');
+
+CREATE TABLE IF NOT EXISTS task_memory_ingest_state (
+    task_id TEXT PRIMARY KEY,
+    last_ingested_event_id INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS active_task_facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    source_event_id INTEGER NOT NULL,
+    source_text TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_active_task_facts_unique
+ON active_task_facts(task_id, kind, key, value, source_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_active_task_facts_task
+ON active_task_facts(task_id, status, source_event_id);

@@ -50,10 +50,15 @@ a file.
 
 If all success criteria are already satisfied in the current page state, do not take
 another browser action. Return finish.
+If no success criteria are specified, that does not mean the task is already complete.
+Follow the goal through its requested terminal action and finish only after current page
+or verified action evidence shows the requested outcome occurred.
 Do not return finish merely because you typed or selected a value. If the current page or
 verified action evidence does not contain the success criteria yet, continue the workflow.
 For forms, activate the relevant button/link after entering values unless the criteria are
 already visible.
+When ACTIVE VERIFIED FACTS contain a field or requirement corresponding to a visible
+control, use the exact verified value for that control. Do not invent replacements.
 
 GENERIC EXAMPLES
 PAGE: [4] textbox "Search"; [5] button "Search"
@@ -72,7 +77,7 @@ Do not narrate. Do not explain. Output only the JSON object."""
 
 def render_task_block(goal: str, success_criteria: list[str]) -> str:
     criteria = "\n".join(f"- {c}" for c in success_criteria) if success_criteria else "(none specified)"
-    return f"TASK\n{goal}\n\nSUCCESS CRITERIA\n{criteria}"
+    return f"TASK\n{goal}\n\nCOMPLETION CRITERIA\n{criteria}"
 
 
 def render_subgoal_block(current_subgoal: Optional[str], plan: list[str]) -> str:
@@ -103,6 +108,44 @@ def render_running_summary_block(summary: str | None) -> str:
     return f"RUNNING SUMMARY\n{summary}"
 
 
+def render_active_facts_block(facts: list[dict]) -> str:
+    if not facts:
+        return "ACTIVE VERIFIED FACTS\n(none)"
+    lines = [
+        "ACTIVE VERIFIED FACTS",
+        "Use these exact values when current controls correspond to them.",
+    ]
+    collected = _ordered_collected_facts(facts)
+    if collected:
+        values = " ".join(fact["value"] for fact in collected)
+        sources = ",".join(str(fact["source_event_id"]) for fact in collected)
+        lines.append(f"- collected facts in order = {values} [source events {sources}]")
+    for fact in facts:
+        if "target_id" in fact:
+            prefix = f"- [{fact['target_id']}] {fact['target_name']} <- {fact['key']} = {fact['value']}"
+        else:
+            prefix = f"- {fact['key']} = {fact['value']}"
+        lines.append(
+            f"{prefix} [source event {fact['source_event_id']}, confidence {fact['confidence']:.2f}]"
+        )
+    return "\n".join(lines)
+
+
+def _ordered_collected_facts(facts: list[dict]) -> list[dict]:
+    collected = [
+        fact for fact in facts
+        if str(fact.get("key", "")).lower().startswith("fact ")
+    ]
+    if not collected:
+        return []
+
+    def order_key(fact: dict) -> tuple[int, int]:
+        raw = str(fact.get("key", "")).lower().replace("fact", "").strip()
+        return (int(raw) if raw.isdigit() else 9999, int(fact.get("source_event_id", 0)))
+
+    return sorted(collected, key=order_key)
+
+
 def render_retrieved_memory_block(memories: list[dict]) -> str:
     if not memories:
         return "RETRIEVED TASK MEMORY\n(no older relevant memories retrieved)"
@@ -124,6 +167,10 @@ def render_recovery_block(recovery_level: str, recent_failures: list[str]) -> st
         for f in recent_failures:
             lines.append(f"- {f}")
         lines.append("Reconsider your approach; do not repeat an action that already failed the same way.")
+    if any("MEMORY_APPLICATION_ERROR" in f for f in recent_failures):
+        lines.append("")
+        lines.append("MEMORY APPLICATION CHECK")
+        lines.append("Re-read ACTIVE VERIFIED FACTS and map exact values to matching current controls.")
     return "\n".join(lines)
 
 
@@ -137,7 +184,7 @@ def render_replan_prompt(goal: str, success_criteria: list[str], history_summary
                           blocked_reason: str) -> str:
     return (
         f"{REPLAN_SYSTEM_BLOCK}\n\n"
-        f"GOAL\n{goal}\n\nSUCCESS CRITERIA\n" +
+        f"GOAL\n{goal}\n\nCOMPLETION CRITERIA\n" +
         "\n".join(f"- {c}" for c in success_criteria) +
         f"\n\nWHY BLOCKED\n{blocked_reason}\n\nHISTORY\n{history_summary}"
     )

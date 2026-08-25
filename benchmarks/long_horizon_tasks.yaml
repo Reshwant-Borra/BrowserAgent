@@ -10,6 +10,13 @@ tasks:
       - "Configuration saved: Advanced"
       - "Region saved: North"
       - "AX-47"
+    memory_expectations:
+      - key: mode
+        value: Advanced
+      - key: region
+        value: North
+      - key: token
+        value: AX-47
 
   - id: tier4_research_32
     goal: "Collect the three facts from the early source sections, continue through the workflow, enter the combined facts in order at the end, and finish."
@@ -17,8 +24,18 @@ tasks:
     max_steps: 55
     tier: 4
     success_criteria: []
+    completion_criteria:
+      - "Final synthesis"
+      - "Combined result"
     evaluation_criteria:
       - "Combined result: Atlas Copper Delta"
+    memory_expectations:
+      - key: fact 1
+        value: Atlas
+      - key: fact 2
+        value: Copper
+      - key: fact 3
+        value: Delta
 
   - id: tier4_download_42
     goal: "Identify the required artifact on the first page, continue through the documentation workflow, download exactly that artifact at the end, and finish after confirming the download."
@@ -28,6 +45,9 @@ tasks:
     success_criteria: []
     evaluation_criteria:
       - "release-notes-v7.txt"
+    memory_expectations:
+      - key: artifact
+        value: release-notes-v7.txt
 
   - id: tier5_config_96
     goal: "Complete the extended configuration workflow. Remember the first-page requirements and apply them on the final configuration page."
@@ -40,6 +60,13 @@ tasks:
       - "Configuration saved: Advanced"
       - "Region saved: South"
       - "GX-22"
+    memory_expectations:
+      - key: mode
+        value: Advanced
+      - key: region
+        value: South
+      - key: token
+        value: GX-22
 
   - id: tier5_download_105
     goal: "Identify the required artifact on the first page, continue through the extended documentation workflow, download exactly that artifact at the end, and finish after confirming the download."
@@ -49,3 +76,6 @@ tasks:
     success_criteria: []
     evaluation_criteria:
       - "dataset-manifest-r12.txt"
+    memory_expectations:
+      - key: artifact
+        value: dataset-manifest-r12.txt

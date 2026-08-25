@@ -5,11 +5,40 @@ current/previous page state, which is exactly why they still work after a crash+
 from __future__ import annotations
 
 
+def semantic_action_signature(action: str, element_name: str | None, params: dict) -> str:
+    """Stable action meaning across changing element ids."""
+    name = _normalize_semantic_name(element_name or "")
+    value = ""
+    if action == "select":
+        value = str(params.get("value", "")).strip().lower()
+    elif action == "type":
+        value = str(params.get("text", "")).strip().lower()
+    elif action == "download":
+        value = name
+    return f"{action}:{name}:{value}"
+
+
+def detect_repeated_semantic_action(recent_actions: list[dict], signature: str, limit: int) -> bool:
+    count = 0
+    for r in reversed(recent_actions):
+        if r.get("semantic_action_signature") == signature:
+            count += 1
+        else:
+            break
+    return count >= limit
+
+
 def action_fingerprint(action: str, target: int | None, params: dict) -> str:
     """Identifies "the same action" across attempts for repeated-action/idempotency logic.
     Deliberately excludes confidence/reason (non-semantic fields)."""
     stable_params = {k: v for k, v in sorted(params.items()) if k not in ("text",)}
     return f"{action}:{target}:{stable_params}"
+
+
+def _normalize_semantic_name(name: str) -> str:
+    return " ".join(
+        "".join(ch.lower() if ch.isalnum() else " " for ch in name).split()
+    )
 
 
 def detect_noop(pre_hash: str, post_hash: str, expected_change: bool) -> bool:
