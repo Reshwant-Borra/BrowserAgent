@@ -10,6 +10,7 @@ prefix reuse; it never changes based on content length, only the volatile tail g
 """
 from __future__ import annotations
 
+from agent.schemas import DecisionValidationError, ValidationErrorKind
 from browser.page_model import PageObservation
 from inference import prompt as prompt_templates
 from memory.models import TaskRecord, TaskState
@@ -45,3 +46,55 @@ def build_replan_prompt(task: TaskRecord, state: TaskState) -> str:
         history_summary="\n".join(history_lines) or "(no actions yet)",
         blocked_reason=state.blocked_reason or "(unspecified)",
     )
+
+
+def build_contract_repair_prompt(
+    task: TaskRecord,
+    observation: PageObservation,
+    raw_response: str,
+    error: DecisionValidationError,
+    max_page_chars: int,
+    max_visible_text_items: int,
+) -> str:
+    lines = [
+        prompt_templates.SYSTEM_BLOCK,
+        prompt_templates.render_task_block(task.goal, task.success_criteria),
+        "CONTRACT REPAIR",
+        "Your previous response is invalid.",
+        f"Error: {error.kind.value}: {error.message}",
+        f"Previous response: {raw_response[:500]}",
+        _valid_targets_hint(error, observation),
+        "Return only one corrected JSON action using the current page IDs.",
+        observation.render_compact(max_page_chars, max_visible_text_items),
+    ]
+    return "\n\n".join(part for part in lines if part)
+
+
+def _valid_targets_hint(error: DecisionValidationError, observation: PageObservation) -> str:
+    if error.kind == ValidationErrorKind.MISSING_TARGET:
+        raw = error.message.lower()
+        if "select" in raw:
+            roles = {"select", "combobox"}
+        elif "type" in raw:
+            roles = {"textbox"}
+        else:
+            roles = {"button", "link", "checkbox", "radio", "tab", "menuitem", "select", "combobox", "textbox"}
+    elif error.kind == ValidationErrorKind.TARGET_TYPE_MISMATCH:
+        raw = error.message.lower()
+        if "select" in raw:
+            roles = {"select", "combobox"}
+        elif "type" in raw:
+            roles = {"textbox"}
+        else:
+            roles = {e.role for e in observation.elements}
+    else:
+        roles = {e.role for e in observation.elements}
+
+    rows = [e for e in observation.elements if e.role in roles and not e.disabled]
+    if not rows:
+        return "No valid element targets of the required type are visible on the current page."
+    rendered = ["Current valid targets:"]
+    for e in rows:
+        suffix = f" options={e.options}" if e.options else ""
+        rendered.append(f'[{e.id}] {e.role} "{e.name}"{suffix}')
+    return "\n".join(rendered)

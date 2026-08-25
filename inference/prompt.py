@@ -26,14 +26,43 @@ AVAILABLE ACTIONS: {ACTION_VOCAB}
 - back(): go to the previous page. No target.
 - extract(target|none): return visible text of one element, or the whole page if no target.
 - download(target): click a link/button expected to start a file download.
-- wait(params): wait for a condition (for_text, url_contains, or a short ms timeout).
-- finish(params.result): the task is complete; params.result summarizes the outcome.
+- wait(for_text|url_contains|ms): wait for a condition or a short timeout.
+- finish(result): the task is complete; result summarizes the outcome.
 
 OUTPUT CONTRACT
-Respond with exactly one JSON object, nothing else, matching:
-{{"action": "<one of the actions above>", "target": <element id or null>, "params": {{}}, "expected_result": {{...assertions...}}, "confidence": <0.0-1.0>}}
-expected_result may include any of: url_contains, page_contains, element_present, element_absent, title_contains.
-Always include expected_result for any action that changes the page. Keep it minimal and concrete.
+Respond with exactly one JSON object, nothing else. Use only fields needed by that action:
+{{"action":"open_url","url":"http://example.com"}}
+{{"action":"click","target":17}}
+{{"action":"type","target":8,"text":"alpha"}}
+{{"action":"select","target":22,"value":"Advanced"}}
+{{"action":"scroll","direction":"down"}}
+{{"action":"back"}}
+{{"action":"extract","target":17}}
+{{"action":"download","target":31}}
+{{"action":"wait","for_text":"Done"}}
+{{"action":"finish","result":"Done."}}
+
+Element IDs are the numbers in square brackets. If you act on [22] select "Mode",
+your target must be 22. Never invent a target. Never omit target for actions that
+require an element. Never use an element ID from a previous page observation.
+Use download(target), not click(target), for controls whose visible purpose is downloading
+a file.
+
+If all success criteria are already satisfied in the current page state, do not take
+another browser action. Return finish.
+
+GENERIC EXAMPLES
+PAGE: [4] textbox "Search"; [5] button "Search"
+Goal: search for a term
+Correct: {{"action":"type","target":4,"text":"term"}}
+
+PAGE: [8] select "Mode" options=["Basic","Advanced"]
+Goal: choose Advanced
+Correct: {{"action":"select","target":8,"value":"Advanced"}}
+
+Goal has been achieved.
+Correct: {{"action":"finish","result":"The requested result is visible."}}
+
 Do not narrate. Do not explain. Output only the JSON object."""
 
 
@@ -54,7 +83,13 @@ def render_recent_actions_block(recent: list[dict]) -> str:
     lines = ["RECENT ACTIONS"]
     for r in recent:
         verification = r.get("verification", "unknown")
-        lines.append(f"- step {r['step']}: {r['action']} target={r.get('target')} -> {verification}")
+        detail = ""
+        result_data = r.get("result_data") or {}
+        if result_data.get("suggested_filename"):
+            detail = f" ({result_data['suggested_filename']})"
+        elif result_data.get("extracted"):
+            detail = " (extracted text)"
+        lines.append(f"- step {r['step']}: {r['action']} target={r.get('target')}{detail} -> {verification}")
     return "\n".join(lines)
 
 

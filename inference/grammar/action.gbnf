@@ -1,40 +1,29 @@
-# GBNF grammar for the outer ModelDecision JSON shape (llama.cpp grammar-constrained decoding).
+# GBNF grammar for the action-specific BrowserAction JSON contract.
 #
-# Scope note (see docs/IMPLEMENTATION_PLAN_PHASES_1_3.md): this grammar guarantees the
-# action enum, target shape, confidence range, and a length-capped optional reason string.
-# `params` and `expected_result` are constrained to well-formed generic JSON objects here;
-# their action-specific field shapes are enforced afterward by agent/schemas.py + semantic
-# validation in agent/decision.py (defense-in-depth layers 3-4, not the grammar).
+# The grammar is deliberately ordered to make constrained decoding practical for
+# llama.cpp. The Python parser accepts normal JSON object ordering and performs the
+# same action-specific validation for both llama.cpp and Ollama outputs.
 
-root ::= "{" ws
-  "\"action\"" ws ":" ws action-value ws ","  ws
-  "\"target\""  ws ":" ws target-value  ws "," ws
-  "\"params\""  ws ":" ws object        ws "," ws
-  "\"expected_result\"" ws ":" ws object ws "," ws
-  "\"confidence\"" ws ":" ws confidence
-  (ws "," ws "\"reason\"" ws ":" ws reason-string)?
-  ws "}"
+root ::= open-url | click | type | select | scroll | back | extract | download | wait | finish
 
-action-value ::= "\"open_url\"" | "\"click\"" | "\"type\"" | "\"select\"" | "\"scroll\""
-                | "\"back\"" | "\"extract\"" | "\"download\"" | "\"wait\"" | "\"finish\""
+open-url ::= "{" ws "\"action\"" ws ":" ws "\"open_url\"" ws "," ws "\"url\"" ws ":" ws string ws "}"
+click ::= "{" ws "\"action\"" ws ":" ws "\"click\"" ws "," ws "\"target\"" ws ":" ws integer ws "}"
+type ::= "{" ws "\"action\"" ws ":" ws "\"type\"" ws "," ws "\"target\"" ws ":" ws integer ws "," ws "\"text\"" ws ":" ws string ws "}"
+select ::= "{" ws "\"action\"" ws ":" ws "\"select\"" ws "," ws "\"target\"" ws ":" ws integer ws "," ws "\"value\"" ws ":" ws string ws "}"
+scroll ::= "{" ws "\"action\"" ws ":" ws "\"scroll\"" (ws "," ws "\"direction\"" ws ":" ws direction)? ws "}"
+back ::= "{" ws "\"action\"" ws ":" ws "\"back\"" ws "}"
+extract ::= "{" ws "\"action\"" ws ":" ws "\"extract\"" (ws "," ws "\"target\"" ws ":" ws (integer | "null"))? ws "}"
+download ::= "{" ws "\"action\"" ws ":" ws "\"download\"" ws "," ws "\"target\"" ws ":" ws integer ws "}"
+wait ::= "{" ws "\"action\"" ws ":" ws "\"wait\"" wait-field? ws "}"
+finish ::= "{" ws "\"action\"" ws ":" ws "\"finish\"" ws "," ws "\"result\"" ws ":" ws string ws "}"
 
-target-value ::= integer | "null"
+wait-field ::= ws "," ws (wait-for-text | wait-url | wait-ms)
+wait-for-text ::= "\"for_text\"" ws ":" ws string
+wait-url ::= "\"url_contains\"" ws ":" ws string
+wait-ms ::= "\"ms\"" ws ":" ws integer
 
-confidence ::= "0" "." [0-9]+ | "1" "." "0"+ | "0" | "1"
+direction ::= "\"up\"" | "\"down\""
 
-reason-string ::= "\"" [^"\\]{0,120} "\""
-
-integer ::= "-"? [0-9]+
-number  ::= "-"? [0-9]+ ("." [0-9]+)?
-
+integer ::= "0" | [1-9] [0-9]*
 string ::= "\"" ( [^"\\] | "\\" ["\\/bfnrt] )* "\""
-
-value ::= string | number | "true" | "false" | "null" | object | array
-
-kv ::= string ws ":" ws value
-
-object ::= "{" ws (kv (ws "," ws kv)*)? ws "}"
-
-array ::= "[" ws (value (ws "," ws value)*)? ws "]"
-
 ws ::= [ \t\n]*

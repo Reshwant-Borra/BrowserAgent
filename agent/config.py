@@ -18,9 +18,11 @@ _ENV_PREFIX = "BROWSER_AGENT_"
 
 @dataclass
 class ModelConfig:
-    backend: str = "llama_cpp"
-    endpoint: str = "http://127.0.0.1:8080"
-    model_name: str = "qwen3-8b"
+    backend: str = "ollama"
+    endpoint: str = ""
+    ollama_endpoint: str = "http://127.0.0.1:11434"
+    llamacpp_endpoint: str = "http://127.0.0.1:8080"
+    model_name: str = "qwen3:8b"
     temperature: float = 0.1
     context_window: int = 8192
     max_output_tokens: int = 256
@@ -54,6 +56,7 @@ class RecoveryConfig:
 
 @dataclass
 class StorageConfig:
+    runtime_dir: str = "./runtime"
     tasks_dir: str = "./runtime/tasks"
 
 
@@ -124,7 +127,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         with open(path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
     raw = _apply_env_overrides(raw)
-    return AppConfig(
+    config = AppConfig(
         model=_coerce(ModelConfig, raw.get("model", {})),
         browser=_coerce(BrowserConfig, raw.get("browser", {})),
         context=_coerce(ContextConfig, raw.get("context", {})),
@@ -132,3 +135,17 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         storage=_coerce(StorageConfig, raw.get("storage", {})),
         logging=_coerce(LoggingConfig, raw.get("logging", {})),
     )
+    _resolve_runtime_paths(config)
+    return config
+
+
+def _resolve_runtime_paths(config: AppConfig) -> None:
+    runtime_dir = Path(config.storage.runtime_dir)
+    default_tasks = Path("./runtime/tasks")
+    default_logs = Path("./runtime/logs")
+    if Path(config.storage.tasks_dir) == default_tasks:
+        config.storage.tasks_dir = str(runtime_dir / "tasks")
+    if Path(config.browser.user_data_dir) == default_tasks:
+        config.browser.user_data_dir = str(runtime_dir / "tasks")
+    if Path(config.logging.dir) == default_logs:
+        config.logging.dir = str(runtime_dir / "logs")

@@ -1,0 +1,36 @@
+tasks:
+  - id: holdout_docs_from_home
+    goal: "Open the Documentation page from the holdout home page and finish when it is visible."
+    start_url: "{base_url}/holdout_home.html"
+    success_criteria:
+      - "Documentation"
+    max_steps: 10
+
+  - id: holdout_products_pro_price
+    goal: "Navigate to the product catalog and tell me the price of the Pro plan."
+    start_url: "{base_url}/holdout_home.html"
+    success_criteria:
+      - "Pro plan"
+      - "$29"
+    max_steps: 10
+
+  - id: holdout_search_beta
+    goal: 'Use Lookup to search for "beta", open the matching result, and finish when its detail page is visible.'
+    start_url: "{base_url}/holdout_home.html"
+    success_criteria:
+      - "detail page for beta"
+    max_steps: 10
+
+  - id: holdout_preferences_compact
+    goal: 'Open Preferences, choose "Compact" from the Density dropdown, and verify compact layout is enabled.'
+    start_url: "{base_url}/holdout_settings.html"
+    success_criteria:
+      - "Compact layout enabled"
+    max_steps: 10
+
+  - id: holdout_download_report
+    goal: "Download the report.csv file and finish after confirming the download."
+    start_url: "{base_url}/holdout_download.html"
+    success_criteria:
+      - "report.csv"
+    max_steps: 10

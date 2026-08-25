@@ -6,9 +6,9 @@ GBNF -> JSON parse -> this Pydantic schema -> semantic validation in agent/decis
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Annotated, Any, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 REASON_MAX_CHARS = 120
 
@@ -48,12 +48,20 @@ class ExpectedResult(BaseModel):
 
 
 class ModelDecision(BaseModel):
+    """Executor-facing normalized action.
+
+    The model-facing contract is the discriminated union below. This legacy-normalized
+    shape remains the internal transport used by the existing executor, verifier, and
+    replay code.
+    """
+
     action: ActionType
     target: Optional[int] = None
     params: dict[str, Any] = Field(default_factory=dict)
     expected_result: ExpectedResult = Field(default_factory=ExpectedResult)
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     reason: Optional[str] = None
+    verification_mode: Literal["legacy", "action_default"] = "legacy"
 
     @field_validator("reason", mode="before")
     @classmethod
@@ -63,9 +71,87 @@ class ModelDecision(BaseModel):
         return v[:REASON_MAX_CHARS]
 
 
+class _StrictAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class OpenUrlAction(_StrictAction):
+    action: Literal["open_url"]
+    url: str
+
+
+class ClickAction(_StrictAction):
+    action: Literal["click"]
+    target: int
+
+
+class TypeAction(_StrictAction):
+    action: Literal["type"]
+    target: int
+    text: str
+
+
+class SelectAction(_StrictAction):
+    action: Literal["select"]
+    target: int
+    value: str
+
+
+class ScrollAction(_StrictAction):
+    action: Literal["scroll"]
+    direction: Literal["up", "down"] = "down"
+
+
+class BackAction(_StrictAction):
+    action: Literal["back"]
+
+
+class ExtractAction(_StrictAction):
+    action: Literal["extract"]
+    target: Optional[int] = None
+
+
+class DownloadAction(_StrictAction):
+    action: Literal["download"]
+    target: int
+
+
+class WaitAction(_StrictAction):
+    action: Literal["wait"]
+    for_text: Optional[str] = None
+    url_contains: Optional[str] = None
+    ms: Optional[int] = Field(default=None, ge=0, le=3000)
+
+
+class FinishAction(_StrictAction):
+    action: Literal["finish"]
+    result: str
+
+
+ModelAction = Annotated[
+    Union[
+        OpenUrlAction,
+        ClickAction,
+        TypeAction,
+        SelectAction,
+        ScrollAction,
+        BackAction,
+        ExtractAction,
+        DownloadAction,
+        WaitAction,
+        FinishAction,
+    ],
+    Field(discriminator="action"),
+]
+
+
 class ValidationErrorKind(str, Enum):
     MALFORMED_JSON = "malformed_json"
     SCHEMA_INVALID = "schema_invalid"
+    MODEL_TARGET_BINDING_ERROR = "model_target_binding_error"
+    MODEL_INTENT_ERROR = "model_intent_error"
+    MODEL_PARAMETER_ERROR = "model_parameter_error"
+    MODEL_COMPLETION_ERROR = "model_completion_error"
     STALE_TARGET = "stale_target"
     TARGET_TYPE_MISMATCH = "target_type_mismatch"
     MISSING_TARGET = "missing_target"

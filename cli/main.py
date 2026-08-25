@@ -16,7 +16,7 @@ from pathlib import Path
 
 from agent.config import load_config
 from agent.loop import AgentLoop
-from inference.llama_client import ModelUnavailableError, create_inference_client
+from inference.llama_client import ModelUnavailableError, active_model_endpoint, create_inference_client
 
 
 def _print_status(state, task=None) -> None:
@@ -34,7 +34,7 @@ async def cmd_run(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     llama = create_inference_client(config)
     if not await llama.health_check():
-        print(f"Local model endpoint unavailable:\n{config.model.endpoint}\n\n"
+        print(f"Local model endpoint unavailable:\n{active_model_endpoint(config)}\n\n"
               f"Start the configured {config.model.backend} backend before running the agent.")
         sys.exit(1)
 

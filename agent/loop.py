@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from agent.config import AppConfig
-from agent.context_builder import build_prompt, build_replan_prompt
+from agent.context_builder import build_contract_repair_prompt, build_prompt, build_replan_prompt
 from agent.decision import parse_model_output, validate_against_observation
 from agent.logging_utils import JsonlLogger, get_logger
 from agent.loop_detector import (
@@ -31,6 +31,7 @@ from agent.schemas import (
     ModelDecision,
     RecoveryLevel,
     RiskLevel,
+    ValidationErrorKind,
     classify_risk,
 )
 from agent import verifier as verifier_mod
@@ -184,10 +185,7 @@ class AgentLoop:
             max_tokens = self.config.model.max_output_tokens_deep_recovery
 
         observation = await self.browser.observe()
-        self.event_store.append(self.task_id, step_no, EventType.OBSERVATION, {
-            "url": observation.url, "page_hash": observation.state_hash,
-            "element_count": observation.element_count, "char_count": observation.char_count,
-        })
+        self._append_observation_event(step_no, observation, phase="pre_decision")
         self.metrics.log(event="observation", task_id=self.task_id, step=step_no,
                           element_count=observation.element_count, char_count=observation.char_count,
                           truncated=observation.truncated)
@@ -212,14 +210,16 @@ class AgentLoop:
                           page_char_count=observation.char_count, endpoint=self.llama.endpoint,
                           model_backend=self.config.model.backend, model_name=self.config.model.model_name)
 
-        try:
-            decision = parse_model_output(completion.text)
-            validate_against_observation(decision, observation)
-        except DecisionValidationError as e:
-            self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION,
-                                     {"raw": completion.text[:2000], "error": e.kind.value, "message": e.message})
+        decision = await self._parse_validate_or_repair(
+            task, state, step_no, prompt, completion.text, observation, max_chars,
+            self.config.context.max_visible_text_items, max_tokens,
+        )
+        if decision is None:
             state = self.state_store.load(self.task_id)
-            return self._advance_recovery(state, step_no, verification_passed=False, loop_detected=False)
+            return self._advance_recovery(
+                state, step_no, verification_passed=False, loop_detected=False,
+                reason_override="MODEL_CONTRACT_ERROR",
+            )
 
         self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION,
                                  {"decision": decision.model_dump(mode="json")})
@@ -279,16 +279,17 @@ class AgentLoop:
 
         new_observation = await self.browser.observe()
         post_hash = new_observation.state_hash
+        self._append_observation_event(step_no, new_observation, phase="post_action")
 
         self.event_store.append(self.task_id, step_no, EventType.ACTION_RESULT, {
             "action_fingerprint": fingerprint, "post_state_hash": post_hash,
             "result_data": result_data, "error": error,
         })
 
-        verification = verifier_mod.check(decision.expected_result, new_observation)
+        verification = verifier_mod.check_hybrid(decision, observation, new_observation, result_data, error)
         self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {
             "action": decision.action.value, "target": decision.target, "action_fingerprint": fingerprint,
-            "url": new_observation.url,
+            "url": new_observation.url, "result_data": self._safe_result_data(decision, result_data),
         }, verification_result=verification.model_dump())
 
         self.metrics.log(event="action", task_id=self.task_id, step=step_no, action=decision.action.value,
@@ -310,13 +311,97 @@ class AgentLoop:
 
     # ---- helpers -----------------------------------------------------------
 
+    def _append_observation_event(self, step_no: int, observation: PageObservation, phase: str) -> None:
+        self.event_store.append(self.task_id, step_no, EventType.OBSERVATION, {
+            "url": observation.url,
+            "title": observation.title,
+            "page_hash": observation.state_hash,
+            "element_count": observation.element_count,
+            "char_count": observation.char_count,
+            "phase": phase,
+            "element_names": [e.name for e in observation.elements[:30]],
+            "visible_text": observation.visible_text[:30],
+        })
+
+    async def _parse_validate_or_repair(
+        self,
+        task: TaskRecord,
+        state: TaskState,
+        step_no: int,
+        prompt: str,
+        raw_text: str,
+        observation: PageObservation,
+        max_chars: int,
+        max_visible_text_items: int,
+        max_tokens: int,
+    ) -> Optional[ModelDecision]:
+        try:
+            decision = parse_model_output(raw_text)
+            validate_against_observation(decision, observation)
+            self.metrics.log(event="model_contract", task_id=self.task_id, step=step_no,
+                              syntax_valid=True, schema_valid=True, semantic_valid=True,
+                              repair_attempt=False, repair_success=None)
+            return decision
+        except DecisionValidationError as first_error:
+            syntax_valid = first_error.kind != ValidationErrorKind.MALFORMED_JSON
+            schema_valid = first_error.kind not in {
+                ValidationErrorKind.MALFORMED_JSON,
+                ValidationErrorKind.SCHEMA_INVALID,
+            }
+            self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION, {
+                "raw": raw_text[:2000],
+                "error": first_error.kind.value,
+                "message": first_error.message,
+                "contract_error": True,
+                "repair_attempted": True,
+            })
+
+            repair_prompt = build_contract_repair_prompt(
+                task, observation, raw_text, first_error, max_chars, max_visible_text_items,
+            )
+            repair_completion = await self.llama.complete(
+                repair_prompt, grammar=self.grammar, max_tokens=max_tokens,
+            )
+            self.metrics.log(event="model_call", task_id=self.task_id, step=step_no,
+                              input_chars=len(repair_prompt), prompt_tokens=repair_completion.prompt_tokens,
+                              output_tokens=repair_completion.predicted_tokens,
+                              prompt_ms=repair_completion.prompt_ms,
+                              predicted_ms=repair_completion.predicted_ms,
+                              total_latency_ms=repair_completion.total_latency_ms,
+                              recovery_level=state.recovery_level, page_element_count=observation.element_count,
+                              page_char_count=observation.char_count, endpoint=self.llama.endpoint,
+                              model_backend=self.config.model.backend, model_name=self.config.model.model_name,
+                              contract_repair=True)
+            try:
+                repaired = parse_model_output(repair_completion.text)
+                validate_against_observation(repaired, observation)
+                self.metrics.log(event="model_contract", task_id=self.task_id, step=step_no,
+                                  syntax_valid=syntax_valid, schema_valid=schema_valid,
+                                  semantic_valid=True, repair_attempt=True, repair_success=True)
+                return repaired
+            except DecisionValidationError as repair_error:
+                self.metrics.log(event="model_contract", task_id=self.task_id, step=step_no,
+                                  syntax_valid=syntax_valid, schema_valid=schema_valid,
+                                  semantic_valid=False, repair_attempt=True, repair_success=False)
+                self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION, {
+                    "raw": repair_completion.text[:2000],
+                    "error": repair_error.kind.value,
+                    "message": repair_error.message,
+                    "contract_error": True,
+                    "repair_attempt": True,
+                    "repair_success": False,
+                })
+                return None
+
     def _advance_recovery(self, state: TaskState, step_no: int, verification_passed: bool,
-                           loop_detected: bool) -> TaskState:
+                           loop_detected: bool, reason_override: Optional[str] = None) -> TaskState:
         current = RecoveryLevel(state.recovery_level)
         new_level = next_recovery_level(current, verification_passed, loop_detected,
                                          state.retry_count, self.config.recovery.max_action_retries)
         if new_level != current:
-            reason = "loop_detected" if loop_detected else ("verification_failed" if not verification_passed else "recovered")
+            reason = reason_override or (
+                "loop_detected" if loop_detected else ("verification_failed" if not verification_passed else "recovered")
+            )
             self.event_store.append(self.task_id, step_no, EventType.RECOVERY_TRANSITION,
                                      {"from": current.value, "to": new_level.value, "reason": reason})
         state.recovery_level = new_level.value
@@ -361,6 +446,13 @@ class AgentLoop:
         if decision.action == ActionType.TYPE and element is not None and element.sensitive:
             return {**decision.params, "text": "***REDACTED***"}
         return decision.params
+
+    def _safe_result_data(self, decision: ModelDecision, result_data: dict) -> dict:
+        if decision.action == ActionType.DOWNLOAD:
+            return {"suggested_filename": result_data.get("suggested_filename")}
+        if decision.action == ActionType.EXTRACT:
+            return {"extracted": result_data.get("extracted")}
+        return {}
 
     def _prompt_for_approval(self, decision: ModelDecision, element: Optional[ElementRef]) -> bool:
         name = element.name if element else "(no target)"
