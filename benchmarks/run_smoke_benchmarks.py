@@ -134,7 +134,10 @@ def _context_stats(metrics: list[dict[str, Any]]) -> dict[str, Any]:
         if (m.get("prompt_tokens") or m.get("total_estimated_prompt_tokens")) is not None
     ]
     block_rows = [m.get("context_block_tokens") or {} for m in calls]
-    block_names = ["static_prefix", "task_state", "running_summary", "recent_window", "retrieved_memory", "page"]
+    block_names = [
+        "static_prefix", "task_state", "active_facts", "running_summary",
+        "recent_window", "retrieved_memory", "page",
+    ]
     block_avgs = {}
     for name in block_names:
         values = [row.get(name, 0) for row in block_rows if row]
@@ -147,6 +150,11 @@ def _context_stats(metrics: list[dict[str, Any]]) -> dict[str, Any]:
         "retrieved_memory_count_total": sum(int(m.get("retrieved_memory_count", 0) or 0) for m in calls),
         "latency_first_half_ms_avg": _latency_window(calls, first=True),
         "latency_second_half_ms_avg": _latency_window(calls, first=False),
+        "event_load_ms_avg": _metric_avg(calls, "event_load_ms"),
+        "memory_ingest_ms_avg": _metric_avg(calls, "memory_ingest_ms"),
+        "summary_update_ms_avg": _metric_avg(calls, "summary_update_ms"),
+        "fts_search_ms_avg": _metric_avg(calls, "fts_search_ms"),
+        "context_render_ms_avg": _metric_avg(calls, "context_render_ms"),
     }
 
 
@@ -157,6 +165,95 @@ def _latency_window(calls: list[dict[str, Any]], first: bool) -> float | None:
     subset = calls[:midpoint] if first else calls[midpoint:]
     values = [m.get("total_latency_ms") for m in subset if m.get("total_latency_ms") is not None]
     return statistics.mean(values) if values else None
+
+
+def _metric_avg(rows: list[dict[str, Any]], key: str) -> float | None:
+    values = [r.get(key) for r in rows if r.get(key) is not None]
+    return statistics.mean(values) if values else None
+
+
+def _memory_expectation_stats(
+    event_store: EventStore,
+    task_id: str,
+    expectations: list[dict[str, str]],
+    metrics: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not expectations:
+        return {
+            "required_facts_observed": None,
+            "required_facts_persisted": None,
+            "required_facts_selected": None,
+            "required_facts_prompted": None,
+            "required_facts_applied": None,
+            "memory_failure_stage": "",
+        }
+    evidence = _event_blob(events)
+    fact_rows = event_store.conn.execute(
+        "SELECT id, key, value, source_event_id FROM active_task_facts WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    required_ids: set[int] = set()
+    required_source_ids: set[int] = set()
+    observed = 0
+    persisted = 0
+    for expectation in expectations:
+        key = expectation["key"].lower()
+        value = expectation["value"].lower()
+        if value in evidence:
+            observed += 1
+        matches = [
+            row for row in fact_rows
+            if row["key"].lower() == key and row["value"].lower() == value
+        ]
+        if matches:
+            persisted += 1
+            required_ids.update(int(row["id"]) for row in matches)
+            required_source_ids.update(int(row["source_event_id"]) for row in matches)
+    model_calls = [m for m in metrics if m.get("event") == "model_call"]
+    selected_ids = {
+        int(item) for m in model_calls for item in (m.get("active_fact_ids") or [])
+    }
+    selected_source_ids = {
+        int(item) for m in model_calls for item in (m.get("selected_memory_source_event_ids") or [])
+    }
+    selected = len(required_ids & selected_ids) + len(required_source_ids & selected_source_ids)
+    prompted = len(required_ids & selected_ids)
+    application_rows = [m for m in metrics if m.get("event") == "memory_application"]
+    applied_ids = {
+        int(item) for m in application_rows for item in (m.get("matched_fact_ids") or [])
+    }
+    applied = len(required_ids & applied_ids)
+    stage = ""
+    total = len(expectations)
+    if observed < total:
+        stage = "FACT_NOT_OBSERVED"
+    elif persisted < total:
+        stage = "STORAGE_MISS"
+    elif selected < total:
+        stage = "RETRIEVAL_MISS"
+    elif prompted < total:
+        stage = "PROMPT_MISS"
+    elif applied < total:
+        stage = "PRESENT_NOT_APPLIED"
+    return {
+        "required_facts_observed": observed,
+        "required_facts_persisted": persisted,
+        "required_facts_selected": min(selected, total),
+        "required_facts_prompted": min(prompted, total),
+        "required_facts_applied": min(applied, total),
+        "memory_failure_stage": stage,
+    }
+
+
+def _event_blob(events: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for event in events:
+        payload = event.get("payload", {})
+        parts.append(json.dumps(payload))
+        if event.get("verification_result"):
+            parts.append(json.dumps(event["verification_result"]))
+    return "\n".join(parts).lower()
 
 
 async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: str,
@@ -170,24 +267,32 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
 
     start_url = task["start_url"].format(base_url=base_url)
     goal = f"Open {start_url}. {task['goal']}"
+    prompt_criteria = task.get("completion_criteria", task.get("success_criteria", []))
     started = time.monotonic()
-    loop = AgentLoop.create_new(config, goal, task.get("success_criteria", []))
+    loop = AgentLoop.create_new(config, goal, prompt_criteria)
     state = await loop.run(max_steps=int(task.get("max_steps", 10)))
     elapsed_ms = (time.monotonic() - started) * 1000
 
     event_store = EventStore(Path(config.storage.tasks_dir) / loop.task_id / "task.db")
     try:
         events = [e.model_dump(mode="json") for e in event_store.all_events(loop.task_id)]
+        metric_path = Path(config.logging.dir) / f"{loop.task_id}.metrics.jsonl"
+        metrics = _read_jsonl(metric_path)
+        memory_stats = _memory_expectation_stats(
+            event_store,
+            loop.task_id,
+            task.get("memory_expectations", []),
+            metrics,
+            events,
+        )
     finally:
         event_store.close()
-    metric_path = Path(config.logging.dir) / f"{loop.task_id}.metrics.jsonl"
-    metrics = _read_jsonl(metric_path)
     model_calls = [m for m in metrics if m.get("event") == "model_call"]
     actions = [e for e in events if e["type"] == EventType.ACTION_INTENT.value]
     recoveries = [e for e in events if e["type"] == EventType.RECOVERY_TRANSITION.value]
     task_completed = next((e for e in reversed(events) if e["type"] == EventType.TASK_COMPLETED.value), None)
     matched = task_completed["payload"].get("success_criteria_textual_matches", []) if task_completed else []
-    criteria = task.get("success_criteria", [])
+    criteria = prompt_criteria
     evaluation_criteria = task.get("evaluation_criteria", criteria)
     criteria_passed = len(matched) == len(criteria)
 
@@ -233,6 +338,7 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
         "verification_failures": failed_verifications,
         **contract,
         **context_stats,
+        **memory_stats,
         "duration_ms": elapsed_ms,
         "failure_category": _failure_category(events, state.status, environment_success),
         "metrics": metrics,

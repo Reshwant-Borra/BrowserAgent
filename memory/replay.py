@@ -49,6 +49,7 @@ def replay_task(task_id: str, events: list[Event]) -> TaskState:
                 "action": action_payload.get("action"),
                 "target": action_payload.get("target"),
                 "action_fingerprint": action_payload.get("action_fingerprint"),
+                "semantic_action_signature": action_payload.get("semantic_action_signature"),
                 "url": action_payload.get("url"),
                 "result_data": action_payload.get("result_data") or {},
                 "verification": "pass" if passed else "fail",

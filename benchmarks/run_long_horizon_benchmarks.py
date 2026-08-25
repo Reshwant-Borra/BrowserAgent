@@ -18,16 +18,32 @@ VARIANTS = {
         "recent_actions": 5,
         "enable_running_summary": False,
         "enable_memory_retrieval": False,
+        "enable_active_facts": False,
     },
     "B_summary": {
         "recent_actions": 5,
         "enable_running_summary": True,
         "enable_memory_retrieval": False,
+        "enable_active_facts": False,
     },
-    "C_summary_retrieval": {
+    "C_page_aware_retrieval": {
         "recent_actions": 5,
         "enable_running_summary": True,
         "enable_memory_retrieval": True,
+        "enable_active_facts": False,
+    },
+    "D_active_facts": {
+        "recent_actions": 5,
+        "enable_running_summary": True,
+        "enable_memory_retrieval": True,
+        "enable_active_facts": True,
+    },
+    "E_constraint_guard": {
+        "recent_actions": 5,
+        "enable_running_summary": True,
+        "enable_memory_retrieval": True,
+        "enable_active_facts": True,
+        "enforce_active_fact_constraints": True,
     },
 }
 

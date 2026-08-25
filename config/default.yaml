@@ -29,6 +29,9 @@ context:
   retrieved_memory_top_k: 5
   enable_running_summary: true
   enable_memory_retrieval: true
+  enable_active_facts: true
+  active_fact_tokens: 300
+  enforce_active_fact_constraints: false
   summary_rebuild_interval: 4
 
 recovery:

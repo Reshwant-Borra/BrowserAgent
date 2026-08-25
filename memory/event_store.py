@@ -88,6 +88,16 @@ class EventStore:
         rows = self.conn.execute(
             "SELECT * FROM events WHERE task_id = ? ORDER BY id ASC", (task_id,)
         ).fetchall()
+        return self._rows_to_events(rows)
+
+    def events_after(self, task_id: str, event_id: int) -> list[Event]:
+        rows = self.conn.execute(
+            "SELECT * FROM events WHERE task_id = ? AND id > ? ORDER BY id ASC",
+            (task_id, event_id),
+        ).fetchall()
+        return self._rows_to_events(rows)
+
+    def _rows_to_events(self, rows: list[sqlite3.Row]) -> list[Event]:
         return [
             Event(
                 id=r["id"], task_id=r["task_id"], step=r["step"], timestamp=r["timestamp"],

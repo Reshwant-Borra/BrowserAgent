@@ -10,6 +10,13 @@ tasks:
       - "Configuration saved: Balanced"
       - "Region saved: West"
       - "BX-19"
+    memory_expectations:
+      - key: mode
+        value: Balanced
+      - key: region
+        value: West
+      - key: token
+        value: BX-19
 
   - id: holdout_research_38
     goal: "Collect the three facts from the early sections, continue to the end, enter the combined facts in order, and finish."
@@ -17,8 +24,18 @@ tasks:
     max_steps: 65
     tier: holdout
     success_criteria: []
+    completion_criteria:
+      - "Final synthesis"
+      - "Combined result"
     evaluation_criteria:
       - "Combined result: Beacon Ivory Harbor"
+    memory_expectations:
+      - key: fact 1
+        value: Beacon
+      - key: fact 2
+        value: Ivory
+      - key: fact 3
+        value: Harbor
 
   - id: holdout_download_88
     goal: "Remember the required artifact from the first page, navigate to the download center, download exactly that artifact, and finish after confirming the download."
@@ -28,3 +45,6 @@ tasks:
     success_criteria: []
     evaluation_criteria:
       - "audit-bundle-q3.txt"
+    memory_expectations:
+      - key: artifact
+        value: audit-bundle-q3.txt
