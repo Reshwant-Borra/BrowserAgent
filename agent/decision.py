@@ -143,6 +143,12 @@ def validate_against_observation(decision: ModelDecision, observation: PageObser
                     ValidationErrorKind.INVALID_OPTION,
                     f"'{value}' is not one of the available options for target {decision.target}: {element.options}",
                 )
+    elif action == ActionType.EXTRACT and decision.target is not None:
+        if observation.element_by_id(decision.target) is None:
+            raise DecisionValidationError(
+                ValidationErrorKind.STALE_TARGET,
+                f"target id {decision.target} is not present in the current observation",
+            )
 
     if action == ActionType.OPEN_URL:
         url = decision.params.get("url", "")

@@ -43,3 +43,35 @@ CREATE TABLE IF NOT EXISTS task_state (
     last_event_id INTEGER,
     FOREIGN KEY(task_id) REFERENCES tasks(id)
 );
+
+CREATE TABLE IF NOT EXISTS task_summaries (
+    task_id TEXT PRIMARY KEY,
+    summary TEXT NOT NULL,
+    source_event_ids TEXT NOT NULL,  -- JSON array
+    covered_event_id INTEGER NOT NULL,
+    compaction_count INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS task_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    content TEXT NOT NULL,
+    source_event_id INTEGER NOT NULL,
+    importance REAL NOT NULL DEFAULT 0.5,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL,
+    last_used_at TEXT,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_memories_unique
+ON task_memories(task_id, kind, content, source_event_id);
+
+CREATE INDEX IF NOT EXISTS idx_task_memories_task
+ON task_memories(task_id, source_event_id);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS task_memories_fts
+USING fts5(content, kind, content='task_memories', content_rowid='id');

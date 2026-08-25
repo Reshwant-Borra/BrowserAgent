@@ -1,0 +1,79 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Long Research Workflow</title>
+</head>
+<body>
+  <h1 id="title">Research Workflow</h1>
+  <main id="app"></main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const total = Number(params.get("steps") || "32");
+    const variant = params.get("variant") || "alpha";
+    const facts = {
+      alpha: ["Atlas", "Copper", "Delta"],
+      beta: ["Beacon", "Ivory", "Harbor"],
+      gamma: ["Cinder", "Jade", "Orbit"]
+    };
+    const needed = facts[variant] || facts.alpha;
+    let step = Number(sessionStorage.getItem("long_research_step_" + variant) || "1");
+    let answer = "";
+
+    function render() {
+      const app = document.getElementById("app");
+      document.title = "Research Workflow - Step " + step;
+      document.getElementById("title").textContent = "Research Workflow - Step " + step + " of " + total;
+      if (step <= 3) {
+        app.innerHTML = `
+          <h2>Source section ${step}</h2>
+          <p>Fact ${step}: ${needed[step - 1]}</p>
+          <button id="next">Continue</button>
+          <button id="decoy">Open unrelated appendix</button>
+        `;
+      } else if (step < total) {
+        app.innerHTML = `
+          <h2>Analysis page ${step}</h2>
+          <p>Compare notes, inspect summaries, and continue through the workflow.</p>
+          <button id="next">Continue</button>
+        `;
+      } else {
+        app.innerHTML = `
+          <h2>Final synthesis</h2>
+          <label for="answer">Combined facts</label>
+          <input id="answer" aria-label="Combined facts">
+          <button id="check">Check answer</button>
+        `;
+      }
+      const next = document.getElementById("next");
+      if (next) {
+        next.onclick = () => {
+          step += 1;
+          sessionStorage.setItem("long_research_step_" + variant, String(step));
+          history.pushState({}, "", `?variant=${variant}&steps=${total}&step=${step}`);
+          render();
+        };
+      }
+      const decoy = document.getElementById("decoy");
+      if (decoy) {
+        decoy.onclick = () => {
+          const note = document.createElement("p");
+          note.textContent = "Appendix fact: unrelated.";
+          app.appendChild(note);
+        };
+      }
+      const check = document.getElementById("check");
+      if (check) {
+        check.onclick = () => {
+          answer = document.getElementById("answer").value.trim();
+          const expected = needed.join(" ");
+          const result = document.createElement("p");
+          result.textContent = answer === expected ? `Combined result: ${expected}` : "Combined result is incorrect.";
+          app.appendChild(result);
+        };
+      }
+    }
+    render();
+  </script>
+</body>
+</html>

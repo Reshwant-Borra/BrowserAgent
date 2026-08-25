@@ -1,0 +1,51 @@
+tasks:
+  - id: tier4_config_36
+    goal: "Complete the configuration workflow. Remember the requirements from the first page and apply them on the final configuration page."
+    start_url: "{base_url}/long_config.html?variant=alpha&steps=36"
+    max_steps: 55
+    tier: 4
+    success_criteria:
+      - "Configuration saved"
+    evaluation_criteria:
+      - "Configuration saved: Advanced"
+      - "Region saved: North"
+      - "AX-47"
+
+  - id: tier4_research_32
+    goal: "Collect the three facts from the early source sections, continue through the workflow, enter the combined facts in order at the end, and finish."
+    start_url: "{base_url}/long_research.html?variant=alpha&steps=32"
+    max_steps: 55
+    tier: 4
+    success_criteria: []
+    evaluation_criteria:
+      - "Combined result: Atlas Copper Delta"
+
+  - id: tier4_download_42
+    goal: "Identify the required artifact on the first page, continue through the documentation workflow, download exactly that artifact at the end, and finish after confirming the download."
+    start_url: "{base_url}/long_download.html?variant=alpha&steps=42"
+    max_steps: 65
+    tier: 4
+    success_criteria: []
+    evaluation_criteria:
+      - "release-notes-v7.txt"
+
+  - id: tier5_config_96
+    goal: "Complete the extended configuration workflow. Remember the first-page requirements and apply them on the final configuration page."
+    start_url: "{base_url}/long_config.html?variant=gamma&steps=96"
+    max_steps: 130
+    tier: 5
+    success_criteria:
+      - "Configuration saved"
+    evaluation_criteria:
+      - "Configuration saved: Advanced"
+      - "Region saved: South"
+      - "GX-22"
+
+  - id: tier5_download_105
+    goal: "Identify the required artifact on the first page, continue through the extended documentation workflow, download exactly that artifact at the end, and finish after confirming the download."
+    start_url: "{base_url}/long_download.html?variant=gamma&steps=105"
+    max_steps: 135
+    tier: 5
+    success_criteria: []
+    evaluation_criteria:
+      - "dataset-manifest-r12.txt"

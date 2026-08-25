@@ -126,6 +126,39 @@ def _contract_rates(metrics: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _context_stats(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    calls = [m for m in metrics if m.get("event") == "model_call"]
+    prompt_tokens = [
+        m.get("prompt_tokens") or m.get("total_estimated_prompt_tokens")
+        for m in calls
+        if (m.get("prompt_tokens") or m.get("total_estimated_prompt_tokens")) is not None
+    ]
+    block_rows = [m.get("context_block_tokens") or {} for m in calls]
+    block_names = ["static_prefix", "task_state", "running_summary", "recent_window", "retrieved_memory", "page"]
+    block_avgs = {}
+    for name in block_names:
+        values = [row.get(name, 0) for row in block_rows if row]
+        block_avgs[name] = statistics.mean(values) if values else 0
+    return {
+        "prompt_tokens_avg": statistics.mean(prompt_tokens) if prompt_tokens else None,
+        "prompt_tokens_max": max(prompt_tokens) if prompt_tokens else None,
+        "context_block_tokens_avg": block_avgs,
+        "retrieved_memory_calls": sum(1 for m in calls if m.get("retrieved_memory_count", 0) > 0),
+        "retrieved_memory_count_total": sum(int(m.get("retrieved_memory_count", 0) or 0) for m in calls),
+        "latency_first_half_ms_avg": _latency_window(calls, first=True),
+        "latency_second_half_ms_avg": _latency_window(calls, first=False),
+    }
+
+
+def _latency_window(calls: list[dict[str, Any]], first: bool) -> float | None:
+    if not calls:
+        return None
+    midpoint = max(1, len(calls) // 2)
+    subset = calls[:midpoint] if first else calls[midpoint:]
+    values = [m.get("total_latency_ms") for m in subset if m.get("total_latency_ms") is not None]
+    return statistics.mean(values) if values else None
+
+
 async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: str,
                      output_dir: Path, trial: int) -> dict[str, Any]:
     config = load_config(config_path)
@@ -155,10 +188,11 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
     task_completed = next((e for e in reversed(events) if e["type"] == EventType.TASK_COMPLETED.value), None)
     matched = task_completed["payload"].get("success_criteria_textual_matches", []) if task_completed else []
     criteria = task.get("success_criteria", [])
+    evaluation_criteria = task.get("evaluation_criteria", criteria)
     criteria_passed = len(matched) == len(criteria)
 
     submit_overstep = _submit_overstep(events) if task["id"] == "tier3_wizard_no_overstep" else False
-    environment_success = _environment_success(events, criteria, task["id"])
+    environment_success = _environment_success(events, evaluation_criteria, task["id"])
     model_finish = task_completed is not None
 
     passed = model_finish and environment_success and not submit_overstep
@@ -179,6 +213,7 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
     )
 
     contract = _contract_rates(metrics)
+    context_stats = _context_stats(metrics)
 
     trial_record = {
         "task_id": task["id"],
@@ -197,6 +232,7 @@ async def _run_trial(config_path: str | None, task: dict[str, Any], base_url: st
         "schema_failures": schema_failures,
         "verification_failures": failed_verifications,
         **contract,
+        **context_stats,
         "duration_ms": elapsed_ms,
         "failure_category": _failure_category(events, state.status, environment_success),
         "metrics": metrics,

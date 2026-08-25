@@ -50,6 +50,10 @@ a file.
 
 If all success criteria are already satisfied in the current page state, do not take
 another browser action. Return finish.
+Do not return finish merely because you typed or selected a value. If the current page or
+verified action evidence does not contain the success criteria yet, continue the workflow.
+For forms, activate the relevant button/link after entering values unless the criteria are
+already visible.
 
 GENERIC EXAMPLES
 PAGE: [4] textbox "Search"; [5] button "Search"
@@ -90,6 +94,24 @@ def render_recent_actions_block(recent: list[dict]) -> str:
         elif result_data.get("extracted"):
             detail = " (extracted text)"
         lines.append(f"- step {r['step']}: {r['action']} target={r.get('target')}{detail} -> {verification}")
+    return "\n".join(lines)
+
+
+def render_running_summary_block(summary: str | None) -> str:
+    if not summary:
+        return "RUNNING SUMMARY\n(no older compacted history yet)"
+    return f"RUNNING SUMMARY\n{summary}"
+
+
+def render_retrieved_memory_block(memories: list[dict]) -> str:
+    if not memories:
+        return "RETRIEVED TASK MEMORY\n(no older relevant memories retrieved)"
+    lines = ["RETRIEVED TASK MEMORY"]
+    for memory in memories:
+        lines.append(
+            f"- {memory['kind']} (event {memory['source_event_id']}, "
+            f"confidence {memory['confidence']:.2f}): {memory['content']}"
+        )
     return "\n".join(lines)
 
 

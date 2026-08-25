@@ -44,6 +44,15 @@ class ContextConfig:
     max_page_chars_deep_recovery: int = 6000
     recent_actions: int = 5
     max_visible_text_items: int = 12
+    max_total_tokens: int = 4096
+    recent_window_tokens: int = 800
+    summary_tokens: int = 500
+    retrieved_memory_tokens: int = 500
+    page_tokens: int = 1400
+    retrieved_memory_top_k: int = 5
+    enable_running_summary: bool = True
+    enable_memory_retrieval: bool = True
+    summary_rebuild_interval: int = 4
 
 
 @dataclass

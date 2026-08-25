@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from agent.config import AppConfig
-from agent.context_builder import build_contract_repair_prompt, build_prompt, build_replan_prompt
+from agent.context_builder import build_contract_repair_prompt, build_replan_prompt, build_tiered_context
 from agent.decision import parse_model_output, validate_against_observation
 from agent.logging_utils import JsonlLogger, get_logger
 from agent.loop_detector import (
@@ -198,8 +198,17 @@ class AgentLoop:
             for r in state.recent_actions if r.get("verification") == "fail"
         ][-3:]
 
-        prompt = build_prompt(task, state, observation, max_chars,
-                               self.config.context.max_visible_text_items, recent_failures)
+        context = build_tiered_context(
+            task,
+            state,
+            observation,
+            self.config.context,
+            max_chars,
+            self.config.context.max_visible_text_items,
+            self.event_store,
+            recent_failures,
+        )
+        prompt = context.prompt
 
         completion = await self.llama.complete(prompt, grammar=self.grammar, max_tokens=max_tokens)
         self.metrics.log(event="model_call", task_id=self.task_id, step=step_no,
@@ -208,7 +217,12 @@ class AgentLoop:
                           predicted_ms=completion.predicted_ms, total_latency_ms=completion.total_latency_ms,
                           recovery_level=state.recovery_level, page_element_count=observation.element_count,
                           page_char_count=observation.char_count, endpoint=self.llama.endpoint,
-                          model_backend=self.config.model.backend, model_name=self.config.model.model_name)
+                          model_backend=self.config.model.backend, model_name=self.config.model.model_name,
+                          context_block_tokens=context.block_tokens,
+                          context_block_chars=context.block_chars,
+                          total_estimated_prompt_tokens=context.total_estimated_tokens,
+                          retrieved_memory_count=context.retrieved_memory_count,
+                          running_summary_tokens=context.running_summary_tokens)
 
         decision = await self._parse_validate_or_repair(
             task, state, step_no, prompt, completion.text, observation, max_chars,
@@ -298,6 +312,10 @@ class AgentLoop:
                           recovery_level=state.recovery_level, retry_number=state.retry_count, risk=risk.value)
 
         state = self.state_store.load(self.task_id)
+        if self._should_complete_after_verified_download(task, decision, verification.passed):
+            return self._complete_from_download(task, state, step_no, decision, new_observation)
+        if self._should_complete_after_verified_action(task, decision, verification.passed, new_observation):
+            return self._complete_after_verified_success(task, state, step_no, decision, new_observation)
 
         noop = detect_noop(pre_hash, post_hash, expected_change=not decision.expected_result.is_empty())
         loop_signal = (
@@ -463,8 +481,37 @@ class AgentLoop:
     async def _handle_finish(self, task: TaskRecord, state: TaskState, step_no: int,
                               decision: ModelDecision, observation: PageObservation) -> TaskState:
         result_text = decision.params.get("result", "")
-        blob = "\n".join([e.name for e in observation.elements] + observation.visible_text).lower()
+        blob = self._finish_evidence_blob(observation)
         matched = [c for c in task.success_criteria if c.lower() in blob]
+        if task.success_criteria and len(matched) != len(task.success_criteria):
+            self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {
+                "action": ActionType.FINISH.value,
+                "target": None,
+                "action_fingerprint": "finish",
+                "url": observation.url,
+                "result_data": {"result": result_text, "matched_success_criteria": matched},
+            }, verification_result={
+                "passed": False,
+                "checks": [{
+                    "type": "finish_success_criteria",
+                    "expected": "; ".join(task.success_criteria),
+                    "actual": blob[:200],
+                    "passed": False,
+                }],
+            })
+            self.event_store.append(self.task_id, step_no, EventType.MODEL_DECISION, {
+                "error": ValidationErrorKind.MODEL_COMPLETION_ERROR.value,
+                "message": "finish requested before success criteria were evidenced",
+                "matched_success_criteria": matched,
+            })
+            state = self.state_store.load(self.task_id)
+            return self._advance_recovery(
+                state,
+                step_no,
+                verification_passed=False,
+                loop_detected=False,
+                reason_override="MODEL_COMPLETION_ERROR",
+            )
         self.event_store.append(self.task_id, step_no, EventType.TASK_COMPLETED, {
             "result": result_text, "final_url": observation.url, "final_title": observation.title,
             "final_text_excerpt": "\n".join(observation.visible_text[:5]),
@@ -476,6 +523,129 @@ class AgentLoop:
         state.status = "completed"
         self.state_store.save(state)
         return state
+
+    def _finish_evidence_blob(self, observation: PageObservation) -> str:
+        current = self._observation_blob(observation)
+        events = [e.model_dump(mode="json") for e in self.event_store.all_events(self.task_id)]
+        return (current + "\n" + self._event_evidence_blob(events)).lower()
+
+    def _observation_blob(self, observation: PageObservation) -> str:
+        return "\n".join(
+            [observation.url, observation.title]
+            + [element.name for element in observation.elements]
+            + observation.visible_text
+        ).lower()
+
+    def _should_complete_after_verified_download(
+        self,
+        task: TaskRecord,
+        decision: ModelDecision,
+        verification_passed: bool,
+    ) -> bool:
+        if decision.action != ActionType.DOWNLOAD or not verification_passed:
+            return False
+        if not task.success_criteria:
+            return True
+        events = [e.model_dump(mode="json") for e in self.event_store.all_events(self.task_id)]
+        return self._criteria_seen_in_events(events, task.success_criteria)
+
+    def _should_complete_after_verified_action(
+        self,
+        task: TaskRecord,
+        decision: ModelDecision,
+        verification_passed: bool,
+        observation: PageObservation,
+    ) -> bool:
+        if not verification_passed or not task.success_criteria:
+            return False
+        if decision.action in {
+            ActionType.OPEN_URL,
+            ActionType.DOWNLOAD,
+            ActionType.FINISH,
+            ActionType.WAIT,
+            ActionType.EXTRACT,
+            ActionType.SCROLL,
+            ActionType.BACK,
+        }:
+            return False
+        blob = self._observation_blob(observation)
+        return all(criterion.lower() in blob for criterion in task.success_criteria)
+
+    def _complete_after_verified_success(
+        self,
+        task: TaskRecord,
+        state: TaskState,
+        step_no: int,
+        decision: ModelDecision,
+        observation: PageObservation,
+    ) -> TaskState:
+        blob = self._observation_blob(observation)
+        matched = [criterion for criterion in task.success_criteria if criterion.lower() in blob]
+        self.event_store.append(self.task_id, step_no, EventType.TASK_COMPLETED, {
+            "result": f"Success criteria satisfied after verified {decision.action.value}.",
+            "final_url": observation.url,
+            "final_title": observation.title,
+            "final_text_excerpt": "\n".join(observation.visible_text[:5]),
+            "success_criteria_textual_matches": matched,
+            "success_criteria_total": len(task.success_criteria),
+            "auto_completed_after_verified_action": True,
+        })
+        state = self.state_store.load(self.task_id)
+        state.status = "completed"
+        self.state_store.save(state)
+        return state
+
+    def _complete_from_download(
+        self,
+        task: TaskRecord,
+        state: TaskState,
+        step_no: int,
+        decision: ModelDecision,
+        observation: PageObservation,
+    ) -> TaskState:
+        result_text = decision.reason or "Verified download completed and success criteria are satisfied."
+        events = [e.model_dump(mode="json") for e in self.event_store.all_events(self.task_id)]
+        matched = [
+            criterion for criterion in task.success_criteria
+            if criterion.lower() in self._event_evidence_blob(events)
+        ]
+        self.event_store.append(self.task_id, step_no, EventType.TASK_COMPLETED, {
+            "result": result_text,
+            "final_url": observation.url,
+            "final_title": observation.title,
+            "final_text_excerpt": "\n".join(observation.visible_text[:5]),
+            "success_criteria_textual_matches": matched,
+            "success_criteria_total": len(task.success_criteria),
+            "auto_completed_after_verified_download": True,
+        })
+        state = self.state_store.load(self.task_id)
+        state.status = "completed"
+        self.state_store.save(state)
+        return state
+
+    def _criteria_seen_in_events(self, events: list[dict], criteria: list[str]) -> bool:
+        blob = self._event_evidence_blob(events)
+        return all(criterion.lower() in blob for criterion in criteria)
+
+    def _event_evidence_blob(self, events: list[dict]) -> str:
+        parts: list[str] = []
+        for event in events:
+            payload = event.get("payload", {})
+            if event.get("type") == EventType.OBSERVATION.value:
+                parts.extend([
+                    payload.get("url", ""),
+                    payload.get("title", ""),
+                    " ".join(payload.get("element_names", [])),
+                    " ".join(payload.get("visible_text", [])),
+                ])
+            elif event.get("type") == EventType.ACTION_RESULT.value:
+                parts.append(json.dumps(payload.get("result_data", {})))
+            elif event.get("type") == EventType.VERIFICATION_RESULT.value:
+                if payload.get("action") in {ActionType.DOWNLOAD.value, ActionType.EXTRACT.value}:
+                    parts.append(json.dumps(payload.get("result_data", {})))
+            elif event.get("type") == EventType.TASK_COMPLETED.value:
+                parts.append(json.dumps(payload))
+        return "\n".join(parts).lower()
 
     async def _replan(self, task: TaskRecord, state: TaskState, step_no: int) -> TaskState:
         prompt = build_replan_prompt(task, state)

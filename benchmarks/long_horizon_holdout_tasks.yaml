@@ -1,0 +1,30 @@
+tasks:
+  - id: holdout_config_balanced_44
+    goal: "Complete the configuration workflow. Remember the first-page requirements and apply them at the end."
+    start_url: "{base_url}/long_config.html?variant=beta&steps=44"
+    max_steps: 70
+    tier: holdout
+    success_criteria:
+      - "Configuration saved"
+    evaluation_criteria:
+      - "Configuration saved: Balanced"
+      - "Region saved: West"
+      - "BX-19"
+
+  - id: holdout_research_38
+    goal: "Collect the three facts from the early sections, continue to the end, enter the combined facts in order, and finish."
+    start_url: "{base_url}/long_research.html?variant=beta&steps=38"
+    max_steps: 65
+    tier: holdout
+    success_criteria: []
+    evaluation_criteria:
+      - "Combined result: Beacon Ivory Harbor"
+
+  - id: holdout_download_88
+    goal: "Remember the required artifact from the first page, navigate to the download center, download exactly that artifact, and finish after confirming the download."
+    start_url: "{base_url}/long_download.html?variant=beta&steps=88"
+    max_steps: 120
+    tier: holdout
+    success_criteria: []
+    evaluation_criteria:
+      - "audit-bundle-q3.txt"

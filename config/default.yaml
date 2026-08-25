@@ -21,6 +21,15 @@ context:
   max_page_chars_deep_recovery: 6000
   recent_actions: 5
   max_visible_text_items: 12
+  max_total_tokens: 4096
+  recent_window_tokens: 800
+  summary_tokens: 500
+  retrieved_memory_tokens: 500
+  page_tokens: 1400
+  retrieved_memory_top_k: 5
+  enable_running_summary: true
+  enable_memory_retrieval: true
+  summary_rebuild_interval: 4
 
 recovery:
   max_action_retries: 2

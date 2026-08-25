@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Long Configuration Workflow</title>
+</head>
+<body>
+  <h1 id="title">Configuration Workflow</h1>
+  <main id="app"></main>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const total = Number(params.get("steps") || "36");
+    const variant = params.get("variant") || "alpha";
+    const requirements = {
+      alpha: { mode: "Advanced", region: "North", token: "AX-47" },
+      beta: { mode: "Balanced", region: "West", token: "BX-19" },
+      gamma: { mode: "Advanced", region: "South", token: "GX-22" }
+    };
+    const req = requirements[variant] || requirements.alpha;
+    let step = Number(sessionStorage.getItem("long_config_step_" + variant) || "1");
+    let saved = false;
+
+    function render() {
+      const app = document.getElementById("app");
+      document.title = "Long Configuration Workflow - Step " + step;
+      document.getElementById("title").textContent = "Configuration Workflow - Step " + step + " of " + total;
+      if (saved) {
+        app.innerHTML = `
+          <h2>Configuration saved: ${req.mode}</h2>
+          <p>Region saved: ${req.region}</p>
+          <p>Confirmation token: ${req.token}</p>
+        `;
+        return;
+      }
+      if (step === 1) {
+        app.innerHTML = `
+          <h2>Requirements</h2>
+          <p>Use mode ${req.mode} for this task.</p>
+          <p>Use region ${req.region}.</p>
+          <p>Remember token ${req.token}; it will not be repeated.</p>
+          <button id="next">Continue</button>
+          <button id="decoy">Open unrelated notes</button>
+        `;
+      } else if (step < total) {
+        app.innerHTML = `
+          <h2>Review checkpoint ${step}</h2>
+          <p>Confirming section ${step}: diagnostics, owners, schedules, and policy notes.</p>
+          <button id="next">Continue</button>
+          <button id="decoy">Review archived baseline</button>
+        `;
+      } else {
+        app.innerHTML = `
+          <h2>Final configuration</h2>
+          <label for="mode">Mode</label>
+          <select id="mode">
+            <option value="Basic">Basic</option>
+            <option value="Balanced">Balanced</option>
+            <option value="Advanced">Advanced</option>
+          </select>
+          <label for="region">Region</label>
+          <select id="region">
+            <option value="North">North</option>
+            <option value="South">South</option>
+            <option value="West">West</option>
+          </select>
+          <label for="token">Token</label>
+          <input id="token" aria-label="Token">
+          <button id="save">Save configuration</button>
+        `;
+      }
+      const next = document.getElementById("next");
+      if (next) {
+        next.onclick = () => {
+          step += 1;
+          sessionStorage.setItem("long_config_step_" + variant, String(step));
+          history.pushState({}, "", `?variant=${variant}&steps=${total}&step=${step}`);
+          render();
+        };
+      }
+      const decoy = document.getElementById("decoy");
+      if (decoy) {
+        decoy.onclick = () => {
+          const note = document.createElement("p");
+          note.textContent = "Archived baseline is not relevant to this task.";
+          app.appendChild(note);
+        };
+      }
+      const save = document.getElementById("save");
+      if (save) {
+        save.onclick = () => {
+          const mode = document.getElementById("mode").value;
+          const region = document.getElementById("region").value;
+          const token = document.getElementById("token").value.trim();
+          if (mode === req.mode && region === req.region && token === req.token) {
+            saved = true;
+            render();
+          } else {
+            const error = document.createElement("p");
+            error.textContent = "Configuration mismatch. Re-check the original requirements.";
+            app.appendChild(error);
+          }
+        };
+      }
+    }
+    render();
+  </script>
+</body>
+</html>
