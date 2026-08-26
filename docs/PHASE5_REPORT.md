@@ -750,3 +750,202 @@ Next step:
 ```text
 NEEDS ANOTHER PHASE 5 CORRECTIVE ITERATION
 ```
+
+## Inference Reliability Corrective Iteration
+
+Date: 2026-08-26
+
+Verdict remains: Phase 5 PARTIAL.
+
+This corrective pass did not start Phase 5B, Phase 6, public-web validation, embeddings, parallel workers, or a model bake-off.
+
+### Root Cause
+
+The prior research 10 `precision=0` result was not a model-quality verdict. The six relevant research pages failed before ledger result creation because Ollama inference exceeded the old effective timeout envelope while running `qwen3:8b` on CPU.
+
+Runtime checks showed:
+
+```text
+ollama ps: qwen3:8b resident after warmup, PROCESSOR=100% CPU, CONTEXT=8192
+nvidia-smi: RTX 4070 present, about 1.9 GB VRAM in use, no Ollama compute process using VRAM
+active inference requests: max 1
+```
+
+The desktop has an NVIDIA GPU available, but this Ollama runtime path used CPU for `qwen3:8b`. Long structured finish generations on CPU consumed the full `num_predict=256` budget and took about 28-50s, so the old 30s scalar timeout was too close to the p95/p99 tail.
+
+### Runtime Diagnostics
+
+Raw trivial Ollama API probe through `/api/generate`:
+
+```text
+requests: 20
+successes: 20
+failures: 0
+p50: 620.7 ms
+p95: 651.4 ms
+max: 7567.7 ms
+```
+
+Representative BrowserAgent research step-2 prompt:
+
+```text
+prompt chars: 4971
+estimated tokens: 1280
+Ollama prompt tokens: 1175
+schema: production action JSON schema
+num_ctx: 8192
+num_predict: 256
+```
+
+Representative 50-call structured stress:
+
+```text
+requests: 50
+raw successes: 50
+raw failures: 0
+success after retry: 50
+failures after retry: 0
+p50: 1184.31 ms
+p95: 29230.63 ms
+max: 50506.43 ms
+max active requests: 1
+endpoint failure taxonomy: none
+```
+
+Controlled structured-output probes:
+
+| Case | Requests | Successes | Failures | p50 | p95 | Max |
+| ---- | -------: | --------: | -------: | --: | --: | --: |
+| Current action schema | 10 | 10 | 0 | 1139.01 ms | 28816.06 ms | 28816.06 ms |
+| Small synthetic schema | 10 | 10 | 0 | 28852.05 ms | 29276.93 ms | 29276.93 ms |
+| Plain JSON | 10 | 10 | 0 | 1201.33 ms | 24677.06 ms | 24677.06 ms |
+
+Conclusion: the observed failures correlate with CPU-bound long generation and timeout margin, not general Ollama endpoint death and not uniquely with `oneOf` schema complexity. Removing structured output is not justified by this evidence.
+
+### Corrective Changes
+
+Inference client changes:
+
+- Added explicit inference failure taxonomy: `CONNECT_TIMEOUT`, `READ_TIMEOUT`, `TOTAL_REQUEST_TIMEOUT`, `OLLAMA_HTTP_ERROR`, `CONNECTION_RESET`, `SERVICE_UNAVAILABLE`, `MALFORMED_RESPONSE`, `STRUCTURED_OUTPUT_FAILURE`, `UNKNOWN_INFERENCE_FAILURE`.
+- Replaced the Ollama scalar timeout with explicit `connect`, `read`, `write`, and `pool` timeout settings.
+- Added bounded inference-level retry for transient endpoint categories only.
+- Added configurable Ollama `keep_alive`, default `5m`.
+- Added request diagnostics: request id, attempt, model, prompt hash/chars/tokens when available, schema type, response-header timing, total duration, prompt/eval durations, done reason, HTTP status, exception class/message, retryability, and active request count.
+
+Agent/batch wiring:
+
+- `AgentLoop` now writes `inference_request` metrics for successful and failed attempts.
+- Batch runtime policy carries `batch_id` and `work_item_id` into child task metrics.
+- Batch child failure classification now maps inference timeout/service categories instead of leaving them as generic `UNKNOWN`.
+- Research ledger ingress now preserves valid findings when `fields[field]` is the string `"found"` and the matching finding carries value/evidence.
+
+The research ledger fix was independently proven after stable inference: live child completions contained canonical findings, but normalization dropped them because the string `found` field placeholder preempted the later evidence-bearing finding.
+
+### Research 10 Rerun
+
+Exact local research 10 fixture rerun after inference hardening and ledger-ingress fix:
+
+```text
+completed: 10
+failed: 0
+blocked: 0
+raw findings: 6
+deduplicated findings: 3
+field precision: 1.00
+field recall: 1.00
+found: 6
+not_found: 12
+unsupported findings: 0
+inference attempts: 21
+inference retries: 0
+endpoint failures: 0
+duration: 246.29s
+RSS startup: 50.90 MB
+RSS item 10: 64.00 MB
+RSS peak: 64.00 MB
+```
+
+### Assignment 10 Regression
+
+Assignment 10 after the inference changes:
+
+```text
+completed: 10
+failed: 0
+blocked: 0
+precision: 1.00
+recall: 1.00
+raw findings: 7
+deduplicated findings: 4
+inference attempts: 20
+inference retries: 0
+endpoint failures: 0
+duration: 239.83s
+RSS startup: 51.04 MB
+RSS item 10: 63.70 MB
+RSS peak: 63.70 MB
+```
+
+### Tests
+
+Focused reliability/regression slice:
+
+```text
+21 passed
+```
+
+Full deterministic suite:
+
+```text
+133 passed in 90.54s
+```
+
+Added coverage for:
+
+- timeout classification
+- retryable inference error
+- non-retryable inference error
+- bounded retry
+- client cleanup after timeout
+- structured response after retry
+- repeated timeout cleanup
+- no duplicate action intent after inference retry
+- research `fields[field] = "found"` plus matching finding evidence
+
+Added a live model-marked Ollama reliability diagnostic for repeated sequential structured calls. It remains under `pytest -m model` and is not part of ordinary deterministic CI.
+
+### Remaining Validation State
+
+The Phase 5 verdict remains PARTIAL because the remaining Phase 5 PASS gates have not been completed in this corrective pass:
+
+- assignment 25/50/100 after corrected contracts
+- research 25/50
+- RSS checkpoints at 25/50/100
+- real process-kill crash/resume matrix
+- failure-mix benchmark
+- representative Phase 4B regression
+- public-web pilot
+
+Model decision:
+
+```text
+QWEN3-8B SUFFICIENT for local assignment 10 and research 10 gates; INSUFFICIENT EVIDENCE for full Phase 5 scaling.
+```
+
+Embedding decision:
+
+```text
+FTS5 SUFFICIENT
+```
+
+Parallelism decision:
+
+```text
+SEQUENTIAL SUFFICIENT for current corrective gates; controlled parallelism is not justified while CPU-bound inference and remaining validation are unresolved.
+```
+
+Next step:
+
+```text
+NEEDS ANOTHER PHASE 5 CORRECTIVE ITERATION
+```
