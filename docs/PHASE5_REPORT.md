@@ -751,6 +751,254 @@ Next step:
 NEEDS ANOTHER PHASE 5 CORRECTIVE ITERATION
 ```
 
+## GPU Runtime and Scaling Corrective Iteration
+
+Date: 2026-08-26
+
+Verdict remains: Phase 5 PARTIAL.
+
+This pass prioritized moving `qwen3:8b` inference from CPU to the local NVIDIA RTX 4070 before continuing the expensive live scale gates. It did not start Phase 5B, Phase 6, public-web validation, embeddings, parallel workers, or a model bake-off.
+
+### CPU Assignment 100 Interruption
+
+An in-progress CPU-only assignment 100 run was stopped intentionally before GPU repair. It had reached approximately item 53 and is diagnostic only. It does not supersede completed assignment 10/25/50 evidence and is not a final assignment 100 result.
+
+### GPU Root Cause
+
+Ollama reported:
+
+```text
+ollama version: 0.33.0
+qwen3:8b: 5.2 GB, Q4_K_M
+ollama ps before repair: PROCESSOR=100% CPU, CONTEXT=8192
+nvidia-smi: NVIDIA GeForce RTX 4070, driver 595.95, CUDA 13.2, 12282 MiB VRAM
+```
+
+The active Ollama installation was incomplete/mismatched. The installed tree contained CPU runner files but lacked usable CUDA backend runner files such as `ggml-cuda.dll`, and direct `llama-server.exe --list-devices` returned no devices. Active server logs showed only CPU compute discovery and `total_vram="0 B"`, while older logs had previously detected the RTX 4070. BrowserAgent was not the cause.
+
+### Runtime Change
+
+The official Ollama Windows installer from `https://ollama.com/download/OllamaSetup.exe` was used to repair the local Ollama installation after unloading `qwen3:8b`.
+
+After repair, the install tree contained CUDA/Vulkan backend files, including:
+
+```text
+cuda_v12/ggml-cuda.dll
+cuda_v13/ggml-cuda.dll
+vulkan/ggml-vulkan.dll
+```
+
+The repaired Ollama server logs reported:
+
+```text
+library=CUDA
+name=CUDA0
+description="NVIDIA GeForce RTX 4070"
+driver=13.2
+total="12.0 GiB"
+available="10.8 GiB"
+```
+
+### GPU Verification
+
+GPU-backed Qwen inference was verified with both Ollama and NVIDIA tools:
+
+```text
+ollama ps after repair: qwen3:8b, PROCESSOR=100% GPU, CONTEXT=8192
+nvidia-smi: llama-server.exe present as a compute process
+VRAM during/after warm request: about 8.0 GiB used of 12.0 GiB
+GPU utilization during representative request: up to 93%
+```
+
+### CPU vs GPU Representative Inference
+
+The CPU baseline reuses the prior 50-call representative structured stress. The GPU comparison used the same BrowserAgent Ollama client/action-schema path for 20 sequential representative calls.
+
+| Metric | CPU baseline | RTX 4070 |
+| ------ | -----------: | -------: |
+| Requests | 50 | 20 |
+| Success rate | 50/50 | 20/20 |
+| Raw endpoint failures | 0 | 0 |
+| Success after retry | 50/50 | 20/20 |
+| Retries | 0 | 0 |
+| p50 latency | 1.18s | 3.18s |
+| p95 latency | 29.23s | 3.24s |
+| max latency | 50.51s | 3.69s |
+| generation throughput | about 9 tok/s on long CPU generations | 71.34 tok/s average |
+| max active inference requests | 1 | 1 |
+
+The GPU path removes the CPU long-tail that caused the earlier timeout misclassification. The existing measured 60-90 second live fixture timeout remains conservative and was not reduced.
+
+### Structured Result Guard
+
+Research 25 initially produced one strict recall miss after GPU repair:
+
+```text
+missing key: research_012.html|education_discount
+page contained fact: yes
+PageObservation contained fact: yes
+model endpoint failure: no
+finish result: malformed inner JSON string "{"
+```
+
+The child action schema was valid because `FinishAction.result` is a string, but the batch structured result contract requires valid JSON. The orchestrator previously converted malformed finish text into an empty free-text result and committed it, silently losing the evidence-bearing field.
+
+Corrective change:
+
+- Structured batch contracts now reject malformed or non-object `finish.result` JSON before ledger persistence.
+- The item is classified as `CONTRACT`.
+- If attempts remain, the retryable item clears its stale `browser_task_id` so the next attempt starts a fresh child instead of resuming the already-completed malformed child.
+- Generic unstructured contracts retain the legacy free-text fallback.
+
+Regression coverage:
+
+```text
+test_structured_contract_retries_malformed_finish_result
+```
+
+### Assignment GPU Scaling
+
+| Targets | Completed | Failed | Blocked | Precision | Recall | F1 | Raw Findings | Deduped Findings | Calls/Item | Duration | RSS Peak |
+| ------: | --------: | -----: | ------: | --------: | -----: | -: | -----------: | ---------------: | ---------: | -------: | -------: |
+| 10 | 10 | 0 | 0 | 1.00 | 1.00 | 1.00 | 7 | 4 | 2.00 | 43.09s | 64.46 MB |
+| 25 | 25 | 0 | 0 | 1.00 | 1.00 | 1.00 | 15 | 4 | 2.00 | 722.23s CPU | 66.46 MB |
+| 50 | 50 | 0 | 0 | 1.00 | 1.00 | 1.00 | 30 | 4 | 2.00 | 1396.69s CPU | 68.04 MB |
+| 100 | 100 | 0 | 0 | 1.00 | 1.00 | 1.00 | 61 | 4 | 2.00 | 406.07s GPU | 68.35 MB |
+
+Assignment 100 GPU details:
+
+```text
+true positives: 4
+false positives: 0
+false negatives: 0
+model calls: 200
+inference retries: 0
+endpoint failures: 0
+median item duration: not emitted by current fixture summary
+p95 item duration: not emitted by current fixture summary
+ollama ps after run: PROCESSOR=100% GPU
+VRAM after run: about 8066 MiB / 12282 MiB
+GPU utilization after run snapshot: 20%
+```
+
+Throughput comparison:
+
+| Run | Processor | Targets | Seconds/Item | Items/Minute | Items/Hour |
+| --- | --------- | ------: | -----------: | -----------: | ---------: |
+| assignment 25 | CPU | 25 | 28.89 | 2.08 | 124.6 |
+| assignment 50 | CPU | 50 | 27.93 | 2.15 | 128.9 |
+| assignment 100 | GPU | 100 | 4.06 | 14.78 | 886.5 |
+
+### Research GPU Scaling
+
+| Targets | Completed | Failed | Blocked | Field Precision | Field Recall | F1 | Raw Findings | Deduped Findings | Calls/Item | Duration | RSS Peak |
+| ------: | --------: | -----: | ------: | --------------: | -----------: | -: | -----------: | ---------------: | ---------: | -------: | -------: |
+| 10 | 10 | 0 | 0 | 1.00 | 1.00 | 1.00 | 6 | 3 | 2.10 | 246.29s CPU | 64.00 MB |
+| 25 | 25 | 0 | 0 | 1.00 | 1.00 | 1.00 | 15 | 3 | 2.04 | 99.69s GPU | 66.46 MB |
+| 50 | 50 | 0 | 0 | 1.00 | 1.00 | 1.00 | 30 | 3 | 2.08 | 196.17s GPU | 67.98 MB |
+
+Research 50 field details:
+
+```text
+truth_count: 30
+predicted_count: 30
+true positives: 30
+false positives: 0
+false negatives: 0
+pricing: precision 1.00, recall 1.00, found 10
+education_discount: precision 1.00, recall 1.00, found 10
+public_api_docs: precision 1.00, recall 1.00, found 10
+unsupported findings: 0
+```
+
+### Prompt and RSS Scaling
+
+Assignment 100 GPU prompt checkpoints:
+
+```text
+item 1: 1059
+item 10: 1059
+item 25: 1059
+item 50: 1059
+item 100: 1059
+average: 1118.29
+p95: 1242
+max: 1242
+```
+
+Research 50 GPU prompt checkpoints:
+
+```text
+item 1: 1071
+item 10: 1071
+item 25: 1071
+item 50: 1071
+average: 1103.69
+p95: 1130
+max: 1221
+```
+
+RSS checkpoints:
+
+| Run | Startup | Item 10 | Item 25 | Item 50 | Item 100 | Peak |
+| --- | ------: | ------: | ------: | ------: | -------: | ---: |
+| assignment 100 GPU | 51.06 MB | 64.64 MB | 66.68 MB | 67.86 MB | 68.35 MB | 68.35 MB |
+| research 50 GPU | 51.06 MB | 64.77 MB | 66.84 MB | 67.98 MB | n/a | 67.98 MB |
+
+Prompt and RSS measurements show no batch-ordinal context growth through assignment 100 or research 50.
+
+### Tests
+
+Focused orchestrator tests:
+
+```text
+9 passed
+```
+
+Full deterministic suite:
+
+```text
+134 passed in 76.85s
+```
+
+### Remaining Validation State
+
+The local extraction scale gates now pass:
+
+- assignment 10/25/50/100
+- research 10/25/50
+
+The Phase 5 verdict remains PARTIAL because these PASS gates are still not complete:
+
+- real process-kill batch crash/resume matrix at 25%/50%/75%
+- failure-mix benchmark
+- representative Phase 4B regression
+- public-web pilot after local gates
+
+Model decision:
+
+```text
+QWEN3-8B SUFFICIENT for completed local assignment/research extraction gates.
+```
+
+Embedding decision:
+
+```text
+FTS5 SUFFICIENT
+```
+
+Parallelism decision:
+
+```text
+SEQUENTIAL SUFFICIENT for Phase 5 local scale gates. Controlled parallelism is not justified before Phase 5 completion.
+```
+
+Next step:
+
+```text
+Continue existing Phase 5 validation only: implement/run real crash-resume matrix, failure mix, Phase 4B regression, then public-web pilot last.
+```
+
 ## Inference Reliability Corrective Iteration
 
 Date: 2026-08-26
