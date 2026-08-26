@@ -132,6 +132,37 @@ def test_research_legacy_finding_maps_to_requested_field():
     assert quality["evidence_backed_findings"] == 1
 
 
+def test_research_string_found_field_accepts_matching_finding_evidence():
+    contract = ResultContract(
+        name="research",
+        required_fields=["pricing", "education_discount", "public_api_docs"],
+    )
+    structured, quality = normalize_structured_result(
+        {
+            "relevant": True,
+            "fields": {
+                "pricing": "found",
+                "education_discount": "unresolved",
+                "public_api_docs": "unresolved",
+            },
+            "findings": [{
+                "field": "pricing",
+                "value": "Pricing starts at $12 per seat.",
+                "evidence": "Pricing starts at $12 per seat.",
+                "source_url": "http://a.test",
+            }],
+        },
+        contract,
+        "http://a.test",
+        "Acme Analytics\nPricing starts at $12 per seat.",
+    )
+
+    assert structured["fields"]["pricing"]["status"] == "found"
+    assert structured["fields"]["pricing"]["value"] == "Pricing starts at $12 per seat."
+    assert structured["findings"][0]["field"] == "pricing"
+    assert quality["evidence_backed_findings"] == 1
+
+
 def test_invalid_result_schema_is_rejected():
     structured, quality = normalize_structured_result(
         {"relevant": "yes", "findings": "not-a-list"},
