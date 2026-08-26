@@ -57,8 +57,17 @@ def classify_child_failure(events: list[Event], status: str, last_error: str | N
         return FailureCategory.CAPTCHA_OR_BOT_CHALLENGE
     if "login" in blob or "sign in" in blob or "authentication" in blob:
         return FailureCategory.AUTH_REQUIRED
-    if "timeout" in blob:
+    if "connect_timeout" in blob or "read_timeout" in blob or "total_request_timeout" in blob or "timeout" in blob:
         return FailureCategory.TIMEOUT
+    if (
+        "ollama_http_error" in blob
+        or "connection_reset" in blob
+        or "service_unavailable" in blob
+        or "malformed_response" in blob
+        or "unknown_inference_failure" in blob
+        or "local ollama inference failed" in blob
+    ):
+        return FailureCategory.MODEL
     if "scope_blocked" in blob or "navigation_scope" in blob:
         return FailureCategory.SCOPE_BLOCKED
     if "read_only_blocked" in blob or "read_only policy" in blob:

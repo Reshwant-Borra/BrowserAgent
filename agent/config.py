@@ -28,6 +28,12 @@ class ModelConfig:
     max_output_tokens: int = 256
     max_output_tokens_deep_recovery: int = 512
     request_timeout_s: float = 30.0
+    request_connect_timeout_s: float = 10.0
+    request_write_timeout_s: float = 10.0
+    request_pool_timeout_s: float = 10.0
+    max_inference_attempts: int = 2
+    inference_retry_backoff_s: float = 0.5
+    ollama_keep_alive: str = "5m"
 
 
 @dataclass

@@ -19,6 +19,8 @@ class BatchRuntimePolicy:
     target_url: str
     read_only: bool = True
     navigation_scope: NavigationScopePolicy = NavigationScopePolicy.SAME_ORIGIN
+    batch_id: str | None = None
+    work_item_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -79,4 +81,3 @@ def url_in_scope(source_url: str, candidate_url: str, scope: NavigationScopePoli
 def _registrable_domain(host: str) -> str:
     parts = host.lower().split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
-

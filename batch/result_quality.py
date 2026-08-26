@@ -200,7 +200,11 @@ def _normalize_research_result(
             "source_url": source_url,
         }
         fields.setdefault(field, {"status": "not_found", "value": "", "evidence": "", "source_url": final_url})
-        if fields[field].get("status") == "found":
+        if (
+            fields[field].get("status") == "found"
+            and fields[field].get("value")
+            and fields[field].get("evidence")
+        ):
             continue
         fields[field] = {"status": "found", **fact}
         findings.append(fact)

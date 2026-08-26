@@ -344,6 +344,8 @@ class BatchOrchestrator:
             target_url=item["target"],
             read_only=self.policy.read_only,
             navigation_scope=NavigationScopePolicy(self.policy.navigation_scope.value),
+            batch_id=self.batch_id,
+            work_item_id=int(item["id"]),
         )
 
 

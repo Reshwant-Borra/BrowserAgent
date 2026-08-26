@@ -40,7 +40,7 @@ from agent.schemas import (
 from agent import verifier as verifier_mod
 from browser.page_model import ElementRef, PageObservation
 from browser.playwright_backend import PlaywrightBackend
-from inference.llama_client import ModelUnavailableError, create_inference_client
+from inference.llama_client import CompletionResult, ModelUnavailableError, create_inference_client
 from memory.event_store import EventStore, EventType
 from memory.models import TaskRecord, TaskState
 from memory.task_memory import ActiveFact, normalize_fact_key
@@ -234,7 +234,9 @@ class AgentLoop:
         )
         prompt = context.prompt
 
-        completion = await self.llama.complete(prompt, grammar=self.grammar, max_tokens=max_tokens)
+        completion = await self._complete_model(
+            prompt, grammar=self.grammar, max_tokens=max_tokens, step_no=step_no, purpose="action"
+        )
         self.metrics.log(event="model_call", task_id=self.task_id, step=step_no,
                           input_chars=len(prompt), prompt_tokens=completion.prompt_tokens,
                           output_tokens=completion.predicted_tokens, prompt_ms=completion.prompt_ms,
@@ -734,8 +736,12 @@ class AgentLoop:
             repair_prompt = build_contract_repair_prompt(
                 task, observation, raw_text, first_error, max_chars, max_visible_text_items,
             )
-            repair_completion = await self.llama.complete(
-                repair_prompt, grammar=self.grammar, max_tokens=max_tokens,
+            repair_completion = await self._complete_model(
+                repair_prompt,
+                grammar=self.grammar,
+                max_tokens=max_tokens,
+                step_no=step_no,
+                purpose="contract_repair",
             )
             self.metrics.log(event="model_call", task_id=self.task_id, step=step_no,
                               input_chars=len(repair_prompt), prompt_tokens=repair_completion.prompt_tokens,
@@ -767,6 +773,56 @@ class AgentLoop:
                     "repair_success": False,
                 })
                 return None
+
+    async def _complete_model(
+        self,
+        prompt: str,
+        *,
+        grammar: Optional[str],
+        max_tokens: int,
+        step_no: int,
+        purpose: str,
+    ) -> CompletionResult:
+        try:
+            completion = await self.llama.complete(prompt, grammar=grammar, max_tokens=max_tokens)
+        except ModelUnavailableError as exc:
+            self._log_inference_attempts(exc.attempts, step_no=step_no, purpose=purpose, success=False)
+            raise
+        self._log_inference_attempts(
+            completion.inference_attempts,
+            step_no=step_no,
+            purpose=purpose,
+            success=True,
+        )
+        return completion
+
+    def _log_inference_attempts(
+        self,
+        attempts: list[dict],
+        *,
+        step_no: int,
+        purpose: str,
+        success: bool,
+    ) -> None:
+        if not attempts:
+            return
+        for attempt in attempts:
+            self.metrics.log(
+                event="inference_request",
+                task_id=self.task_id,
+                batch_id=getattr(self.runtime_policy, "batch_id", None),
+                work_item_id=getattr(self.runtime_policy, "work_item_id", None),
+                step=step_no,
+                purpose=purpose,
+                endpoint=self.llama.endpoint,
+                model_backend=self.config.model.backend,
+                success=success and not attempt.get("failure_category"),
+                **{
+                    key: value
+                    for key, value in attempt.items()
+                    if key != "request_start_monotonic"
+                },
+            )
 
     def _advance_recovery(self, state: TaskState, step_no: int, verification_passed: bool,
                            loop_detected: bool, reason_override: Optional[str] = None) -> TaskState:
@@ -1048,8 +1104,13 @@ class AgentLoop:
 
     async def _replan(self, task: TaskRecord, state: TaskState, step_no: int) -> TaskState:
         prompt = build_replan_prompt(task, state)
-        completion = await self.llama.complete(prompt, grammar=None,
-                                                max_tokens=self.config.model.max_output_tokens_deep_recovery)
+        completion = await self._complete_model(
+            prompt,
+            grammar=None,
+            max_tokens=self.config.model.max_output_tokens_deep_recovery,
+            step_no=step_no,
+            purpose="replan",
+        )
         subgoal, plan = state.current_subgoal, state.plan
         try:
             data = json.loads(completion.text.strip())
