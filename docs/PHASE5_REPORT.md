@@ -407,3 +407,346 @@ Public-web decision: NEEDS PHASE 5 CORRECTIVE ITERATION
 5. Run live failure-mix benchmark.
 6. Run safety fixture with a consequential-looking control.
 7. Run public-web pilot only after local 100-target and crash/resume gates pass.
+
+## Phase 5 Corrective Validation: Result Quality
+
+Date: 2026-08-26
+
+Verdict remains: Phase 5 PARTIAL.
+
+This was a corrective Phase 5 validation pass, not Phase 5B and not Phase 6.
+
+### Starting State
+
+Starting commit:
+
+```text
+44de5a0 fix: enforce batch safety and validate live phase5 fixtures
+```
+
+Branch:
+
+```text
+phase5-multisite-orchestration
+```
+
+Repository:
+
+```text
+origin https://github.com/Reshwant-Borra/BrowserAgent.git
+```
+
+### Result Path Audit
+
+The current implementation uses this path:
+
+```text
+BatchOrchestrator._child_goal()
+  -> child AgentLoop prompt
+  -> model finish(result)
+  -> TASK_COMPLETED.result
+  -> _extract_structured_result()
+  -> result normalization / validation
+  -> batch_results.structured_data
+  -> synthesize()
+```
+
+The queue and ledger architecture were not rewritten. The corrective work stayed at the child-result contract and ledger-ingress boundary.
+
+### Assignment False-Positive Audit
+
+The 50-target live assignment false positives were inspected directly from the saved ledger and child task DBs.
+
+False positives:
+
+```text
+assignment_022.html -> History | Old Review Packet | Deadline: September 18, 2026
+assignment_033.html -> Algebra | Old Review Packet | Submit by 11:59 PM Friday
+```
+
+Both pages visibly contained:
+
+```text
+Completed assignment from last month
+```
+
+and their HTML contained:
+
+```text
+data-status="completed"
+```
+
+The page information was visible in `PageObservation`, and the child model included the page due-date text in its finish result while classifying the item as actionable/upcoming. Classification:
+
+```text
+STATUS_ERROR
+```
+
+No queue, ledger transform, or observation miss was found for these two false positives.
+
+### Research Failure Audit
+
+The 10-target live research run was inspected from saved fixture pages, child task DBs, and ledger rows.
+
+Observed failures:
+
+- Pricing/API pages sometimes produced a fact-like value but not the requested canonical field.
+- Education-discount pages were marked irrelevant even though the visible page text included the education-discount evidence.
+- Generic labels such as `Relevant source` entered the result path as findings under the old contract.
+
+Classification:
+
+```text
+FIELD_EXTRACTION_ERROR
+RESULT_CONTRACT_ERROR
+```
+
+The requested fields were not explicit in the child contract, so the model could satisfy the old wording with vague source labels or empty findings.
+
+### Corrective Changes
+
+Generic result-contract changes:
+
+- `ResultContract` now supports `field_definitions` in addition to `required_fields`.
+- Child prompts render task-specific result shapes from the configured contract.
+- Assignment contract explicitly asks for `status` and `actionable`.
+- Research contract explicitly asks for `pricing`, `education_discount`, and `public_api_docs`.
+- Ledger ingress validates and normalizes structured results through `batch.result_quality`.
+- Synthesis excludes assignment findings unless `actionable=true`.
+- Raw non-actionable assignment ledger records are preserved.
+- Found research facts must include `field`, `value`, `source_url`, and `evidence`.
+- Unsupported/generic findings are rejected from final factual synthesis.
+- Research `not_found` remains a field state and is not converted into a factual absence claim.
+
+Conservative deterministic guard:
+
+- Explicit non-actionable assignment cues such as submitted/completed/graded/closed/archived/no-longer-accepting/past-due are treated as high-confidence status conflicts when the model marks an item actionable.
+- The guard does not contain fixture assignment names, expected truth values, page ordinals, or known fixture URLs.
+
+### Corrective Assignment 10
+
+Initial live assignment 10 run after the contract change:
+
+```text
+completed: 10
+failed: 0
+blocked: 0
+raw actionable findings: 7
+deduped actionable findings: 4
+duration: 311.85s
+calls/item: 2.0
+```
+
+The first evaluator output showed:
+
+```text
+precision: 0.75
+recall: 0.75
+```
+
+Inspection showed an evaluator normalization error, not a model/ledger error:
+
+```text
+truth: Submit by 11:59 PM Friday
+prediction: 11:59 PM Friday
+```
+
+The due-date normalizer now strips the generic assignment prefix `submit by`, matching the existing handling of `due` and `deadline`.
+
+Re-evaluation of the same live ledger:
+
+```text
+precision: 1.00
+recall: 1.00
+true positives: 4
+false positives: 0
+false negatives: 0
+```
+
+Classification:
+
+```text
+EVALUATOR_ERROR fixed
+```
+
+### Corrective Research 10
+
+Research 10 was rerun with the field-based contract.
+
+Run 1:
+
+```text
+completed: 4
+failed: 6
+blocked: 0
+field precision: 0.00
+field recall: 0.00
+```
+
+The six failed items were the six relevant pages. They failed before ledger result creation with:
+
+```text
+Local Ollama endpoint unavailable: http://127.0.0.1:11434
+```
+
+Partial child metrics showed that the pages opened successfully and then failed during or before the step-2 model call. This was not a clean extraction-quality verdict.
+
+Root cause found:
+
+```text
+OllamaClient request_timeout_s defaulted to 30s, while field-based relevant-page generations exceeded that.
+```
+
+The live fixture runner now raises `config.model.request_timeout_s` to at least the per-item benchmark budget.
+
+Run 2 with a 240s per-item budget still produced the same pre-ledger failures for the six relevant pages. A direct `ollama run qwen3:8b` health probe also hung and streamed internal reasoning until interrupted. The local model service was therefore not stable enough to produce a clean research 10 gate result in this pass.
+
+Because the research 10 gate did not pass, the required validation order stopped there. Assignment 25/50/100, research 25/50, real crash matrix, failure mix, Phase 4B live regression, and public-web pilot were not run after this corrective change.
+
+### Structured Result Reliability
+
+Corrective assignment 10 live ledger:
+
+```text
+structured outputs attempted: 10
+schema-valid results: 10
+schema-valid %: 100.0
+evidence-backed findings: 11
+unsupported findings rejected: 0
+status conflicts: 0
+evidence-backed %: 100.0
+```
+
+Corrective research 10 timeout-fixed run:
+
+```text
+structured outputs attempted: 4
+schema-valid results: 4
+schema-valid %: 100.0
+evidence-backed findings: 0
+unsupported findings rejected: 0
+status conflicts: 0
+```
+
+The research numbers only cover the four irrelevant pages that reached ledger storage.
+
+### Prompt Scaling
+
+Corrective assignment 10:
+
+```text
+item 1: 1059
+item 10: 1059
+avg: 1121.5
+p95: 1242
+max: 1242
+```
+
+Corrective research 10 timeout-fixed partial:
+
+```text
+item 10: 1123
+avg: 1149.75
+p95: 1177
+max: 1177
+```
+
+No batch-ordinal growth was observed in the completed 10-target runs. Item 25/50/100 prompt checkpoints remain unmeasured after this corrective change because the research 10 gate stopped the scaling sequence.
+
+### RSS Scaling
+
+Actual process RSS instrumentation was added to the live fixture runner using `psutil` when available.
+
+Corrective assignment 10:
+
+```text
+startup: 50.86 MB
+item 10: 64.05 MB
+peak: 64.05 MB
+```
+
+Corrective research 10 timeout-fixed partial:
+
+```text
+startup: 50.79 MB
+item 10: 64.53 MB
+peak: 64.53 MB
+```
+
+Item 25/50/100 RSS checkpoints remain unmeasured because the validation gate stopped at research 10.
+
+### Queue Correctness
+
+Corrective assignment 10:
+
+```text
+lost items: 0
+duplicate completions: 0
+unexplained RUNNING leftovers: 0
+```
+
+Corrective research 10:
+
+```text
+lost items: 0
+duplicate completions: 0
+unexplained RUNNING leftovers: 0
+failed items: 6 pre-ledger model-service failures
+```
+
+### Crash, Failure Mix, Public Web
+
+Not run in this corrective pass because the research 10 gate did not pass. This follows the required validation order and avoids hiding local correctness problems behind larger-scale or public-web noise.
+
+### Tests
+
+Focused result-quality and orchestrator tests:
+
+```text
+15 passed
+```
+
+Full deterministic suite after the corrective code changes:
+
+```text
+121 passed in 98.08s
+```
+
+Added or updated coverage for:
+
+- assignment result schema
+- status classification contract
+- completed/closed item exclusion from synthesis
+- unknown status behavior
+- research field result schema
+- found / not_found / unresolved states
+- evidence requirement
+- result schema validation / normalization
+- synthesis filtering
+- RSS checkpoint instrumentation
+
+### Decisions
+
+Model decision:
+
+```text
+INSUFFICIENT EVIDENCE
+```
+
+Embedding decision:
+
+```text
+FTS5 SUFFICIENT
+```
+
+Parallelism decision:
+
+```text
+SEQUENTIAL SUFFICIENT
+```
+
+Next step:
+
+```text
+NEEDS ANOTHER PHASE 5 CORRECTIVE ITERATION
+```

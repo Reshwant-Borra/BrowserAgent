@@ -89,7 +89,14 @@ def classify_child_failure(events: list[Event], status: str, last_error: str | N
 
 def finding_dedupe_key(finding: dict[str, Any], source_url: str | None = None) -> str:
     course = _norm(str(finding.get("course") or ""))
-    title = _norm(str(finding.get("title") or finding.get("assignment") or finding.get("fact") or finding.get("type") or ""))
+    title = _norm(str(
+        finding.get("title")
+        or finding.get("assignment")
+        or finding.get("fact")
+        or finding.get("field")
+        or finding.get("type")
+        or ""
+    ))
     value = _norm_due(str(finding.get("value") or finding.get("due_date") or finding.get("deadline") or ""))
     source = normalize_target_url(source_url or finding.get("source_url") or "") if (source_url or finding.get("source_url")) else ""
     if title or value:
@@ -105,7 +112,7 @@ def _norm_due(value: str) -> str:
     normalized = _norm(value)
     if not normalized or "to be announced" in normalized:
         return ""
-    normalized = normalized.removeprefix("due ").removeprefix("deadline: ").strip()
+    normalized = normalized.removeprefix("due ").removeprefix("deadline: ").removeprefix("submit by ").strip()
     normalized = normalized.split(" at ", 1)[0]
     normalized = normalized.replace("sept ", "sep ")
     month_match = re.fullmatch(r"(?:september|sep)\s+(\d{1,2})(?:,\s*(\d{4}))?", normalized)

@@ -99,13 +99,22 @@ def _contract_from_name(name: str) -> ResultContract:
         return ResultContract(
             name="assignment",
             description="Find actionable assignments only; preserve course, assignment, due date, status, source, and evidence.",
-            required_fields=["course", "assignment", "due_date", "status", "source", "evidence"],
+            required_fields=["course", "title", "due_date", "status", "actionable", "source_url", "evidence"],
+            field_definitions={
+                "status": "one of upcoming, current_incomplete, completed, closed, past_archived, unknown",
+                "actionable": "true only when the assignment still requires action",
+            },
         )
     if name == "research":
         return ResultContract(
             name="research",
-            description="Classify relevance and extract concise facts with source and evidence.",
-            required_fields=["relevant", "fact", "source", "evidence"],
+            description="Classify relevance and extract requested facts with source and evidence.",
+            required_fields=["pricing", "education_discount", "public_api_docs", "source_url", "evidence"],
+            field_definitions={
+                "pricing": "pricing, plan, cost, seat, or monthly price information",
+                "education_discount": "education, school, student, teacher, or academic discount information",
+                "public_api_docs": "public API, REST API, developer documentation, or API docs availability",
+            },
         )
     return ResultContract(name=name)
 

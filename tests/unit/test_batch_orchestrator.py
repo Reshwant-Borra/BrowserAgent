@@ -64,8 +64,8 @@ def test_orchestrator_completes_and_dedupes_findings(tmp_config, tmp_path):
     policy = BatchPolicy(max_steps_per_item=5)
     batch_id = store.create_batch("find assignments", ["http://a.test", "http://b.test"], contract, policy, "b1")
     findings = [
-        {"title": "Unit 4 Lab", "value": "Due Sep 14", "evidence": "Unit 4 Lab due Sep 14"},
-        {"title": "Unit 4 Lab", "value": "Due Sep 14", "evidence": "Duplicate posting"},
+        {"title": "Unit 4 Lab", "value": "Due Sep 14", "status": "upcoming", "actionable": True, "evidence": "Unit 4 Lab due Sep 14"},
+        {"title": "Unit 4 Lab", "value": "Due Sep 14", "status": "upcoming", "actionable": True, "evidence": "Duplicate posting due Sep 14"},
     ]
     runner = FakeRunner([
         {"status": "completed", "result": {"summary": "one assignment", "findings": [findings[0]]}},
@@ -124,6 +124,37 @@ def test_assignment_result_postprocess_drops_completed_findings(tmp_config, tmp_
     final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
     try:
         assert final["raw_findings"] == 0
+        assert final["deduplicated_findings"] == 0
+        stored = json.loads(store.results(batch_id)[0]["structured_data"])
+        assert stored["findings"][0]["actionable"] is False
+        assert stored["_quality"]["status_conflicts"] == 0
+    finally:
+        store.close()
+
+
+def test_assignment_status_conflict_uses_page_evidence(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract(name="assignment", required_fields=["course", "title", "due_date", "status", "actionable", "evidence"])
+    policy = BatchPolicy(max_steps_per_item=5)
+    batch_id = store.create_batch("find assignments", ["http://a.test"], contract, policy, "b1")
+    runner = FakeRunner([
+        {"status": "completed", "result": {"summary": "one", "findings": [
+            {
+                "type": "assignment",
+                "course": "History",
+                "title": "Old Review Packet",
+                "due_date": "Deadline: September 18, 2026",
+                "status": "upcoming",
+                "actionable": True,
+                "evidence": "Deadline: September 18, 2026",
+            }
+        ]}, "final_text_excerpt": "History\nOld Review Packet\nDeadline: September 18, 2026\nCompleted assignment from last month"},
+    ])
+    final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        stored = json.loads(store.results(batch_id)[0]["structured_data"])
+        assert stored["findings"][0]["actionable"] is False
+        assert stored["_quality"]["status_conflicts"] == 1
         assert final["deduplicated_findings"] == 0
     finally:
         store.close()
@@ -237,7 +268,7 @@ def _write_child_task(config, task_id: str, target: str, outcome: dict[str, Any]
                     "result": json.dumps(outcome["result"]),
                     "final_url": target,
                     "final_title": "Fixture",
-                    "final_text_excerpt": "Evidence text",
+                    "final_text_excerpt": outcome.get("final_text_excerpt", "Evidence text"),
                 },
             )
             state = TaskState(task_id=task_id, current_step=2, status="completed", last_event_id=store.max_event_id(task_id))

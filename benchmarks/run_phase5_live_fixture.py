@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import functools
 import json
+import os
 import statistics
 import sys
 import threading
@@ -45,6 +46,7 @@ async def run_live(kind: str, count: int, output_dir: Path, max_steps: int, max_
         config.storage.tasks_dir = str(output_dir / "runtime" / "tasks")
         config.browser.user_data_dir = str(output_dir / "runtime" / "tasks")
         config.logging.dir = str(output_dir / "runtime" / "logs")
+        config.model.request_timeout_s = max(float(config.model.request_timeout_s), max_seconds)
         client = create_inference_client(config)
         if not await client.health_check():
             raise RuntimeError(f"model backend unavailable at {client.endpoint}")
@@ -60,9 +62,26 @@ async def run_live(kind: str, count: int, output_dir: Path, max_steps: int, max_
         store = BatchStore.for_batch_dir(output_dir / "runtime" / "batches" / batch_id)
         try:
             store.create_batch(f"Phase 5 live {kind} sweep", targets, contract, policy, batch_id=batch_id)
+            rss = {"startup": _process_rss_mb()}
+            rss_checkpoints: dict[str, float | None] = {}
+
+            def record_rss(item: dict[str, Any]) -> None:
+                ordinal = int(item["ordinal"])
+                if ordinal in {10, 25, 50, 100}:
+                    rss_checkpoints[str(ordinal)] = _process_rss_mb()
+
             start = time.monotonic()
-            final = await BatchOrchestrator(config, store, batch_id, policy, contract).run()
+            final = await BatchOrchestrator(
+                config,
+                store,
+                batch_id,
+                policy,
+                contract,
+                item_completed_callback=record_rss,
+            ).run()
             duration = time.monotonic() - start
+            rss.update(_rss_checkpoints(store, batch_id, rss_checkpoints))
+            rss["peak"] = max(v for v in rss.values() if v is not None) if any(v is not None for v in rss.values()) else None
             evaluation = _evaluate(kind, truth, store, batch_id)
             metrics = _metrics(config, store, batch_id)
             summary = {
@@ -80,6 +99,7 @@ async def run_live(kind: str, count: int, output_dir: Path, max_steps: int, max_
                 },
                 "evaluation": evaluation,
                 "metrics": metrics,
+                "rss_mb": rss,
                 "final": final,
             }
             (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -97,12 +117,21 @@ def _contract(kind: str) -> ResultContract:
         return ResultContract(
             name="assignment",
             description="Find actionable upcoming assignments only; include course, assignment title, due date if present, status, source URL, and evidence.",
-            required_fields=["course", "title", "value", "status", "source_url", "evidence"],
+            required_fields=["course", "title", "due_date", "status", "actionable", "source_url", "evidence"],
+            field_definitions={
+                "status": "one of upcoming, current_incomplete, completed, closed, past_archived, unknown",
+                "actionable": "true only when the assignment still requires action",
+            },
         )
     return ResultContract(
         name="research",
-        description="Classify relevance and extract concise facts with source URL and evidence.",
-        required_fields=["relevant", "fact", "source_url", "evidence"],
+        description="Classify relevance and extract requested research fields with source URL and evidence.",
+        required_fields=["pricing", "education_discount", "public_api_docs", "source_url", "evidence"],
+        field_definitions={
+            "pricing": "pricing, plan, cost, seat, or monthly price information",
+            "education_discount": "education, school, student, teacher, or academic discount information",
+            "public_api_docs": "public API, REST API, developer documentation, or API docs availability",
+        },
     )
 
 
@@ -115,6 +144,7 @@ def _evaluate(kind: str, truth: dict[str, Any], store: BatchStore, batch_id: str
             if isinstance(finding, dict):
                 predictions.append({**finding, "work_item_id": row["work_item_id"], "result_id": row["id"]})
     if kind == "assignment":
+        predictions = [p for p in predictions if p.get("actionable") is True]
         truth_keys = {
             _assignment_key(row["course"], row["assignment"], row["due_date"])
             for row in truth["assignments"]
@@ -128,8 +158,19 @@ def _evaluate(kind: str, truth: dict[str, Any], store: BatchStore, batch_id: str
             for p in predictions
         }
     else:
-        truth_keys = {_norm(row["fact"]) for row in truth["facts"]}
-        pred_keys = {_norm(str(p.get("fact") or p.get("value") or p.get("title") or "")) for p in predictions}
+        truth_keys = {
+            _research_key(row["source"], _research_field_for_fact(row["fact"]))
+            for row in truth["facts"]
+        }
+        target_by_item = {
+            row["id"]: Path(row["target"]).name
+            for row in store.items(batch_id)
+        }
+        pred_keys = {
+            _research_key(target_by_item.get(p["work_item_id"], ""), str(p.get("field") or ""))
+            for p in predictions
+            if p.get("field") and p.get("value") and p.get("evidence")
+        }
     tp = len(truth_keys & pred_keys)
     fp = len(pred_keys - truth_keys)
     fn = len(truth_keys - pred_keys)
@@ -146,6 +187,7 @@ def _evaluate(kind: str, truth: dict[str, Any], store: BatchStore, batch_id: str
         "f1": (2 * precision * recall / (precision + recall)) if precision + recall else 0.0,
         "missing_keys": sorted(truth_keys - pred_keys),
         "extra_keys": sorted(pred_keys - truth_keys),
+        **(_research_field_breakdown(truth, predictions, store, batch_id) if kind == "research" else {}),
     }
 
 
@@ -215,7 +257,7 @@ def _norm_due(value: str) -> str:
     normalized = _norm(value)
     if not normalized or "to be announced" in normalized:
         return ""
-    normalized = normalized.removeprefix("due ").removeprefix("deadline: ").strip()
+    normalized = normalized.removeprefix("due ").removeprefix("deadline: ").removeprefix("submit by ").strip()
     normalized = normalized.split(" at ", 1)[0]
     normalized = normalized.replace("sept ", "sep ")
     import re
@@ -232,6 +274,74 @@ def _p95(values: list[int | float]) -> int | float | None:
     ordered = sorted(values)
     idx = min(len(ordered) - 1, int(round((len(ordered) - 1) * 0.95)))
     return ordered[idx]
+
+
+def _research_key(source: str, field: str) -> str:
+    return f"{Path(source).name}|{field}"
+
+
+def _research_field_for_fact(fact: str) -> str:
+    text = _norm(fact)
+    if "pricing" in text or "seat" in text:
+        return "pricing"
+    if "education" in text or "discount" in text:
+        return "education_discount"
+    if "api" in text:
+        return "public_api_docs"
+    return text.replace(" ", "_")
+
+
+def _research_field_breakdown(truth: dict[str, Any], predictions: list[dict[str, Any]], store: BatchStore, batch_id: str) -> dict[str, Any]:
+    fields = ["pricing", "education_discount", "public_api_docs"]
+    truth_pairs = {
+        (Path(row["source"]).name, _research_field_for_fact(row["fact"]))
+        for row in truth["facts"]
+    }
+    target_by_item = {row["id"]: Path(row["target"]).name for row in store.items(batch_id)}
+    pred_pairs = {
+        (target_by_item.get(p["work_item_id"], ""), str(p.get("field") or ""))
+        for p in predictions
+        if p.get("field") and p.get("value") and p.get("evidence")
+    }
+    per_field = {}
+    found = not_found = unsupported = 0
+    for field in fields:
+        expected = {pair for pair in truth_pairs if pair[1] == field}
+        predicted = {pair for pair in pred_pairs if pair[1] == field}
+        tp = len(expected & predicted)
+        fp = len(predicted - expected)
+        fn = len(expected - predicted)
+        per_field[field] = {
+            "precision": tp / (tp + fp) if tp + fp else 1.0 if not expected else 0.0,
+            "recall": tp / (tp + fn) if tp + fn else 1.0,
+            "found": len(predicted),
+            "false_positive": fp,
+            "missed": fn,
+        }
+        found += len(predicted)
+    for row in store.results(batch_id):
+        data = json.loads(row["structured_data"])
+        for state in (data.get("fields") or {}).values():
+            if isinstance(state, dict) and state.get("status") == "not_found":
+                not_found += 1
+        unsupported += int((data.get("_quality") or {}).get("unsupported_findings_rejected") or 0)
+    return {"field_metrics": per_field, "found": found, "not_found": not_found, "unsupported_findings": unsupported}
+
+
+def _process_rss_mb() -> float | None:
+    try:
+        import psutil
+    except ImportError:
+        return None
+    return round(psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024), 2)
+
+
+def _rss_checkpoints(store: BatchStore, batch_id: str, observed: dict[str, float | None]) -> dict[str, float | None]:
+    rss = {}
+    for ordinal in (10, 25, 50, 100):
+        item = next((row for row in store.items(batch_id) if row["ordinal"] == ordinal), None)
+        rss[str(ordinal)] = observed.get(str(ordinal)) if item else None
+    return rss
 
 
 async def main() -> None:

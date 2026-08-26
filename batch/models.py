@@ -91,6 +91,7 @@ class ResultContract:
     name: str = "generic"
     description: str = "Return relevant findings with concise evidence and source URLs."
     required_fields: list[str] = field(default_factory=list)
+    field_definitions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
