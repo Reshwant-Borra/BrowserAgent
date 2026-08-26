@@ -49,12 +49,12 @@ GRAMMAR_PATH = Path(__file__).resolve().parent.parent / "inference" / "grammar" 
 
 
 class AgentLoop:
-    def __init__(self, config: AppConfig, task_id: str):
+    def __init__(self, config: AppConfig, task_id: str, profile_dir: Path | None = None):
         self.config = config
         self.task_id = task_id
         self.tasks_dir = Path(config.storage.tasks_dir)
         self.db_path = self.tasks_dir / task_id / "task.db"
-        self.profile_dir = self.tasks_dir / task_id / "browser_profile"
+        self.profile_dir = profile_dir or self.tasks_dir / task_id / "browser_profile"
 
         self.event_store = EventStore(self.db_path)
         self.state_store = TaskStateStore(self.event_store)
@@ -70,9 +70,15 @@ class AgentLoop:
     # ---- lifecycle ---------------------------------------------------------
 
     @classmethod
-    def create_new(cls, config: AppConfig, goal: str, success_criteria: list[str]) -> "AgentLoop":
+    def create_new(
+        cls,
+        config: AppConfig,
+        goal: str,
+        success_criteria: list[str],
+        profile_dir: Path | None = None,
+    ) -> "AgentLoop":
         task_id = uuid.uuid4().hex[:12]
-        loop = cls(config, task_id)
+        loop = cls(config, task_id, profile_dir=profile_dir)
         loop.event_store.create_task(task_id, goal, success_criteria)
         loop.event_store.append(task_id, 0, EventType.TASK_CREATED,
                                  {"goal": goal, "success_criteria": success_criteria})
@@ -80,8 +86,8 @@ class AgentLoop:
         return loop
 
     @classmethod
-    def resume(cls, config: AppConfig, task_id: str) -> "AgentLoop":
-        loop = cls(config, task_id)
+    def resume(cls, config: AppConfig, task_id: str, profile_dir: Path | None = None) -> "AgentLoop":
+        loop = cls(config, task_id, profile_dir=profile_dir)
         if not loop.event_store.task_exists(task_id):
             raise ValueError(f"no such task: {task_id}")
         return loop
