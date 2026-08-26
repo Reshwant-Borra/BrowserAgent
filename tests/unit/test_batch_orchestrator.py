@@ -6,7 +6,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from batch.models import BatchPolicy, FailureCategory, ResultContract, WorkItemStatus
+from batch.models import BatchPolicy, FailureCategory, NavigationScope, ResultContract, WorkItemStatus
 from batch.orchestrator import BatchOrchestrator
 from batch.store import BatchStore
 from memory.event_store import EventStore, EventType
@@ -29,8 +29,29 @@ class FakeRunner:
         profile_dir: Path | None,
         max_steps: int,
         resume_task_id: str | None = None,
+        runtime_policy=None,
     ) -> str:
         self.calls.append({"item": work_item["id"], "goal": child_goal, "resume_task_id": resume_task_id})
+        outcome = self.outcomes.pop(0)
+        task_id = resume_task_id or uuid.uuid4().hex[:12]
+        _write_child_task(config, task_id, work_item["target"], outcome)
+        return task_id
+
+
+class PolicyCapturingRunner(FakeRunner):
+    async def run_child(
+        self,
+        config,
+        batch_id: str,
+        work_item: dict[str, Any],
+        child_goal: str,
+        success_criteria: list[str],
+        profile_dir: Path | None,
+        max_steps: int,
+        resume_task_id: str | None = None,
+        runtime_policy=None,
+    ) -> str:
+        self.calls.append({"item": work_item["id"], "runtime_policy": runtime_policy})
         outcome = self.outcomes.pop(0)
         task_id = resume_task_id or uuid.uuid4().hex[:12]
         _write_child_task(config, task_id, work_item["target"], outcome)
@@ -62,6 +83,52 @@ def test_orchestrator_completes_and_dedupes_findings(tmp_config, tmp_path):
         store.close()
 
 
+def test_assignment_dedupe_normalizes_date_variants(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract(name="assignment", required_fields=["course", "title", "value", "evidence"])
+    policy = BatchPolicy(max_steps_per_item=5)
+    batch_id = store.create_batch("find assignments", ["http://a.test", "http://b.test"], contract, policy, "b1")
+    runner = FakeRunner([
+        {"status": "completed", "result": {"summary": "one", "findings": [
+            {"type": "assignment", "course": "Biology", "title": "Unit 4 Lab", "value": "September 14", "evidence": "Assignment due September 14"}
+        ]}},
+        {"status": "completed", "result": {"summary": "two", "findings": [
+            {"type": "assignment", "course": "Biology", "title": "Unit 4 Lab", "value": "Due Sep 14", "evidence": "Due Sep 14"}
+        ]}},
+    ])
+    final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        assert final["raw_findings"] == 2
+        assert final["deduplicated_findings"] == 1
+    finally:
+        store.close()
+
+
+def test_assignment_result_postprocess_drops_completed_findings(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract(name="assignment", required_fields=["course", "title", "value", "evidence"])
+    policy = BatchPolicy(max_steps_per_item=5)
+    batch_id = store.create_batch("find assignments", ["http://a.test"], contract, policy, "b1")
+    runner = FakeRunner([
+        {"status": "completed", "result": {"summary": "one", "findings": [
+            {
+                "type": "assignment",
+                "course": "Biology",
+                "title": "Old Review Packet",
+                "value": "Due Sep 14",
+                "status": "Completed assignment from last month",
+                "evidence": "Completed assignment from last month",
+            }
+        ]}},
+    ])
+    final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        assert final["raw_findings"] == 0
+        assert final["deduplicated_findings"] == 0
+    finally:
+        store.close()
+
+
 def test_orchestrator_continues_past_item_failure(tmp_config, tmp_path):
     store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
     contract = ResultContract()
@@ -80,6 +147,25 @@ def test_orchestrator_continues_past_item_failure(tmp_config, tmp_path):
         assert final["status"] == "completed_with_failures"
         blocked = [item for item in store.items(batch_id) if item["status"] == WorkItemStatus.BLOCKED.value]
         assert blocked[0]["failure_category"] == FailureCategory.AUTH_REQUIRED.value
+    finally:
+        store.close()
+
+
+def test_orchestrator_passes_batch_runtime_policy(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract()
+    policy = BatchPolicy(read_only=True, navigation_scope=NavigationScope.SAME_DOMAIN)
+    batch_id = store.create_batch("research", ["https://school.example.edu/a"], contract, policy, "b1")
+    runner = PolicyCapturingRunner([
+        {"status": "completed", "result": {"summary": "ok", "findings": []}},
+    ])
+    asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        runtime_policy = runner.calls[0]["runtime_policy"]
+        assert runtime_policy is not None
+        assert runtime_policy.read_only is True
+        assert runtime_policy.target_url == "https://school.example.edu/a"
+        assert runtime_policy.navigation_scope.value == "same_domain"
     finally:
         store.close()
 

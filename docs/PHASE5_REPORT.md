@@ -214,3 +214,196 @@ Only after the live fixture, crash/resume, safety enforcement, and public-web pi
 - Phase 5B - Real-Web Robustness
 - Phase 6 - Reusable Domain Skills
 
+## Phase 5 Validation Completion
+
+Date: 2026-08-26
+
+Verdict remains: Phase 5 PARTIAL.
+
+### Safety and Scope Enforcement
+
+Added `agent.runtime_policy.BatchRuntimePolicy` and passed it from the batch orchestrator into child `AgentLoop` tasks.
+
+Enforced:
+
+- `read_only=true` blocks consequential actions before `ACTION_INTENT`.
+- `navigation_scope=same_origin|same_domain|unrestricted` blocks out-of-scope `open_url` before execution.
+- Click-driven out-of-scope navigation is detected after post-action observation, persisted, and blocks the child task.
+- New failure categories: `SCOPE_BLOCKED`, `READ_ONLY_BLOCKED`.
+
+Focused tests increased from 9 to 16 and cover:
+
+- read-only consequential blocking
+- harmless read-only click allowance
+- same-origin blocking
+- same-domain allowance
+- unrestricted allowance
+- policy propagation from `BatchOrchestrator` to child runner
+- assignment dedupe date normalization
+- deterministic dropping of completed/old assignment findings
+
+### Deterministic Regression
+
+Full suite after safety/scope changes:
+
+```text
+112 passed in 87.00s
+```
+
+Focused Phase 5 tests after final filter:
+
+```text
+16 passed
+```
+
+### Live Model Environment
+
+Ollama was available with `qwen3:8b`:
+
+```text
+qwen3:8b  5.2 GB
+```
+
+`ollama run qwen3:8b "ok"` returned successfully.
+
+### Live Assignment Scaling
+
+Real Qwen/Ollama child tasks were run through the batch orchestrator against local HTTP-served fixtures.
+
+| Targets | Completed | Failed | Blocked | Precision | Recall | Raw Findings | Deduped Findings | Calls/Item | Duration |
+| ------: | --------: | -----: | ------: | --------: | -----: | -----------: | ---------------: | ---------: | -------: |
+| 10 | 10 | 0 | 0 | 1.00 | 1.00 | 7 | 4 | 2.0 | 47.25s |
+| 25 | 25 | 0 | 0 | 1.00 | 1.00 | 15 | 4 | 2.0 | 118.66s |
+| 50 | 50 | 0 | 0 | 0.667 | 1.00 | 32 | 6 | 2.0 | 240.04s |
+| 100 | not run | not run | not run | not run | not run | not run | not run | not run | not run |
+
+The 10 and 25 target runs passed extraction after deterministic due-date normalization and old/completed-assignment filtering. The 50 target run preserved queue correctness but failed the >=95% precision gate. Qwen produced false positives for old/completed pages whose title was `Old Review Packet` while extracting actionable-looking due text.
+
+Because the 50-target accuracy gate failed, 100-target live assignment validation was not run.
+
+### Prompt Scaling
+
+Measured live assignment prompt checkpoints:
+
+| Run | Item 1 | Item 10 | Item 25 | Item 50 | Avg | P95 | Max |
+| --- | -----: | ------: | ------: | ------: | --: | --: | --: |
+| assignment 10 | 946 | 946 | n/a | n/a | 1008.5 | 1129 | 1129 |
+| assignment 25 | 945 | 945 | 945 | n/a | 1002.1 | 1127 | 1127 |
+| assignment 50 | 945 | 945 | 945 | 945 | 1004.62 | 1127 | 1127 |
+
+Prompt size showed no batch-ordinal growth through item 50.
+
+### Live Research Fixture
+
+Ran 10 real Qwen research targets:
+
+```text
+completed: 10/10
+failed: 0
+blocked: 0
+raw findings: 4
+deduped findings: 3
+duration: 43.90s
+model calls/item: 2.0
+```
+
+Evaluator result:
+
+```text
+precision: 0.0 under strict fact-key evaluation
+recall: 0.0 under strict fact-key evaluation
+```
+
+Manual interpretation is still below gate: Qwen found pricing/API evidence on some pages but missed the education-discount fact and sometimes extracted generic labels such as `Relevant source` instead of the intended fact. The 50-target research gate was not run because the 10-target research extraction was not healthy.
+
+### Queue Correctness
+
+Observed live fixture queue behavior:
+
+```text
+lost items: 0
+duplicate completions: 0
+unexplained RUNNING items: 0
+completed assignment children: 85 total across 10/25/50 runs
+completed research children: 10
+```
+
+Queue correctness is healthy; extraction quality is the blocker.
+
+### Dedupe Accuracy
+
+Assignment 10 and 25:
+
+```text
+over-merges: 0 observed
+under-merges: 0 observed after due-date normalization
+```
+
+Assignment 50:
+
+```text
+raw findings: 32
+deduped findings: 6
+expected actionable deduped findings: 4
+over-merges: 0 observed
+under-merges: 0 for true duplicates
+false-positive retained findings: 2
+```
+
+### Result Provenance
+
+Live final findings included:
+
+- `work_item_id`
+- `result_id`
+- child `browser_task_id`
+- source URL
+- final URL
+- bounded evidence entries
+
+Provenance coverage for retained final findings: 100%.
+
+### Crash / Resume
+
+Unit-level reconciliation still passes for:
+
+- child completed before item status update
+- result persisted before item status update
+
+Real process-kill batch crash/resume matrix was not run because the live 50-target extraction gate failed first.
+
+### Failure Continuation
+
+The focused tests still cover blocked/failure continuation. A live failure-mix benchmark was not run because assignment/research live extraction did not reach the required accuracy gate.
+
+### RAM Scaling
+
+RSS checkpoint instrumentation was not completed in this validation pass. The orchestrator still persists child histories to SQLite and does not retain child event histories across the batch, but the required process-RSS measurements remain missing.
+
+### Public-Web Pilot
+
+Not run. Local validation did not clear the 50/100 target accuracy gate, so public-web validation would be premature.
+
+### Safety
+
+Consequential read-only blocking is implemented and unit-tested. No unintended consequential writes occurred in deterministic tests or live fixture runs. A live fixture with an actual consequential-looking button was not run yet.
+
+### Decisions
+
+Model decision: INSUFFICIENT EVIDENCE
+
+Embedding decision: FTS5 SUFFICIENT
+
+Parallelism decision: SEQUENTIAL SUFFICIENT for current throughput and correctness work; parallelism is not justified while extraction quality remains the blocker.
+
+Public-web decision: NEEDS PHASE 5 CORRECTIVE ITERATION
+
+### Remaining Validation Gaps
+
+1. Improve assignment extraction/filtering enough for 50 and 100 target live precision >=95%.
+2. Improve research result contract adherence; current Qwen outputs generic labels and misses facts.
+3. Add RSS checkpoint instrumentation.
+4. Run real process-kill batch crash/resume matrix.
+5. Run live failure-mix benchmark.
+6. Run safety fixture with a consequential-looking control.
+7. Run public-web pilot only after local 100-target and crash/resume gates pass.

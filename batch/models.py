@@ -34,6 +34,8 @@ class FailureCategory(str, Enum):
     CAPTCHA_OR_BOT_CHALLENGE = "CAPTCHA_OR_BOT_CHALLENGE"
     TIMEOUT = "TIMEOUT"
     UNSUPPORTED_PAGE = "UNSUPPORTED_PAGE"
+    SCOPE_BLOCKED = "SCOPE_BLOCKED"
+    READ_ONLY_BLOCKED = "READ_ONLY_BLOCKED"
     BLOCKED_CONSEQUENTIAL = "BLOCKED_CONSEQUENTIAL"
     MAX_STEPS = "MAX_STEPS"
     UNKNOWN = "UNKNOWN"
@@ -96,4 +98,3 @@ class WorkTarget:
     raw: str
     normalized: str
     payload: dict[str, Any]
-

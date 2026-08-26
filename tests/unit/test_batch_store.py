@@ -5,7 +5,15 @@ import json
 from batch.models import BatchEventType, BatchPolicy, FailureCategory, NavigationScope, ResultContract, WorkItemStatus
 from batch.policies import in_navigation_scope, normalize_target_url, read_only_allows
 from batch.store import BatchStore
+from agent.runtime_policy import (
+    BatchRuntimePolicy,
+    NavigationScopePolicy,
+    post_navigation_violation,
+    pre_action_violation,
+    url_in_scope,
+)
 from agent.schemas import ActionType, ModelDecision
+from browser.page_model import ElementRef, SelectorHint
 
 
 def test_create_batch_deduplicates_targets(tmp_path):
@@ -111,3 +119,54 @@ def test_domain_and_read_only_policies():
     consequential = ModelDecision(action=ActionType.CLICK, target=1)
     assert read_only_allows(harmless, "Expand details")
     assert not read_only_allows(consequential, "Submit Assignment")
+
+
+def test_runtime_policy_blocks_consequential_read_only_action():
+    policy = BatchRuntimePolicy(target_url="https://school.example.edu/course/1", read_only=True)
+    decision = ModelDecision(action=ActionType.CLICK, target=1)
+    element = ElementRef(
+        id=1,
+        role="button",
+        name="Submit Assignment",
+        selector_hint=SelectorHint(css="button", nth=0),
+    )
+    violation = pre_action_violation(policy, decision, element)
+    assert violation is not None
+    assert violation.category == "READ_ONLY_BLOCKED"
+
+
+def test_runtime_policy_allows_harmless_read_only_interactions():
+    policy = BatchRuntimePolicy(target_url="https://school.example.edu/course/1", read_only=True)
+    decision = ModelDecision(action=ActionType.CLICK, target=1)
+    element = ElementRef(
+        id=1,
+        role="button",
+        name="Expand details",
+        selector_hint=SelectorHint(css="button", nth=0),
+    )
+    assert pre_action_violation(policy, decision, element) is None
+
+
+def test_runtime_policy_blocks_cross_origin_open_url():
+    policy = BatchRuntimePolicy(
+        target_url="https://school.example.edu/course/1",
+        navigation_scope=NavigationScopePolicy.SAME_ORIGIN,
+    )
+    decision = ModelDecision(action=ActionType.OPEN_URL, params={"url": "https://evil.example.com/"})
+    violation = pre_action_violation(policy, decision, None)
+    assert violation is not None
+    assert violation.category == "SCOPE_BLOCKED"
+
+
+def test_runtime_policy_scope_modes():
+    source = "https://school.example.edu/course/1"
+    assert url_in_scope(source, "https://school.example.edu/course/2", NavigationScopePolicy.SAME_ORIGIN)
+    assert not url_in_scope(source, "https://portal.example.edu/course/2", NavigationScopePolicy.SAME_ORIGIN)
+    assert url_in_scope(source, "https://portal.example.edu/course/2", NavigationScopePolicy.SAME_DOMAIN)
+    assert url_in_scope(source, "https://external.test/path", NavigationScopePolicy.UNRESTRICTED)
+    violation = post_navigation_violation(
+        BatchRuntimePolicy(target_url=source, navigation_scope=NavigationScopePolicy.SAME_ORIGIN),
+        "https://portal.example.edu/course/2",
+    )
+    assert violation is not None
+    assert violation.category == "SCOPE_BLOCKED"

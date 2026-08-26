@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from agent.config import AppConfig
+from agent.runtime_policy import BatchRuntimePolicy, NavigationScopePolicy
 from batch.models import BatchEventType, BatchPolicy, FailureCategory, ResultContract, SessionMode, WorkItemStatus
 from batch.policies import classify_child_failure, finding_dedupe_key
 from batch.store import BatchStore
@@ -25,6 +26,7 @@ class ChildRunner(Protocol):
         profile_dir: Path | None,
         max_steps: int,
         resume_task_id: str | None = None,
+        runtime_policy: BatchRuntimePolicy | None = None,
     ) -> str:
         ...
 
@@ -40,13 +42,20 @@ class AgentLoopChildRunner:
         profile_dir: Path | None,
         max_steps: int,
         resume_task_id: str | None = None,
+        runtime_policy: BatchRuntimePolicy | None = None,
     ) -> str:
         from agent.loop import AgentLoop
 
         loop = (
-            AgentLoop.resume(config, resume_task_id, profile_dir=profile_dir)
+            AgentLoop.resume(config, resume_task_id, profile_dir=profile_dir, runtime_policy=runtime_policy)
             if resume_task_id
-            else AgentLoop.create_new(config, child_goal, success_criteria, profile_dir=profile_dir)
+            else AgentLoop.create_new(
+                config,
+                child_goal,
+                success_criteria,
+                profile_dir=profile_dir,
+                runtime_policy=runtime_policy,
+            )
         )
         await loop.run(max_steps=max_steps)
         return loop.task_id
@@ -130,6 +139,7 @@ class BatchOrchestrator:
                     profile_dir,
                     self.policy.max_steps_per_item,
                     resume_task_id=task_id,
+                    runtime_policy=self._runtime_policy(item),
                 ),
                 timeout=self.policy.max_seconds_per_item,
             )
@@ -156,6 +166,7 @@ class BatchOrchestrator:
 
     def _persist_child_result(self, item: dict[str, Any], task_id: str, events: list[Event]) -> int:
         parsed = _extract_structured_result(events, item["target"], task_id)
+        parsed["structured_data"] = self._postprocess_structured_result(parsed["structured_data"])
         dedupe_key = None
         findings = parsed["structured_data"].get("findings") or []
         if findings:
@@ -174,6 +185,32 @@ class BatchOrchestrator:
             parsed["source_event_ids"],
             dedupe_key,
         )
+
+    def _postprocess_structured_result(self, structured: dict[str, Any]) -> dict[str, Any]:
+        if self.result_contract.name != "assignment":
+            return structured
+        findings = []
+        for finding in structured.get("findings", []):
+            if not isinstance(finding, dict):
+                continue
+            blob = " ".join(str(finding.get(k, "")) for k in ("status", "evidence", "summary", "title")).lower()
+            if any(
+                marker in blob
+                for marker in (
+                    "assignment closed",
+                    "completed",
+                    "closed last",
+                    "last month",
+                    "old assignment",
+                    "old review",
+                )
+            ):
+                continue
+            findings.append(finding)
+        updated = {**structured, "findings": findings}
+        if not findings:
+            updated["relevant"] = False
+        return updated
 
     def synthesize(self) -> dict[str, Any]:
         self.store.append_event(self.batch_id, None, BatchEventType.SYNTHESIS_STARTED, {})
@@ -246,7 +283,12 @@ class BatchOrchestrator:
             f"Target: {target}\n"
             f"Required result contract: {self.result_contract.description}\n"
             f"Required fields: {fields}.\n"
-            "Return concise structured findings with evidence in the finish result. "
+            "When finished, put only compact JSON in the finish result with this shape: "
+            "{\"relevant\": true|false, \"summary\": \"...\", \"findings\": ["
+            "{\"type\": \"...\", \"title\": \"...\", \"course\": \"...\", "
+            "\"value\": \"...\", \"status\": \"...\", \"source_url\": \"...\", "
+            "\"evidence\": \"short exact page excerpt\"}]}. "
+            "Use an empty findings array when nothing relevant is present. "
             "Do not inspect unrelated websites unless navigation within this target site is needed."
         )
 
@@ -257,6 +299,13 @@ class BatchOrchestrator:
         if self.policy.session_mode == SessionMode.SHARED:
             return self.batch_dir / "browser_profile"
         return None
+
+    def _runtime_policy(self, item: dict[str, Any]) -> BatchRuntimePolicy:
+        return BatchRuntimePolicy(
+            target_url=item["target"],
+            read_only=self.policy.read_only,
+            navigation_scope=NavigationScopePolicy(self.policy.navigation_scope.value),
+        )
 
 
 def _load_child_state(config: AppConfig, task_id: str):

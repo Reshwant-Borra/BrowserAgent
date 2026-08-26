@@ -26,6 +26,7 @@ from agent.loop_detector import (
     semantic_action_signature,
 )
 from agent.recovery import RetryDecision, idempotency_decision, next_recovery_level, requires_approval
+from agent.runtime_policy import BatchRuntimePolicy, post_navigation_violation, pre_action_violation
 from agent.schemas import (
     ActionType,
     DecisionValidationError,
@@ -49,12 +50,19 @@ GRAMMAR_PATH = Path(__file__).resolve().parent.parent / "inference" / "grammar" 
 
 
 class AgentLoop:
-    def __init__(self, config: AppConfig, task_id: str, profile_dir: Path | None = None):
+    def __init__(
+        self,
+        config: AppConfig,
+        task_id: str,
+        profile_dir: Path | None = None,
+        runtime_policy: BatchRuntimePolicy | None = None,
+    ):
         self.config = config
         self.task_id = task_id
         self.tasks_dir = Path(config.storage.tasks_dir)
         self.db_path = self.tasks_dir / task_id / "task.db"
         self.profile_dir = profile_dir or self.tasks_dir / task_id / "browser_profile"
+        self.runtime_policy = runtime_policy
 
         self.event_store = EventStore(self.db_path)
         self.state_store = TaskStateStore(self.event_store)
@@ -76,9 +84,10 @@ class AgentLoop:
         goal: str,
         success_criteria: list[str],
         profile_dir: Path | None = None,
+        runtime_policy: BatchRuntimePolicy | None = None,
     ) -> "AgentLoop":
         task_id = uuid.uuid4().hex[:12]
-        loop = cls(config, task_id, profile_dir=profile_dir)
+        loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy)
         loop.event_store.create_task(task_id, goal, success_criteria)
         loop.event_store.append(task_id, 0, EventType.TASK_CREATED,
                                  {"goal": goal, "success_criteria": success_criteria})
@@ -86,8 +95,14 @@ class AgentLoop:
         return loop
 
     @classmethod
-    def resume(cls, config: AppConfig, task_id: str, profile_dir: Path | None = None) -> "AgentLoop":
-        loop = cls(config, task_id, profile_dir=profile_dir)
+    def resume(
+        cls,
+        config: AppConfig,
+        task_id: str,
+        profile_dir: Path | None = None,
+        runtime_policy: BatchRuntimePolicy | None = None,
+    ) -> "AgentLoop":
+        loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy)
         if not loop.event_store.task_exists(task_id):
             raise ValueError(f"no such task: {task_id}")
         return loop
@@ -351,6 +366,10 @@ class AgentLoop:
         if decision.action == ActionType.FINISH:
             return await self._handle_finish(task, state, step_no, decision, observation)
 
+        violation = pre_action_violation(self.runtime_policy, decision, element)
+        if violation is not None:
+            return self._block_by_runtime_policy(state, step_no, violation.category, violation.reason)
+
         if requires_approval(risk, self.config.browser.interactive_approval):
             if not self._prompt_for_approval(decision, element):
                 state = self.state_store.load(self.task_id)
@@ -402,6 +421,14 @@ class AgentLoop:
         new_observation = await self.browser.observe()
         post_hash = new_observation.state_hash
         self._append_observation_event(step_no, new_observation, phase="post_action")
+
+        violation = post_navigation_violation(self.runtime_policy, new_observation.url)
+        if violation is not None:
+            self.event_store.append(self.task_id, step_no, EventType.ACTION_RESULT, {
+                "action_fingerprint": fingerprint, "post_state_hash": post_hash,
+                "result_data": result_data, "error": error,
+            })
+            return self._block_by_runtime_policy(state, step_no, violation.category, violation.reason)
 
         self.event_store.append(self.task_id, step_no, EventType.ACTION_RESULT, {
             "action_fingerprint": fingerprint, "post_state_hash": post_hash,
@@ -801,6 +828,20 @@ class AgentLoop:
         if decision.action == ActionType.EXTRACT:
             return {"extracted": result_data.get("extracted")}
         return {}
+
+    def _block_by_runtime_policy(self, state: TaskState, step_no: int, category: str, reason: str) -> TaskState:
+        state = self.state_store.load(self.task_id)
+        state.status = "blocked"
+        state.blocked_reason = reason
+        self.event_store.append(self.task_id, step_no, EventType.TASK_BLOCKED, {
+            "reason": reason,
+            "failure_category": category,
+            "runtime_policy_block": True,
+        })
+        self.metrics.log(event="runtime_policy_block", task_id=self.task_id, step=step_no,
+                          category=category, reason=reason)
+        self.state_store.save(state)
+        return state
 
     def _prompt_for_approval(self, decision: ModelDecision, element: Optional[ElementRef]) -> bool:
         name = element.name if element else "(no target)"

@@ -29,7 +29,18 @@ class FixtureRunner:
         self.fixture_kind = fixture_kind
         self.calls = 0
 
-    async def run_child(self, config, batch_id, work_item, child_goal, success_criteria, profile_dir, max_steps, resume_task_id=None):
+    async def run_child(
+        self,
+        config,
+        batch_id,
+        work_item,
+        child_goal,
+        success_criteria,
+        profile_dir,
+        max_steps,
+        resume_task_id=None,
+        runtime_policy=None,
+    ):
         self.calls += 1
         task_id = resume_task_id or uuid.uuid4().hex[:12]
         target_name = Path(work_item["target"]).name

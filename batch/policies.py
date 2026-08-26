@@ -59,6 +59,10 @@ def classify_child_failure(events: list[Event], status: str, last_error: str | N
         return FailureCategory.AUTH_REQUIRED
     if "timeout" in blob:
         return FailureCategory.TIMEOUT
+    if "scope_blocked" in blob or "navigation_scope" in blob:
+        return FailureCategory.SCOPE_BLOCKED
+    if "read_only_blocked" in blob or "read_only policy" in blob:
+        return FailureCategory.READ_ONLY_BLOCKED
     if "consequential" in blob or "approval" in blob:
         return FailureCategory.BLOCKED_CONSEQUENTIAL
     if any(e.type == EventType.TASK_BLOCKED for e in events):
@@ -84,11 +88,12 @@ def classify_child_failure(events: list[Event], status: str, last_error: str | N
 
 
 def finding_dedupe_key(finding: dict[str, Any], source_url: str | None = None) -> str:
+    course = _norm(str(finding.get("course") or ""))
     title = _norm(str(finding.get("title") or finding.get("assignment") or finding.get("fact") or finding.get("type") or ""))
-    value = _norm(str(finding.get("value") or finding.get("due_date") or finding.get("deadline") or ""))
+    value = _norm_due(str(finding.get("value") or finding.get("due_date") or finding.get("deadline") or ""))
     source = normalize_target_url(source_url or finding.get("source_url") or "") if (source_url or finding.get("source_url")) else ""
     if title or value:
-        return f"{title}|{value}"
+        return f"{course}|{title}|{value}" if course else f"{title}|{value}"
     return f"{source}|{_norm(json.dumps(finding, sort_keys=True))}"
 
 
@@ -96,7 +101,19 @@ def _norm(value: str) -> str:
     return re.sub(r"\s+", " ", value.strip().lower())
 
 
+def _norm_due(value: str) -> str:
+    normalized = _norm(value)
+    if not normalized or "to be announced" in normalized:
+        return ""
+    normalized = normalized.removeprefix("due ").removeprefix("deadline: ").strip()
+    normalized = normalized.split(" at ", 1)[0]
+    normalized = normalized.replace("sept ", "sep ")
+    month_match = re.fullmatch(r"(?:september|sep)\s+(\d{1,2})(?:,\s*(\d{4}))?", normalized)
+    if month_match:
+        return f"sep {int(month_match.group(1))}"
+    return normalized
+
+
 def _registrable_domain(host: str) -> str:
     parts = host.lower().split(".")
     return ".".join(parts[-2:]) if len(parts) >= 2 else host.lower()
-
