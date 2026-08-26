@@ -182,6 +182,46 @@ def test_orchestrator_continues_past_item_failure(tmp_config, tmp_path):
         store.close()
 
 
+def test_structured_contract_retries_malformed_finish_result(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract(name="research", required_fields=["education_discount"])
+    policy = BatchPolicy(work_item_max_attempts=2, max_steps_per_item=5)
+    batch_id = store.create_batch("research", ["http://school.test/research_012.html"], contract, policy, "b1")
+    runner = FakeRunner([
+        {"status": "completed", "result_text": "{"},
+        {"status": "completed", "result": {
+            "relevant": True,
+            "summary": "education discount found",
+            "fields": {"education_discount": "found"},
+            "findings": [{
+                "field": "education_discount",
+                "value": "available for verified schools",
+                "source_url": "http://school.test/research_012.html",
+                "evidence": "Education discount available for verified schools.",
+            }],
+        }},
+    ])
+    final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        item = dict(store.items(batch_id)[0])
+        retry_events = [
+            event for event in store.events(batch_id)
+            if event["type"] == "WORK_ITEM_RETRY_SCHEDULED"
+        ]
+        assert final["completed"] == 1
+        assert final["failed"] == 0
+        assert final["raw_findings"] == 1
+        assert item["attempt_count"] == 2
+        assert item["failure_category"] is None
+        assert len(store.results(batch_id)) == 1
+        assert len(runner.calls) == 2
+        assert runner.calls[0]["resume_task_id"] is None
+        assert runner.calls[1]["resume_task_id"] is None
+        assert json.loads(retry_events[0]["payload"])["failure_category"] == FailureCategory.CONTRACT.value
+    finally:
+        store.close()
+
+
 def test_orchestrator_passes_batch_runtime_policy(tmp_config, tmp_path):
     store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
     contract = ResultContract()
@@ -260,12 +300,15 @@ def _write_child_task(config, task_id: str, target: str, outcome: dict[str, Any]
         store.append(task_id, 0, EventType.TASK_CREATED, {"goal": f"child {target}", "success_criteria": []})
         store.append(task_id, 1, EventType.OBSERVATION, {"url": target, "title": "Fixture", "page_hash": "h", "visible_text": ["Evidence"]})
         if outcome["status"] == "completed":
+            result_text = outcome.get("result_text")
+            if result_text is None:
+                result_text = json.dumps(outcome["result"])
             store.append(
                 task_id,
                 2,
                 EventType.TASK_COMPLETED,
                 {
-                    "result": json.dumps(outcome["result"]),
+                    "result": result_text,
                     "final_url": target,
                     "final_title": "Fixture",
                     "final_text_excerpt": outcome.get("final_text_excerpt", "Evidence text"),

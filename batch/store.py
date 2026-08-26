@@ -309,7 +309,14 @@ class BatchStore:
             )
             self.refresh_job_counts(item["batch_job_id"])
 
-    def fail_item(self, item_id: int, category: str, error: str, retryable: bool) -> None:
+    def fail_item(
+        self,
+        item_id: int,
+        category: str,
+        error: str,
+        retryable: bool,
+        clear_browser_task: bool = False,
+    ) -> None:
         item = self.get_item(item_id)
         status = WorkItemStatus.FAILED_RETRYABLE.value if retryable else WorkItemStatus.FAILED_FINAL.value
         event_type = BatchEventType.WORK_ITEM_RETRY_SCHEDULED if retryable else BatchEventType.WORK_ITEM_FAILED
@@ -318,9 +325,10 @@ class BatchStore:
                 """UPDATE batch_work_items
                    SET status = ?, completed_at = CASE WHEN ? THEN NULL ELSE ? END,
                        last_error = ?, failure_category = ?, claimed_at = NULL, worker_id = NULL,
-                       lease_expires_at = NULL
+                       lease_expires_at = NULL,
+                       browser_task_id = CASE WHEN ? THEN NULL ELSE browser_task_id END
                    WHERE id = ?""",
-                (status, retryable, now_iso(), error[:1000], category, item_id),
+                (status, retryable, now_iso(), error[:1000], category, clear_browser_task, item_id),
             )
             self._append_event_locked(
                 item["batch_job_id"], item_id, event_type,
@@ -481,4 +489,3 @@ def _iso_plus_seconds(seconds: int) -> str:
     from datetime import datetime, timedelta, timezone
 
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
-

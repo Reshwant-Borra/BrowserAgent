@@ -62,6 +62,10 @@ class AgentLoopChildRunner:
         return loop.task_id
 
 
+class StructuredResultContractError(ValueError):
+    """Raised when a batch child completed without valid structured result JSON."""
+
+
 class BatchOrchestrator:
     def __init__(
         self,
@@ -112,14 +116,24 @@ class BatchOrchestrator:
                 self.store.fail_item(item["id"], FailureCategory.UNKNOWN.value, f"child task {task_id} not found", retryable)
                 continue
             if state.status == "completed":
-                result_id = self._persist_child_result(item, task_id, events)
-                self.store.complete_item(item["id"], result_id)
-                self.store.append_event(
-                    self.batch_id,
-                    item["id"],
-                    BatchEventType.WORK_ITEM_RECONCILED,
-                    {"browser_task_id": task_id, "status": "completed"},
-                )
+                try:
+                    result_id = self._persist_child_result(item, task_id, events)
+                    self.store.complete_item(item["id"], result_id)
+                    self.store.append_event(
+                        self.batch_id,
+                        item["id"],
+                        BatchEventType.WORK_ITEM_RECONCILED,
+                        {"browser_task_id": task_id, "status": "completed"},
+                    )
+                except StructuredResultContractError as exc:
+                    retryable = int(item["attempt_count"]) < self.policy.work_item_max_attempts
+                    self.store.fail_item(
+                        item["id"],
+                        FailureCategory.CONTRACT.value,
+                        str(exc),
+                        retryable,
+                        clear_browser_task=retryable,
+                    )
             elif state.status == "blocked":
                 category = classify_child_failure(events, state.status, state.blocked_reason)
                 self.store.block_item(item["id"], category.value, state.blocked_reason or "child task blocked")
@@ -165,6 +179,18 @@ class BatchOrchestrator:
             retryable = int(item["attempt_count"]) < self.policy.work_item_max_attempts
             self.store.fail_item(item["id"], FailureCategory.TIMEOUT.value, "per-item time budget expired", retryable)
             self._after_item(dict(self.store.get_item(item["id"])))
+        except StructuredResultContractError as exc:
+            retryable = int(item["attempt_count"]) < self.policy.work_item_max_attempts
+            self.store.fail_item(
+                item["id"],
+                FailureCategory.CONTRACT.value,
+                str(exc),
+                retryable,
+                clear_browser_task=retryable,
+            )
+            self._after_item(dict(self.store.get_item(item["id"])))
+            if not self.policy.continue_on_failure:
+                raise
         except Exception as exc:
             retryable = int(item["attempt_count"]) < self.policy.work_item_max_attempts
             self.store.fail_item(item["id"], FailureCategory.UNKNOWN.value, str(exc), retryable)
@@ -177,7 +203,12 @@ class BatchOrchestrator:
             self.item_completed_callback(item)
 
     def _persist_child_result(self, item: dict[str, Any], task_id: str, events: list[Event]) -> int:
-        parsed = _extract_structured_result(events, item["target"], task_id)
+        parsed = _extract_structured_result(
+            events,
+            item["target"],
+            task_id,
+            require_json=_requires_structured_result_json(self.result_contract),
+        )
         parsed["structured_data"], parsed["quality"] = normalize_structured_result(
             parsed["structured_data"],
             self.result_contract,
@@ -362,7 +393,16 @@ def _load_child_state(config: AppConfig, task_id: str):
         store.close()
 
 
-def _extract_structured_result(events: list[Event], target: str, task_id: str) -> dict[str, Any]:
+def _requires_structured_result_json(contract: ResultContract) -> bool:
+    return contract.name != "generic" or bool(contract.required_fields) or bool(contract.field_definitions)
+
+
+def _extract_structured_result(
+    events: list[Event],
+    target: str,
+    task_id: str,
+    require_json: bool = False,
+) -> dict[str, Any]:
     completed = next((e for e in reversed(events) if e.type == EventType.TASK_COMPLETED), None)
     observations = [e for e in events if e.type == EventType.OBSERVATION]
     final_url = completed.payload.get("final_url") if completed else (observations[-1].payload.get("url") if observations else target)
@@ -370,8 +410,16 @@ def _extract_structured_result(events: list[Event], target: str, task_id: str) -
     structured: dict[str, Any]
     try:
         parsed = json.loads(result_text)
+        if require_json and not isinstance(parsed, dict):
+            raise StructuredResultContractError(
+                f"structured batch result for task {task_id} was JSON but not an object"
+            )
         structured = parsed if isinstance(parsed, dict) else {"relevant": bool(parsed), "findings": []}
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        if require_json:
+            raise StructuredResultContractError(
+                f"structured batch result for task {task_id} was not valid JSON: {exc.msg}"
+            ) from exc
         structured = {"relevant": bool(result_text.strip()), "summary": result_text, "findings": []}
     structured.setdefault("findings", [])
     summary = structured.get("summary") or result_text or "Completed without a textual summary."
