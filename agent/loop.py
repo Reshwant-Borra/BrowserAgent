@@ -423,9 +423,16 @@ class AgentLoop:
             return self._complete_after_verified_success(task, state, step_no, decision, new_observation)
 
         noop = detect_noop(pre_hash, post_hash, expected_change=not decision.expected_result.is_empty())
-        loop_signal = (
+        repeated_action_loop = (
             detect_repeated_action(state.recent_actions, fingerprint, self.config.recovery.identical_action_limit)
-            or detect_repeated_semantic_action(state.recent_actions, semantic_signature, self.config.recovery.identical_action_limit)
+            or detect_repeated_semantic_action(
+                state.recent_actions,
+                semantic_signature,
+                self.config.recovery.identical_action_limit,
+            )
+        ) and (not verification.passed or noop)
+        loop_signal = (
+            repeated_action_loop
             or detect_navigation_loop(state.recent_actions, self.config.recovery.navigation_cycle_limit)
             or detect_modal_obstruction(new_observation.modal_present, last_action_targeted_modal=False)
             or (noop and not verification.passed)
