@@ -224,6 +224,15 @@ async def test_translate_sweep_open_tabs_resolves_via_selection():
     assert isinstance(result, RouterDecision)
     assert result.task_type == TaskType.MULTISITE_SWEEP
     assert set(result.targets) == {"https://canvas.example/chem", "https://canvas.example/math"}
+    # Regression: resolved open tabs must preserve canonical tab identity (id/title), not
+    # collapse to bare URLs — see docs/BROWSERAGENT_MASTER_STATUS.md's open-tab sweep finding.
+    by_url = {tr.url: tr for tr in result.target_resources}
+    assert set(by_url) == {"https://canvas.example/chem", "https://canvas.example/math"}
+    assert all(tr.kind.value == "open_tab" for tr in by_url.values())
+    assert by_url["https://canvas.example/chem"].tab_id == 1
+    assert by_url["https://canvas.example/chem"].title == "AP Chem"
+    assert by_url["https://canvas.example/math"].tab_id == 3
+    assert by_url["https://canvas.example/math"].title == "AP Calc"
 
 
 async def test_translate_sweep_no_matching_tabs_yields_needs_input():

@@ -222,6 +222,71 @@ def test_structured_contract_retries_malformed_finish_result(tmp_config, tmp_pat
         store.close()
 
 
+def test_structured_contract_fails_final_when_all_attempts_malformed(tmp_config, tmp_path):
+    """Regression for the real 3-tab open-tab sweep (2026-08-27): both IANA and Python
+    work items reported CONTRACT / 'structured batch result ... was not valid JSON:
+    Expecting property name enclosed in double quotes' on every attempt, exhausting the
+    retry budget. This reproduces a child that reliably writes malformed JSON text into
+    finish.result (unquoted key, the classic shape a model produces when asked to
+    hand-serialize JSON into a free-text string field) on every attempt."""
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract(name="research", required_fields=["topic"])
+    policy = BatchPolicy(work_item_max_attempts=2, max_steps_per_item=5)
+    batch_id = store.create_batch("summarize pages", ["https://www.iana.org/"], contract, policy, "b1")
+    malformed = '{summary: "IANA is the registry", "findings": []}'
+    runner = FakeRunner([
+        {"status": "completed", "result_text": malformed},
+        {"status": "completed", "result_text": malformed},
+    ])
+    final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        item = dict(store.items(batch_id)[0])
+        assert final["completed"] == 0
+        assert final["failed"] == 1
+        assert item["status"] == WorkItemStatus.FAILED_FINAL.value
+        assert item["failure_category"] == FailureCategory.CONTRACT.value
+        assert "not valid JSON" in item["last_error"]
+    finally:
+        store.close()
+
+
+def test_typed_structured_result_avoids_json_in_string_fragility(tmp_config, tmp_path):
+    """The fix for the malformed-JSON failure above: when the child uses the typed
+    FinishAction.structured_result field, the orchestrator never re-parses `result` as JSON
+    at all — even a plain, non-JSON `result` sentence (exactly what the new batch child
+    prompt now asks for) completes cleanly."""
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract(name="research", required_fields=["topic"])
+    policy = BatchPolicy(work_item_max_attempts=2, max_steps_per_item=5)
+    batch_id = store.create_batch("summarize pages", ["https://www.iana.org/"], contract, policy, "b1")
+    runner = FakeRunner([
+        {
+            "status": "completed",
+            "result_text": "IANA is the registry for internet number resources.",
+            "structured_result": {
+                "relevant": True,
+                "summary": "IANA is the registry for internet number resources.",
+                "findings": [{
+                    "field": "topic",
+                    "value": "Internet number resource registry",
+                    "source_url": "https://www.iana.org/",
+                    "evidence": "Internet Assigned Numbers Authority",
+                }],
+            },
+        },
+    ])
+    final = asyncio.run(BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner).run())
+    try:
+        assert final["completed"] == 1
+        assert final["failed"] == 0
+        assert final["raw_findings"] == 1
+        item = dict(store.items(batch_id)[0])
+        assert item["status"] == WorkItemStatus.COMPLETED.value
+        assert item["failure_category"] is None
+    finally:
+        store.close()
+
+
 def test_orchestrator_passes_batch_runtime_policy(tmp_config, tmp_path):
     store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
     contract = ResultContract()
@@ -237,6 +302,49 @@ def test_orchestrator_passes_batch_runtime_policy(tmp_config, tmp_path):
         assert runtime_policy.read_only is True
         assert runtime_policy.target_url == "https://school.example.edu/a"
         assert runtime_policy.navigation_scope.value == "same_domain"
+    finally:
+        store.close()
+
+
+def test_open_tab_work_item_sets_is_open_tab_runtime_policy_and_prompt(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract()
+    policy = BatchPolicy()
+    batch_id = store.create_batch(
+        "look through my open tabs", ["https://example.com/"], contract, policy, "b1",
+        target_resources={"https://example.com/": {"tab_id": 3, "title": "Example Domain"}},
+    )
+    runner = PolicyCapturingRunner([
+        {"status": "completed", "result": {"summary": "ok", "findings": []}},
+    ])
+    orchestrator = BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner)
+    goal = orchestrator._child_goal(dict(store.items(batch_id)[0]))
+    asyncio.run(orchestrator.run())
+    try:
+        runtime_policy = runner.calls[0]["runtime_policy"]
+        assert runtime_policy.is_open_tab is True
+        assert runtime_policy.target_url == "https://example.com/"
+        assert "already-open browser tab" in goal
+        assert "Do not navigate away" in goal
+    finally:
+        store.close()
+
+
+def test_url_work_item_leaves_is_open_tab_false(tmp_config, tmp_path):
+    store = BatchStore(tmp_path / "batches" / "b1" / "batch.db")
+    contract = ResultContract()
+    policy = BatchPolicy()
+    batch_id = store.create_batch("check this site", ["https://example.com/"], contract, policy, "b1")
+    runner = PolicyCapturingRunner([
+        {"status": "completed", "result": {"summary": "ok", "findings": []}},
+    ])
+    orchestrator = BatchOrchestrator(tmp_config, store, batch_id, policy, contract, runner)
+    goal = orchestrator._child_goal(dict(store.items(batch_id)[0]))
+    asyncio.run(orchestrator.run())
+    try:
+        runtime_policy = runner.calls[0]["runtime_policy"]
+        assert runtime_policy.is_open_tab is False
+        assert "Open this target page" in goal
     finally:
         store.close()
 
@@ -301,17 +409,18 @@ def _write_child_task(config, task_id: str, target: str, outcome: dict[str, Any]
         store.append(task_id, 1, EventType.OBSERVATION, {"url": target, "title": "Fixture", "page_hash": "h", "visible_text": ["Evidence"]})
         if outcome["status"] == "completed":
             result_text = outcome.get("result_text")
-            if result_text is None:
+            if result_text is None and "structured_result" not in outcome:
                 result_text = json.dumps(outcome["result"])
             store.append(
                 task_id,
                 2,
                 EventType.TASK_COMPLETED,
                 {
-                    "result": result_text,
+                    "result": result_text or outcome.get("summary_text", "done"),
                     "final_url": target,
                     "final_title": "Fixture",
                     "final_text_excerpt": outcome.get("final_text_excerpt", "Evidence text"),
+                    "structured_result": outcome.get("structured_result"),
                 },
             )
             state = TaskState(task_id=task_id, current_step=2, status="completed", last_event_id=store.max_event_id(task_id))

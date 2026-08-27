@@ -37,6 +37,32 @@ def test_create_batch_deduplicates_targets(tmp_path):
         store.close()
 
 
+def test_create_batch_preserves_open_tab_identity(tmp_path):
+    store = BatchStore(tmp_path / "batch.db")
+    try:
+        batch_id = store.create_batch(
+            "look through my open tabs",
+            ["https://www.iana.org/", "https://www.python.org/", "https://example.com/"],
+            ResultContract(),
+            BatchPolicy(),
+            batch_id="b1",
+            target_resources={
+                "https://www.iana.org/": {"tab_id": 1, "title": "IANA"},
+                "https://www.python.org/": {"tab_id": 2, "title": "Welcome to Python.org"},
+                # example.com deliberately omitted -> plain url target_payload
+            },
+        )
+        items = {item["target"]: json.loads(item["target_payload"]) for item in store.items(batch_id)}
+        assert items["https://www.iana.org/"] == {
+            "type": "open_tab", "url": "https://www.iana.org/", "tab_id": 1, "title": "IANA",
+        }
+        assert items["https://www.python.org/"]["type"] == "open_tab"
+        assert items["https://www.python.org/"]["tab_id"] == 2
+        assert items["https://example.com/"] == {"type": "url", "url": "https://example.com/"}
+    finally:
+        store.close()
+
+
 def test_claim_complete_and_progress_counts(tmp_path):
     store = BatchStore(tmp_path / "batch.db")
     try:
