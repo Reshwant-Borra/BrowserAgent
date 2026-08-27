@@ -21,7 +21,14 @@ def normalize_target_url(url: str) -> str:
     return urlunsplit((scheme, host, path, parts.query, ""))
 
 
-def target_payload(url: str) -> dict[str, Any]:
+def target_payload(url: str, tab_id: int | None = None, title: str | None = None) -> dict[str, Any]:
+    """The discriminated target-identity blob persisted per work item (batch_work_items.
+    target_payload). `tab_id` set means this target is an existing open browser tab the
+    resolver picked out, not a plain URL to navigate to — see BatchOrchestrator._runtime_policy
+    and PlaywrightBackend's preferred_tab_url for how that identity is used to attach to the
+    exact right tab instead of navigating whatever tab happens to be active."""
+    if tab_id is not None:
+        return {"type": "open_tab", "url": url, "tab_id": tab_id, "title": title}
     return {"type": "url", "url": url}
 
 

@@ -26,6 +26,31 @@ class SafetyPolicy(str, Enum):
     REVERSIBLE_ACTIONS = "reversible_actions"
 
 
+class TargetResourceKind(str, Enum):
+    """Discriminates what a `RouterDecision.targets` entry actually *is* — a plain URL to
+    navigate to, or an already-open browser tab to inspect in place. Losing this distinction
+    (collapsing every target to a bare URL string) is what let a semantic open-tab sweep's
+    resolved tabs get treated as ordinary navigation targets downstream, causing a batch
+    child to attach to whatever tab happened to be active rather than the specific tab the
+    resolver picked (see docs/BROWSERAGENT_MASTER_STATUS.md's open-tab sweep finding)."""
+
+    URL = "url"
+    OPEN_TAB = "open_tab"
+
+
+class TargetResource(BaseModel):
+    """Canonical identity for one resolved target, aligned to `RouterDecision.targets` by
+    URL. Only ever populated by router/policy.py's plan translator from what
+    router/resources.py's ResourceResolver actually resolved — never invented downstream.
+    Absent (empty `RouterDecision.target_resources`) means every target is a plain URL,
+    exactly the pre-existing behavior."""
+
+    kind: TargetResourceKind = TargetResourceKind.URL
+    url: str
+    tab_id: Optional[int] = None
+    title: Optional[str] = None
+
+
 class WorkflowStepPlan(BaseModel):
     """One ordered step for `task_type == ordered_workflow`. Ordinal is explicit and
     persisted (ARCHITECTURE.md/Section 16 of the Phase 5B spec) — the model is never
@@ -40,6 +65,10 @@ class RouterDecision(BaseModel):
     task_type: TaskType
     objective: str
     targets: list[str] = Field(default_factory=list)
+    # Aligned to `targets` by URL (not by index — see TargetResource docstring), populated
+    # only for resolved open_tabs resources. Empty for every legacy/explicit-URL/current-page
+    # decision, which is the pre-existing, unaffected behavior.
+    target_resources: list[TargetResource] = Field(default_factory=list)
     requires_discovery: bool = False
     preferred_policy: SafetyPolicy = SafetyPolicy.READ_ONLY
     result_contract: str = "generic"  # "generic" | "assignment" | "research"

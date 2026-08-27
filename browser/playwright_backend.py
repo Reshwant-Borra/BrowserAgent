@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import Browser, Locator, Page, async_playwright
 
@@ -24,6 +25,12 @@ from browser.page_model import PageObservation
 from browser.observer import extract_observation
 
 _BLANK_URLS = {"about:blank", ""}
+
+
+def _normalize_url_for_match(url: str) -> str:
+    parts = urlsplit((url or "").strip())
+    path = parts.path.rstrip("/")
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}?{parts.query}"
 
 
 class ElementNotFoundError(Exception):
@@ -40,7 +47,8 @@ class BrowserAttachError(Exception):
 class PlaywrightBackend:
     def __init__(self, profile_dir: Path, headless: bool, action_timeout_ms: int,
                  max_page_chars: int, max_visible_text_items: int,
-                 mode: str = "launch", cdp_endpoint: str = "http://127.0.0.1:9222"):
+                 mode: str = "launch", cdp_endpoint: str = "http://127.0.0.1:9222",
+                 preferred_tab_url: Optional[str] = None):
         self.profile_dir = profile_dir
         self.headless = headless
         self.action_timeout_ms = action_timeout_ms
@@ -48,6 +56,13 @@ class PlaywrightBackend:
         self.max_visible_text_items = max_visible_text_items
         self.mode = mode
         self.cdp_endpoint = cdp_endpoint
+        # Set only for a semantic open-tab batch work item (see agent/runtime_policy.py's
+        # BatchRuntimePolicy.is_open_tab) — the exact URL of the existing tab the resolver
+        # picked out. cdp_attach's default page-selection heuristic ("most recently active
+        # tab") has no notion of *which* tab a given batch child is actually supposed to
+        # inspect, so without this a child can attach to whatever a sibling child's own
+        # navigation left behind and then get SCOPE_BLOCKED trying to reach its own target.
+        self.preferred_tab_url = preferred_tab_url
         self._pw = None
         self._browser: Optional[Browser] = None  # only set in cdp_attach mode
         self.context = None
@@ -88,7 +103,7 @@ class PlaywrightBackend:
                 "See docs/USING_BROWSERAGENT.md for the exact command for your machine."
             ) from exc
 
-        page = self._select_page(self._browser)
+        page = self._select_preferred_page(self._browser) or self._select_page(self._browser)
         if page is None:
             # No usable page anywhere on the attached browser (Section 11): create exactly
             # one page in an existing context rather than launching a separate browser.
@@ -97,6 +112,23 @@ class PlaywrightBackend:
         self.page = page
         self.context = self.page.context
         self.page.set_default_timeout(self.action_timeout_ms)
+
+    def _select_preferred_page(self, browser: Browser) -> Optional[Page]:
+        """Attach to the exact existing tab a semantic open-tab resolution picked out
+        (`preferred_tab_url`), never navigate a different tab to reach it — this is what a
+        batch "look through my open tabs" work item requires (Section 6 of the open-tab
+        sweep fix). Returns None (falls through to the default heuristic) when unset, or
+        when the tab isn't found among the attached browser's current pages — e.g. the user
+        closed it between resolution and this child starting, a normal, recoverable case
+        rather than a hard failure."""
+        if not self.preferred_tab_url:
+            return None
+        target_key = _normalize_url_for_match(self.preferred_tab_url)
+        all_pages = [p for ctx in browser.contexts for p in ctx.pages]
+        for page in all_pages:
+            if _normalize_url_for_match(page.url) == target_key:
+                return page
+        return None
 
     def _select_page(self, browser: Browser) -> Page:
         """Page-selection policy for attaching to a browser that may already have tabs open

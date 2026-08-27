@@ -135,9 +135,16 @@ class BatchStore:
         result_contract: ResultContract,
         policy: BatchPolicy,
         batch_id: str | None = None,
+        target_resources: dict[str, dict[str, Any]] | None = None,
     ) -> str:
+        """`target_resources`, when given, maps a raw target URL to `{"tab_id":, "title":}`
+        for targets that are actually an existing open browser tab rather than a plain URL
+        (see batch/policies.py::target_payload) — populated by ui/jobs.py from
+        RouterDecision.target_resources. Absent/empty for every existing caller, which keeps
+        the pre-existing plain-URL target_payload shape."""
         batch_id = batch_id or uuid.uuid4().hex[:12]
         now = now_iso()
+        target_resources = target_resources or {}
         target_list = [t.strip() for t in targets if t.strip()]
         if policy.max_total_items is not None:
             target_list = target_list[:policy.max_total_items]
@@ -182,6 +189,12 @@ class BatchStore:
                     )
                     continue
                 ordinal += 1
+                resource = target_resources.get(raw)
+                payload = (
+                    target_payload(raw, tab_id=resource.get("tab_id"), title=resource.get("title"))
+                    if resource
+                    else target_payload(raw)
+                )
                 cur = self.conn.execute(
                     """INSERT INTO batch_work_items
                        (batch_job_id, ordinal, target, target_key, target_payload,
@@ -192,7 +205,7 @@ class BatchStore:
                         ordinal,
                         raw,
                         key,
-                        json.dumps(target_payload(raw)),
+                        json.dumps(payload),
                         json.dumps([raw]),
                         WorkItemStatus.PENDING.value,
                     ),

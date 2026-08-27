@@ -23,7 +23,7 @@ from research.discovery import discover_sources
 from router.plan_schema import ReplanDecisionKind
 from router.policy import NeedsInput, RoutingError, route, route_with_answer, to_batch_policy
 from router.replanner import ReplanOutputError, decide_replan, finding_source_url
-from router.schema import RouterDecision, TaskType
+from router.schema import RouterDecision, TargetResourceKind, TaskType
 from ui.store import UIJobStore
 from workflow.models import WorkflowPolicy
 from workflow.orchestrator import WorkflowOrchestrator
@@ -302,7 +302,13 @@ class JobRunner:
             contract = _assignment_contract() if decision.result_contract == "assignment" else \
                 (_research_contract() if decision.result_contract == "research" else ResultContract())
             policy = to_batch_policy(decision)
-            store.create_batch(decision.objective, decision.targets, contract, policy, batch_id=job_id)
+            tab_resources = {
+                tr.url: {"tab_id": tr.tab_id, "title": tr.title}
+                for tr in decision.target_resources
+                if tr.kind == TargetResourceKind.OPEN_TAB
+            }
+            store.create_batch(decision.objective, decision.targets, contract, policy, batch_id=job_id,
+                                target_resources=tab_resources)
             self.store.update(job_id, batch_id=job_id, activity=f"Checking 0 / {len(decision.targets)}")
 
             def _on_item(item: dict[str, Any]) -> None:

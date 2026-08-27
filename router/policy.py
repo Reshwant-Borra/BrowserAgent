@@ -32,7 +32,14 @@ from router.extract import extract_urls, try_deterministic_route
 from router.llm_router import RouterOutputError, route_with_model
 from router.plan_schema import ExecutionShape, PlanIntent, ResourceKind, ResourceRequirement, TaskPlan
 from router.resources import ResourceResolutionError, ResourceResolver
-from router.schema import RouterDecision, SafetyPolicy, TaskType, WorkflowStepPlan
+from router.schema import (
+    RouterDecision,
+    SafetyPolicy,
+    TargetResource,
+    TargetResourceKind,
+    TaskType,
+    WorkflowStepPlan,
+)
 from router.semantic_planner import PlannerOutputError, plan_task
 
 DEFAULT_ROUTING_MODE = "hybrid"
@@ -169,6 +176,7 @@ async def _translate_sweep(plan: TaskPlan, resolver: ResourceResolver) -> Router
     if not reqs:
         raise RoutingError("sweep plan has no resource requirements")
     all_urls: list[str] = []
+    target_resources: list[TargetResource] = []
     first_req: ResourceRequirement | None = None
     for i, req in enumerate(reqs):
         if req.kind == ResourceKind.CURRENT_PAGE:
@@ -180,10 +188,22 @@ async def _translate_sweep(plan: TaskPlan, resolver: ResourceResolver) -> Router
         for u in resolved.urls:
             if u not in all_urls:
                 all_urls.append(u)
+            # open_tabs is the only resolution kind with real browser-tab identity to
+            # preserve (Section 3 of the open-tab sweep fix) — explicit_urls/web_discovery
+            # targets are genuinely just URLs to navigate to, so they're left as plain
+            # TargetResourceKind.URL (i.e. no entry at all) exactly as before.
+            if req.kind == ResourceKind.OPEN_TABS and u in resolved.tab_ids:
+                target_resources.append(TargetResource(
+                    kind=TargetResourceKind.OPEN_TAB,
+                    url=u,
+                    tab_id=resolved.tab_ids.get(u),
+                    title=resolved.labels.get(u),
+                ))
     if not all_urls:
         return NeedsInput(question=_clarification_question(first_req or reqs[0]), plan=plan)
     return RouterDecision(
         task_type=TaskType.MULTISITE_SWEEP, objective=plan.goal, targets=all_urls,
+        target_resources=target_resources,
         requires_discovery=False, preferred_policy=SafetyPolicy.READ_ONLY, result_contract=plan.result_contract,
         mixed_intent_followup=(plan.intent == PlanIntent.MIXED),
     )
