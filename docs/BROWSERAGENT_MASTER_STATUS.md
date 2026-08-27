@@ -612,3 +612,98 @@ as a last-resort fallback if planning itself errors.
 
 BrowserAgent is ready for real-world use. Future changes should be driven by failures observed
 during actual tasks, not further speculative architecture work.
+
+## 24. First Real Open-Tab Sweep — Two Bugs Found and Fixed
+
+Branch `fix/cdp-open-tab-sweep`, off `main` @ `780d650`. The semantic planner pass (Section
+22-23) validated planning/resolution live but never drove a full multisite sweep through
+real CDP-attached tabs end to end. The first time a user actually did that — prompt "Look
+through the pages I currently have open and tell me what each one is about. Give me a
+combined report with the source for each page." against 3 real open tabs (iana.org,
+python.org, example.com) — semantic planning and resolution were both correct (exactly the
+3 real tabs, zero hallucinated targets), but the batch itself failed: two items hit
+`CONTRACT` ("structured batch result ... was not valid JSON"), and the third hit
+`SCOPE_BLOCKED` misreported in the UI as `AUTH_REQUIRED`. Two independent bugs, both only
+reachable by a real multi-tab cdp_attach batch — no existing test exercised this combination.
+
+**Bug 1 — malformed structured batch results.** `agent/schemas.py`'s `FinishAction.result`
+was (and, for single-task finishes, still is) a plain string. The GBNF grammar
+(`inference/grammar/action.gbnf`) only constrains that string to be *validly JSON-string-
+encoded* — it says nothing about the string's *content*. Batch child prompts
+(`BatchOrchestrator._child_goal`) asked the model to hand-serialize a full JSON object as
+that content, which `batch/orchestrator.py::_extract_structured_result` then re-parsed with
+a second `json.loads()`. Qwen reliably wrote syntactically-close-but-invalid JSON there
+(unquoted keys, stray characters) — exactly the "JSON inside a JSON string" fragility this
+project has hit before with `outputs` (see `OutputItem`'s docstring), just not yet fixed for
+batch results. **Fix**: added `FinishStructuredResult`/`FinishFinding` — real, grammar-
+constrained fields (`agent/schemas.py`, extended `action.gbnf`) the model fills directly, no
+second JSON layer. `_child_goal` now asks for a short plain-text `result` sentence plus the
+typed `structured_result` field; `_extract_structured_result` prefers the typed field when
+present and only falls back to legacy string-JSON parsing for old/non-batch callers (that
+fallback's existing malformed-JSON handling — retry, then `FAILED_FINAL`/`CONTRACT` — is
+deliberately unchanged, see `test_structured_contract_fails_final_when_all_attempts_malformed`).
+
+**Bug 2 — resolved tabs collapsed to bare URLs.** `RouterDecision.targets` was (and remains,
+for backward compatibility) `list[str]` — resolving an `open_tabs` requirement to real tabs
+still handed `BatchOrchestrator`/`BatchStore` nothing but URLs, with no way to tell "this is
+an already-open tab, attach to it" from "navigate somewhere to reach this URL". In
+`cdp_attach` mode, `PlaywrightBackend._start_cdp_attach` picks "the most recently active
+tab" by default (a reasonable default for a single attached task) — with no per-item tab
+identity, each sequential batch child just inherited whatever tab a *previous* child's own
+navigation had left active, then got `SCOPE_BLOCKED` trying to act on a page whose origin
+didn't match its own target. **Fix**: a minimal, additive discriminated-resource thread —
+`router/resources.py::ResolvedResource.tab_ids` (resolver-owned) ->
+`router/schema.py::RouterDecision.target_resources` (`TargetResource`, aligned to `targets`
+by URL, empty for every non-open-tab decision) -> `batch/store.py::create_batch(...,
+target_resources=...)` building a richer `target_payload` per item (`batch/policies.py::
+target_payload` already had this discriminated shape, just always URL-typed until now) ->
+`agent/runtime_policy.py::BatchRuntimePolicy.is_open_tab` -> `AgentLoop` passing
+`preferred_tab_url` into `PlaywrightBackend` -> `PlaywrightBackend._select_preferred_page`
+matching the attached browser's real pages by URL and using that exact page, never
+navigating to reach it (so tab-switching is never treated as navigation — `same_origin`
+scope checks stay anchored to each item's own target, exactly as they already were). Falls
+back to the pre-existing "most recently active" heuristic when unset (plain URL targets,
+launch mode, or a tab that's since been closed) — completely unaffected. `_child_goal` also
+stopped telling open-tab items to "open this target page" (redundant/unwanted navigation);
+they're told the tab is already the active page to read in place.
+
+**Bug 3 (found while fixing Bug 2) — failure-category misclassification.** UI showed
+`AUTH_REQUIRED` for the scope-blocked item. `batch/policies.py::classify_child_failure`
+scanned the *entire* event history's JSON blob for auth keywords ("sign in", "login", ...)
+before ever checking the `failure_category` `agent/loop.py::_block_by_runtime_policy`
+already writes verbatim onto the `TASK_BLOCKED` event — so an unrelated OBSERVATION event
+merely containing "Sign In" (a nav link on the wrong-tab page) won the heuristic race before
+the correct, already-known, structural `SCOPE_BLOCKED` category ever got a chance. **Fix**:
+check that explicit `TASK_BLOCKED.failure_category` first; only fall through to the
+blob-wide heuristic when nothing structural was recorded (still needed for genuine live
+login walls via `looks_like_login_page`, which never sets an explicit category — covered by
+`test_genuine_login_wall_still_classified_as_auth_required`).
+
+**Live validation, real Qwen3-8B + real CDP Chrome, not mocked.** Set up exactly 3 tabs
+(iana.org, python.org, example.com; tab ids captured before/after) and ran the exact failing
+prompt through the UI again:
+- Semantic planner: exactly the 3 real tabs, 0 hallucinated, `target_resources` carried all
+  3 with correct `tab_id`/`title`.
+- Batch: **3/3 completed, 0 failed, 0 blocked**, `schema_valid_pct: 100.0`.
+- Every child's OBSERVATION events stayed on its own tab's URL for the entire task (checked
+  per-task event log) — no tab was ever navigated to a sibling item's target.
+- Tab identity: all 3 original CDP target ids/URLs unchanged after the run — 0 new tabs, 0
+  closed tabs.
+- `structured_result` on every completed task was a real parsed dict populated by the model
+  (not a re-parsed string) — e.g. the example.com item's finish carried
+  `{"findings": [{"field": "education_discount", "value": "Avoid use in operations.", ...}]}`
+  straight through, and `result` was a short plain-text sentence, never JSON text.
+
+**Regression**: 235/235 `tests/unit` passed (12 new: `test_batch_policies.py`,
+`test_playwright_backend_tab_selection.py`, `test_agent_loop_tab_wiring.py`, plus additions
+to `test_batch_orchestrator.py`/`test_batch_store.py`/`test_decision.py`/
+`test_semantic_planner.py`) incl. the pre-fix regression fixtures that reproduce both
+original bugs verbatim. `tests/integration` (real Playwright launch-mode + phase1-4 Playwright
+suites) re-run unchanged.
+
+**Scope discipline**: the semantic planner itself needed no changes — evidence showed both
+bugs were purely in execution/attachment plumbing downstream of a correct plan. Single-site
+(`current_page`) tasks were left untouched (they don't route through `BatchRuntimePolicy` at
+all); launch-mode batches were left untouched (`preferred_tab_url` is only ever set when
+`BatchRuntimePolicy.is_open_tab` is true, which only `create_batch(..., target_resources=...)`
+from a resolved `open_tabs` requirement ever sets).
