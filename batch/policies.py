@@ -53,6 +53,22 @@ def read_only_allows(decision: ModelDecision, element_name: str | None = None) -
 
 
 def classify_child_failure(events: list[Event], status: str, last_error: str | None = None) -> FailureCategory:
+    # Authoritative, structural signal first: agent/loop.py's _block_by_runtime_policy
+    # already records the exact failure_category (SCOPE_BLOCKED/READ_ONLY_BLOCKED) on the
+    # TASK_BLOCKED event the moment a runtime policy violation happens. That must win over
+    # every heuristic below — in particular over the blob-wide auth-keyword scan, which
+    # previously mis-fired whenever *any* event's payload (e.g. an OBSERVATION of a page
+    # that merely has a "Sign In" nav link) happened to mention an auth keyword, even though
+    # the real, already-known reason for the block was something else entirely.
+    explicit_categories = [
+        e.payload.get("failure_category") for e in events
+        if e.type == EventType.TASK_BLOCKED and e.payload.get("failure_category")
+    ]
+    if explicit_categories:
+        try:
+            return FailureCategory(explicit_categories[-1])
+        except ValueError:
+            pass
     blob = "\n".join([json.dumps(e.payload).lower() for e in events] + [(last_error or "").lower()])
     if "captcha" in blob or "bot challenge" in blob:
         return FailureCategory.CAPTCHA_OR_BOT_CHALLENGE
