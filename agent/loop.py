@@ -83,10 +83,16 @@ class AgentLoop:
         self.event_store = EventStore(self.db_path)
         self.state_store = TaskStateStore(self.event_store)
         self.llama = create_inference_client(config)
+        preferred_tab_url = (
+            runtime_policy.target_url
+            if runtime_policy is not None and runtime_policy.is_open_tab
+            else None
+        )
         self.browser = PlaywrightBackend(
             self.profile_dir, config.browser.headless, config.browser.action_timeout_ms,
             config.context.max_page_chars, config.context.max_visible_text_items,
             mode=config.browser.mode, cdp_endpoint=config.browser.cdp_endpoint,
+            preferred_tab_url=preferred_tab_url,
         )
         self.grammar = GRAMMAR_PATH.read_text(encoding="utf-8")
         self.log = get_logger("agent.loop", config.logging.level)
@@ -1013,6 +1019,7 @@ class AgentLoop:
             "success_criteria_textual_matches": matched, "success_criteria_total": len(task.success_criteria),
             "verified": decision.params.get("verified"),
             "outputs": decision.params.get("outputs", []),
+            "structured_result": decision.params.get("structured_result"),
         })
         self.log.info(f"task {self.task_id} reports completion: {result_text!r} "
                        f"({len(matched)}/{len(task.success_criteria)} success criteria textually matched)")
