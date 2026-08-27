@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Upload Filename</title></head>
+<body>
+  <h1>Upload Filename</h1>
+  <label for="filename-input">Filename</label>
+  <input type="text" id="filename-input">
+  <button onclick="saveFilename()">Save filename</button>
+  <p id="save-status"></p>
+  <script>
+    function saveFilename() {
+      const value = document.getElementById('filename-input').value;
+      document.getElementById('save-status').textContent = 'Saved filename: ' + value;
+    }
+  </script>
+</body>
+</html>

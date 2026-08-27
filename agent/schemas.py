@@ -123,9 +123,26 @@ class WaitAction(_StrictAction):
     ms: Optional[int] = Field(default=None, ge=0, le=3000)
 
 
+class OutputItem(_StrictAction):
+    """One piece of structured state a step discovered that a later step might depend on
+    (workflow cross-site fact passing). A real JSON field, not a value embedded inside
+    another JSON-in-a-string blob — the model fills these directly and Ollama's/llama.cpp's
+    structured-output layer enforces the shape the same way it enforces every other action."""
+
+    key: str
+    value: str
+    evidence: Optional[str] = None
+
+
 class FinishAction(_StrictAction):
     action: Literal["finish"]
     result: str
+    # Both optional and additive so single-site/batch/research finish calls (which never
+    # mention these fields in their prompts) are completely unaffected. Workflow steps are
+    # the only caller that asks for them; `verified=None` (field omitted) is treated as "not
+    # confirmed" downstream, never silently coerced to True.
+    verified: Optional[bool] = None
+    outputs: list[OutputItem] = Field(default_factory=list)
 
 
 ModelAction = Annotated[

@@ -29,6 +29,7 @@ class ChildRunner(Protocol):
         resume_task_id: str | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
         approval_callback: Optional[Callable[[Any, Any], Awaitable[bool]]] = None,
+        seed_facts: Optional[dict[str, str]] = None,
     ) -> str:
         ...
 
@@ -46,8 +47,10 @@ class AgentLoopChildRunner:
         resume_task_id: str | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
         approval_callback: Optional[Callable[[Any, Any], Awaitable[bool]]] = None,
+        seed_facts: Optional[dict[str, str]] = None,
     ) -> str:
         from agent.loop import AgentLoop
+        from memory.task_memory import TaskMemoryStore
 
         loop = (
             AgentLoop.resume(config, resume_task_id, profile_dir=profile_dir, runtime_policy=runtime_policy,
@@ -62,6 +65,25 @@ class AgentLoopChildRunner:
                 approval_callback=approval_callback,
             )
         )
+        # Only meaningful on a fresh task (a resumed task already has whatever active facts
+        # survived its own history) — seeds verified cross-step workflow facts (Section 33/34)
+        # into the *same* Phase 4B active-fact-constraint machinery already validated for
+        # single-task memory (memory/task_memory.py), so a high-confidence verified fact from
+        # an earlier workflow step gets the same deterministic contradiction guard as a fact
+        # discovered earlier in one task's own history — no second guard mechanism invented.
+        if seed_facts and not resume_task_id:
+            memory_store = TaskMemoryStore(loop.event_store)
+            source_event_id = loop.event_store.max_event_id(loop.task_id) or 0
+            for key, value in seed_facts.items():
+                normalized_key = key.replace("_", " ").replace("-", " ").strip()
+                if not normalized_key or not str(value).strip():
+                    continue
+                memory_store.write_active_fact(
+                    loop.task_id,
+                    ("requirement", normalized_key, str(value),
+                     f"verified workflow input: {normalized_key} = {value}", 1.0),
+                    source_event_id,
+                )
         await loop.run(max_steps=max_steps)
         return loop.task_id
 

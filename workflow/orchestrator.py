@@ -10,6 +10,7 @@ next step's goal.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import time
 from pathlib import Path
@@ -66,12 +67,22 @@ class WorkflowOrchestrator:
             read_only=self.policy.read_only,
             navigation_scope=NavigationScopePolicy(self.policy.navigation_scope.value),
         )
+        # Turning on the deterministic active-fact-constraint guard only for steps that
+        # actually carry a verified incoming fact keeps this scoped to workflows (single-site/
+        # batch tasks never set this) and to the exact steps where a contradiction is possible.
+        step_config = self.config
+        if facts:
+            step_config = dataclasses.replace(
+                self.config,
+                context=dataclasses.replace(self.config.context, enforce_active_fact_constraints=True),
+            )
         try:
             child_task_id = await asyncio.wait_for(
                 self.runner.run_child(
-                    self.config, self.workflow_id, step, goal, [], profile_dir,
+                    step_config, self.workflow_id, step, goal, [], profile_dir,
                     self.policy.max_steps_per_step, runtime_policy=runtime_policy,
                     approval_callback=self.approval_callback,
+                    seed_facts=facts or None,
                 ),
                 timeout=self.policy.max_seconds_per_step,
             )
@@ -120,26 +131,35 @@ class WorkflowOrchestrator:
             self.step_completed_callback(dict(self.store.get_step(step_id)))
 
     def _step_goal(self, step: dict[str, Any], facts: dict[str, Any]) -> str:
-        facts_block = json.dumps(facts) if facts else "none"
+        if facts:
+            facts_lines = "\n".join(f"  {key} = {value}" for key, value in facts.items())
+            facts_block = (
+                "VERIFIED WORKFLOW INPUTS (already confirmed by an earlier step in this "
+                "workflow — use these exact values rather than re-discovering or guessing "
+                "them):\n" + facts_lines
+            )
+        else:
+            facts_block = "VERIFIED WORKFLOW INPUTS: none yet."
         return (
             f"Open {step['target']} and complete this objective: {step['objective']}\n"
-            f"Known facts from previous workflow steps (already verified, use them exactly "
-            f"as given rather than re-discovering them): {facts_block}\n"
+            f"{facts_block}\n"
+            "When a verified workflow input's name matches a control on the current page "
+            "(e.g. a field labeled with that same name), use that exact verified value for "
+            "it instead of typing something else or leaving it blank.\n"
             "This step's target page is exactly the one given above. Stay on it and complete "
             "the objective there; do not follow a link to another page unless the objective "
             "explicitly requires navigating within this site to complete it.\n"
             "Before finishing, verify the page now actually shows the requested end-state — "
-            "do not report success from memory of the action alone.\n"
-            "When finished, put only compact JSON in the finish result, using this exact "
-            "shape: {\"done\": true|false, \"verified\": true|false, \"summary\": \"...\", "
-            "\"evidence\": \"short exact page excerpt proving the verified end-state, or the "
-            "reason verification failed\", \"facts\": {\"key\": \"value\"}}. "
-            "Set verified=true only when the current page directly shows the objective's "
-            "end-state was achieved (e.g. a dropdown now reads the new value, a toggle is now "
-            "on). Put any concrete value this step discovered that a later step might need "
-            "into facts (empty object if none). The whole finish result must be one valid JSON "
-            "object: never put a literal double-quote character inside a string value (write "
-            "evidence like SMS alerts checked, not \\\"SMS alerts\\\" checked); keep evidence short."
+            "do not report success from memory of the action alone. When you call finish: "
+            "set result to a short human-readable summary of what happened and whether it "
+            "satisfies the objective; set verified to true only when the current page "
+            "directly shows the objective's end-state was achieved (e.g. a dropdown now "
+            "reads the new value, a toggle is now on) and to false otherwise; put any "
+            "concrete value this step discovered on the page that a later step might need "
+            "into outputs as a list of objects shaped {\"key\": \"short name\", \"value\": "
+            "\"the value\", \"evidence\": \"short exact page excerpt showing it\"} — leave "
+            "outputs empty if this step discovered nothing reusable, and never invent a "
+            "value that is not actually shown on the page."
         )
 
     def _final_result(self) -> dict[str, Any]:
@@ -167,17 +187,28 @@ class WorkflowOrchestrator:
 
 
 def _extract_step_result(events: list[Event]) -> dict[str, Any]:
+    """Reads the structured `verified`/`outputs` fields the model set directly on the finish
+    action (agent/schemas.py::FinishAction, persisted onto the TASK_COMPLETED event by
+    agent/loop.py::_handle_finish) — no JSON-in-a-string parsing of the free-form `result`
+    text. A missing/omitted `verified` is treated as not-verified, never coerced to true:
+    the model not stating a value is not evidence of success."""
     completed = next((e for e in reversed(events) if e.type == EventType.TASK_COMPLETED), None)
     if completed is None:
-        return {"verified": False, "evidence": "task finished without a TASK_COMPLETED event"}
-    result_text = completed.payload.get("result", "")
-    try:
-        parsed = json.loads(result_text)
-        if not isinstance(parsed, dict):
-            return {"verified": False, "evidence": "finish result was JSON but not an object"}
-    except json.JSONDecodeError:
-        return {"verified": bool(result_text.strip()) and False, "summary": result_text,
-                "evidence": "finish result was not valid JSON"}
-    parsed.setdefault("summary", "")
-    parsed.setdefault("facts", {})
-    return parsed
+        return {"verified": False, "summary": "", "evidence": "task finished without a TASK_COMPLETED event", "facts": {}}
+    payload = completed.payload
+    summary = str(payload.get("result") or "")
+    verified_raw = payload.get("verified")
+    facts: dict[str, Any] = {}
+    for item in payload.get("outputs") or []:
+        if isinstance(item, dict) and item.get("key"):
+            facts[str(item["key"])] = str(item.get("value", ""))
+    if verified_raw is None:
+        evidence = "model did not report a verified value on finish"
+    else:
+        evidence = summary or "step finished without a human-readable summary"
+    return {
+        "verified": bool(verified_raw),
+        "summary": summary,
+        "evidence": evidence,
+        "facts": facts,
+    }

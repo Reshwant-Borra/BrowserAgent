@@ -78,6 +78,51 @@ async def test_navigation_loop_is_detected(make_agent_loop, fixture_site_url):
     assert any(t.payload["reason"] == "loop_detected" for t in transitions)
 
 
+async def test_repeated_readonly_action_with_no_state_change_triggers_recovery_escalation(
+    make_agent_loop, fixture_site_url,
+):
+    """Phase 5B corrective pass: a fact-finding workflow step observed live re-opening the
+    same URL (or re-extracting the same element) many times in a row without ever reaching
+    `finish`, because open_url/extract have no `expected_result` to fail verification against
+    — `noop` (which requires an *expected* change) never fires, so the repeated-action guard
+    stayed silent. `open_url` to a page whose content never changes must now be caught by the
+    same repeated-action loop guard even though each individual open_url trivially "passes"."""
+    url = fixture_site_url + "/workflow_multi_fact_a.html"
+    loop = make_agent_loop("Find the build filename on this page", [], [
+        decision("open_url", params={"url": url}),
+        decision("open_url", params={"url": url}),
+        decision("open_url", params={"url": url}),
+        decision("finish", params={"result": "report-v3.zip"}),
+    ])
+    state = await loop.run(max_steps=10)
+    assert state.status == "completed"
+    events = read_events(loop)
+    transitions = [e for e in events if e.type == EventType.RECOVERY_TRANSITION]
+    assert any(t.payload["reason"] == "loop_detected" for t in transitions)
+
+
+async def test_repeated_wait_with_no_state_change_does_not_trigger_loop_escalation(
+    make_agent_loop, fixture_site_url,
+):
+    """The fix above is scoped to open_url/extract only — `wait` is legitimately repeated
+    while polling for a page to change (see test_phase4_long_horizon.py's long-horizon
+    scenario) and must not be swept into the same loop guard."""
+    url = fixture_site_url + "/workflow_multi_fact_a.html"
+    loop = make_agent_loop("Wait a bit then finish", [], [
+        decision("open_url", params={"url": url}),
+        decision("wait", params={"ms": 1}),
+        decision("wait", params={"ms": 1}),
+        decision("wait", params={"ms": 1}),
+        decision("wait", params={"ms": 1}),
+        decision("finish", params={"result": "done waiting"}),
+    ])
+    state = await loop.run(max_steps=10)
+    assert state.status == "completed"
+    events = read_events(loop)
+    transitions = [e for e in events if e.type == EventType.RECOVERY_TRANSITION]
+    assert not any(t.payload["reason"] == "loop_detected" for t in transitions)
+
+
 async def test_consequential_action_is_not_auto_retried_after_failure(make_agent_loop, fixture_site_url):
     loop = make_agent_loop("Submit the application", [], [
         decision("open_url", params={"url": fixture_site_url + "/wizard_confirm.html"}),

@@ -49,6 +49,15 @@ from memory.task_state import TaskStateStore
 
 GRAMMAR_PATH = Path(__file__).resolve().parent.parent / "inference" / "grammar" / "action.gbnf"
 
+# Repeating open_url/extract with no page-state change trivially "passes" verification (there
+# is nothing to assert about a read-only action with no expected_result), so the existing
+# repeated-action loop guard below never fires for it on its own — observed live as a fact-
+# finding workflow step burning its entire step budget re-opening the same URL, or re-
+# extracting the same element, without ever reaching `finish`. Narrowly scoped to these two
+# action types (never `wait`, which is legitimately repeated while polling for a page change —
+# see tests/integration/test_phase4_long_horizon.py's repeated-wait long-horizon scenario).
+_STALL_LOOP_ELIGIBLE_ACTIONS = {ActionType.OPEN_URL, ActionType.EXTRACT}
+
 
 class AgentLoop:
     def __init__(
@@ -482,6 +491,7 @@ class AgentLoop:
             return self._complete_after_verified_success(task, state, step_no, decision, new_observation)
 
         noop = detect_noop(pre_hash, post_hash, expected_change=not decision.expected_result.is_empty())
+        stalled_readonly_repeat = decision.action in _STALL_LOOP_ELIGIBLE_ACTIONS and pre_hash == post_hash
         repeated_action_loop = (
             detect_repeated_action(state.recent_actions, fingerprint, self.config.recovery.identical_action_limit)
             or detect_repeated_semantic_action(
@@ -489,7 +499,7 @@ class AgentLoop:
                 semantic_signature,
                 self.config.recovery.identical_action_limit,
             )
-        ) and (not verification.passed or noop)
+        ) and (not verification.passed or noop or stalled_readonly_repeat)
         loop_signal = (
             repeated_action_loop
             or detect_navigation_loop(state.recent_actions, self.config.recovery.navigation_cycle_limit)
@@ -1000,6 +1010,8 @@ class AgentLoop:
             "result": result_text, "final_url": observation.url, "final_title": observation.title,
             "final_text_excerpt": "\n".join(observation.visible_text[:5]),
             "success_criteria_textual_matches": matched, "success_criteria_total": len(task.success_criteria),
+            "verified": decision.params.get("verified"),
+            "outputs": decision.params.get("outputs", []),
         })
         self.log.info(f"task {self.task_id} reports completion: {result_text!r} "
                        f"({len(matched)}/{len(task.success_criteria)} success criteria textually matched)")

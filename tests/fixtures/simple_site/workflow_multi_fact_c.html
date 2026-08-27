@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Register Version</title></head>
+<body>
+  <h1>Register Version</h1>
+  <label for="version-input">Version</label>
+  <input type="text" id="version-input">
+  <button onclick="saveVersion()">Save version</button>
+  <p id="save-status"></p>
+  <script>
+    function saveVersion() {
+      const value = document.getElementById('version-input').value;
+      document.getElementById('save-status').textContent = 'Saved version: ' + value;
+    }
+  </script>
+</body>
+</html>

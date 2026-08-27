@@ -7,8 +7,6 @@ approval/login pauses to HTTP requests, and honors a cooperative stop flag betwe
 from __future__ import annotations
 
 import asyncio
-import json
-import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -20,8 +18,8 @@ from batch.models import ResultContract
 from batch.orchestrator import BatchOrchestrator
 from batch.store import BatchStore
 from browser.page_model import ElementRef
-from inference.llama_client import create_inference_client
-from router.extract import normalize_url
+from inference.llama_client import InferenceClient, create_inference_client
+from research.discovery import discover_sources
 from router.policy import RoutingError, route, to_batch_policy
 from router.schema import RouterDecision, TaskType
 from ui.store import UIJobStore
@@ -30,7 +28,6 @@ from workflow.orchestrator import WorkflowOrchestrator
 from workflow.store import WorkflowStore
 
 RESEARCH_MAX_SOURCES_DEFAULT = 20
-RESEARCH_SEARCH_MAX_STEPS = 8
 
 
 def _assignment_contract() -> ResultContract:
@@ -118,7 +115,7 @@ class JobRunner:
             elif decision.task_type == TaskType.ORDERED_WORKFLOW:
                 await self._run_workflow(job_id, decision, control)
             elif decision.task_type == TaskType.RESEARCH:
-                await self._run_research(job_id, decision, control)
+                await self._run_research(job_id, decision, control, client)
         except Exception as exc:  # last-resort: never leave a job stuck "running" forever
             self.store.update(job_id, status="failed", error=str(exc), activity="Unexpected error")
         finally:
@@ -314,10 +311,11 @@ class JobRunner:
 
     # ---- research (Section 37-42) ------------------------------------------
 
-    async def _run_research(self, job_id: str, decision: RouterDecision, control: _JobControl) -> None:
+    async def _run_research(self, job_id: str, decision: RouterDecision, control: _JobControl,
+                             client: InferenceClient) -> None:
         max_sources = self.research_max_sources
         self.store.update(job_id, activity="Searching for sources...")
-        urls = await self._discover_sources(decision.objective, max_sources, control)
+        urls = await self._discover_sources(job_id, decision.objective, max_sources, control, client)
         if control.stop_event.is_set():
             self.store.update(job_id, status="stopped", activity="Stopped during source discovery")
             return
@@ -329,48 +327,18 @@ class JobRunner:
         sweep_decision = decision.model_copy(update={"targets": urls, "result_contract": "research"})
         await self._run_sweep(job_id, sweep_decision, control)
 
-    async def _discover_sources(self, objective: str, max_sources: int, control: _JobControl) -> list[str]:
-        query = urllib.parse.quote_plus(objective)
-        search_url = f"https://duckduckgo.com/html/?q={query}"
-        # Cap the *discovery* listing at a small number regardless of the overall max_sources
-        # budget: a single search-results page rarely has more than ~10 organic results
-        # anyway, and asking the model to enumerate a long URL list risks the finish JSON
-        # getting truncated by the output token budget mid-string — observed live as a
-        # MALFORMED_JSON parse failure that then loops on a fallback action instead of
-        # finishing. Multiple search rounds (Section 38's "additional rounds only when
-        # justified") would be the way to reach a larger max_sources, not one longer listing.
-        discovery_cap = min(max_sources, 10)
-        goal = (
-            f"Open {search_url}. This is a search engine results page. Extract the URLs of "
-            f"the organic search results relevant to: {objective}. Do not click into any "
-            f"result. When finished, put only compact JSON in the finish result with this "
-            f'shape: {{"urls": ["https://...", ...]}}, listing up to {discovery_cap} of the '
-            "most relevant, distinct result URLs found on the page. Keep the list short — "
-            "fewer, well-chosen URLs are better than an exhaustive list."
+    async def _discover_sources(self, job_id: str, objective: str, max_sources: int,
+                                 control: _JobControl, client: InferenceClient) -> list[str]:
+        """Deterministic candidate-link enumeration + Qwen id-selection (research/discovery.py)
+        instead of asking the model to transcribe URLs into a finish JSON string — see that
+        module's docstring for why. Wrapped in the same cancelable pattern as the batch/
+        workflow paths so a stop request during discovery still leaves no dangling browser."""
+        profile_dir = self.runtime_dir / "research" / job_id / "discovery_browser_profile"
+        urls = await self._run_cancelable(
+            discover_sources(self.config, client, objective, profile_dir, max_sources=min(max_sources, 10)),
+            control,
         )
-        loop = AgentLoop.create_new(self.config, goal, [])
-        try:
-            state = await self._run_cancelable(loop.run(max_steps=RESEARCH_SEARCH_MAX_STEPS), control)
-        finally:
-            pass  # loop.run() already closes the browser (aclose() in its own finally)
-        if state is None or state.status != "completed":
-            return []
-        result_text = _last_finish_result(self.config, loop.task_id)
-        try:
-            parsed = json.loads(result_text)
-            urls = parsed.get("urls", []) if isinstance(parsed, dict) else []
-        except json.JSONDecodeError:
-            return []
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for url in urls:
-            if not isinstance(url, str) or not url.startswith("http"):
-                continue
-            key = normalize_url(url)
-            if key not in seen:
-                seen.add(key)
-                deduped.append(url)
-        return deduped[:max_sources]
+        return urls or []
 
 
 def _reload_state(config: AppConfig, task_id: str):

@@ -55,6 +55,15 @@ def _scenarios(base_url: str) -> list[dict[str, Any]]:
             ],
         },
         {
+            "id": "multi_fact_dependency",
+            "objective": "Find the build filename and version, then register the filename on one page and the version on another.",
+            "steps": [
+                {"ordinal": 1, "target": f"{base_url}/workflow_multi_fact_a.html", "objective": "Find the build filename and the build version shown on this page."},
+                {"ordinal": 2, "target": f"{base_url}/workflow_multi_fact_b.html", "objective": "Enter the build filename found on the previous page into the Filename field and click Save filename."},
+                {"ordinal": 3, "target": f"{base_url}/workflow_multi_fact_c.html", "objective": "Enter the build version found on the first page into the Version field and click Save version."},
+            ],
+        },
+        {
             "id": "holdout_3site_different_order",
             "objective": "Check the system status, then switch to Dark theme, then enable SMS alerts.",
             "steps": [

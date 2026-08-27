@@ -6,7 +6,6 @@ exercises real orchestration/persistence logic without a live model or browser.
 from __future__ import annotations
 
 import asyncio
-import json
 import uuid
 from pathlib import Path
 from typing import Any
@@ -27,10 +26,11 @@ class FakeWorkflowRunner:
     async def run_child(
         self, config, batch_id, work_item, child_goal, success_criteria, profile_dir,
         max_steps, resume_task_id=None, runtime_policy=None, approval_callback=None,
+        seed_facts=None,
     ) -> str:
         self.calls.append({
             "ordinal": work_item["ordinal"], "target": work_item["target"], "goal": child_goal,
-            "approval_callback": approval_callback,
+            "approval_callback": approval_callback, "seed_facts": seed_facts,
         })
         outcome = self.outcomes.pop(0)
         task_id = uuid.uuid4().hex[:12]
@@ -39,15 +39,21 @@ class FakeWorkflowRunner:
 
 
 def _write_step_task(config, task_id: str, target: str, outcome: dict[str, Any]) -> None:
+    """Writes a TASK_COMPLETED event using the structured verified/outputs contract
+    (agent/schemas.py::FinishAction, persisted by agent/loop.py::_handle_finish) — not the
+    old JSON-embedded-in-the-result-string shape workflow/orchestrator.py used to parse."""
     db_path = Path(config.storage.tasks_dir) / task_id / "task.db"
     store = EventStore(db_path)
     try:
         store.create_task(task_id, f"step {target}", [])
         store.append(task_id, 0, EventType.TASK_CREATED, {"goal": f"step {target}", "success_criteria": []})
         if outcome["status"] == "completed":
+            result = outcome["result"]
             store.append(task_id, 1, EventType.TASK_COMPLETED, {
-                "result": json.dumps(outcome["result"]), "final_url": target, "final_title": "Fixture",
+                "result": result.get("summary", ""), "final_url": target, "final_title": "Fixture",
                 "final_text_excerpt": outcome.get("final_text_excerpt", "evidence"),
+                "verified": result.get("verified"),
+                "outputs": result.get("outputs", []),
             })
             state = TaskState(task_id=task_id, current_step=1, status="completed", last_event_id=store.max_event_id(task_id))
         elif outcome["status"] == "blocked":
@@ -70,13 +76,12 @@ def _make_store(tmp_path, objective: str, steps: list[dict[str, Any]], policy: W
 
 
 def _verified(summary: str = "ok", facts: dict | None = None) -> dict:
-    return {"status": "completed", "result": {"done": True, "verified": True, "summary": summary,
-                                               "evidence": "matches expected state", "facts": facts or {}}}
+    outputs = [{"key": key, "value": value} for key, value in (facts or {}).items()]
+    return {"status": "completed", "result": {"verified": True, "summary": summary, "outputs": outputs}}
 
 
 def _unverified(reason: str = "state not confirmed") -> dict:
-    return {"status": "completed", "result": {"done": True, "verified": False, "summary": "",
-                                               "evidence": reason, "facts": {}}}
+    return {"status": "completed", "result": {"verified": False, "summary": reason, "outputs": []}}
 
 
 def test_workflow_completes_sequentially(tmp_config, tmp_path):
@@ -142,6 +147,52 @@ def test_workflow_passes_structured_facts_between_steps(tmp_path, tmp_config):
         assert final["status"] == "completed"
         assert final["steps"][0]["facts"] == {"project_code": "AX-42"}
         assert "AX-42" in runner.calls[1]["goal"]
+    finally:
+        store.close()
+
+
+def test_workflow_passes_multiple_facts_across_three_steps(tmp_path, tmp_config):
+    """Fact-test-matrix item (docs/PHASE5B_REPORT.md corrective pass): step 1 discovers two
+    facts, step 2 uses one, step 3 uses the other — and step 3 still sees both (facts_so_far
+    accumulates everything verified before its ordinal, not just the immediately-prior step)."""
+    steps = [
+        {"ordinal": 1, "target": "http://a.test", "objective": "find the build filename and version"},
+        {"ordinal": 2, "target": "http://b.test", "objective": "enter the filename"},
+        {"ordinal": 3, "target": "http://c.test", "objective": "enter the version"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "multi-fact dependency", steps)
+    runner = FakeWorkflowRunner([
+        _verified("found build info", facts={"filename": "report-v3.zip", "version": "3.2.1"}),
+        _verified("filename entered"),
+        _verified("version entered"),
+    ])
+    try:
+        final = asyncio.run(WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner).run())
+        assert final["status"] == "completed"
+        assert final["steps"][0]["facts"] == {"filename": "report-v3.zip", "version": "3.2.1"}
+        assert "report-v3.zip" in runner.calls[1]["goal"]
+        assert runner.calls[1]["seed_facts"] == {"filename": "report-v3.zip", "version": "3.2.1"}
+        assert "3.2.1" in runner.calls[2]["goal"]
+        assert "report-v3.zip" in runner.calls[2]["goal"]  # still available, not dropped after step 2
+    finally:
+        store.close()
+
+
+def test_workflow_does_not_invent_facts_when_absent(tmp_path, tmp_config):
+    """Section 8 of the corrective pass: when a step discovers nothing reusable, the next
+    step's goal must say so plainly rather than fabricating or carrying over a stale value."""
+    steps = [
+        {"ordinal": 1, "target": "http://a.test", "objective": "check for a project code"},
+        {"ordinal": 2, "target": "http://b.test", "objective": "proceed without a project code"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "no code available", steps)
+    runner = FakeWorkflowRunner([_verified("no code was shown on the page", facts={}), _verified("proceeded")])
+    try:
+        final = asyncio.run(WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner).run())
+        assert final["status"] == "completed"
+        assert final["steps"][0]["facts"] == {}
+        assert "VERIFIED WORKFLOW INPUTS: none yet." in runner.calls[1]["goal"]
+        assert runner.calls[1]["seed_facts"] is None
     finally:
         store.close()
 

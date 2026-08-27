@@ -15,15 +15,25 @@ back ::= "{" ws "\"action\"" ws ":" ws "\"back\"" ws "}"
 extract ::= "{" ws "\"action\"" ws ":" ws "\"extract\"" (ws "," ws "\"target\"" ws ":" ws (integer | "null"))? ws "}"
 download ::= "{" ws "\"action\"" ws ":" ws "\"download\"" ws "," ws "\"target\"" ws ":" ws integer ws "}"
 wait ::= "{" ws "\"action\"" ws ":" ws "\"wait\"" wait-field? ws "}"
-finish ::= "{" ws "\"action\"" ws ":" ws "\"finish\"" ws "," ws "\"result\"" ws ":" ws string ws "}"
+finish ::= "{" ws "\"action\"" ws ":" ws "\"finish\"" ws "," ws "\"result\"" ws ":" ws string finish-field* ws "}"
 
 wait-field ::= ws "," ws (wait-for-text | wait-url | wait-ms)
 wait-for-text ::= "\"for_text\"" ws ":" ws string
 wait-url ::= "\"url_contains\"" ws ":" ws string
 wait-ms ::= "\"ms\"" ws ":" ws integer
 
+# Optional, additive finish fields (workflow cross-site fact passing): repeatable so either
+# or both may appear in any order, same pattern as wait-field above but generalized.
+finish-field ::= ws "," ws (finish-verified | finish-outputs)
+finish-verified ::= "\"verified\"" ws ":" ws boolean
+finish-outputs ::= "\"outputs\"" ws ":" ws output-array
+output-array ::= "[" ws (output-item (ws "," ws output-item)*)? ws "]"
+output-item ::= "{" ws "\"key\"" ws ":" ws string ws "," ws "\"value\"" ws ":" ws string output-evidence? ws "}"
+output-evidence ::= ws "," ws "\"evidence\"" ws ":" ws string
+
 direction ::= "\"up\"" | "\"down\""
 
+boolean ::= "true" | "false"
 integer ::= "0" | [1-9] [0-9]*
 string ::= "\"" ( [^"\\] | "\\" ["\\/bfnrt] )* "\""
 ws ::= [ \t\n]*
