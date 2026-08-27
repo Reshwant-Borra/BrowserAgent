@@ -29,10 +29,18 @@ CREATE TABLE IF NOT EXISTS ui_jobs (
     batch_id TEXT,
     workflow_id TEXT,
     pending_approval TEXT,
+    pending_clarification TEXT,
     final_result TEXT,
     error TEXT
 );
 """
+
+# `pending_clarification` was added after the original schema shipped; ALTER TABLE rather
+# than a version-gated migration framework since this is a single local SQLite file with one
+# reader/writer process (Section 29 of the semantic planner task: don't over-build this).
+_MIGRATIONS = (
+    "ALTER TABLE ui_jobs ADD COLUMN pending_clarification TEXT",
+)
 
 
 class UIJobStore:
@@ -43,6 +51,12 @@ class UIJobStore:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        for migration in _MIGRATIONS:
+            try:
+                self.conn.execute(migration)
+                self.conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists on a pre-existing runtime/ui/jobs.db
 
     def close(self) -> None:
         self.conn.close()
@@ -71,7 +85,7 @@ class UIJobStore:
     def update(self, job_id: str, **fields: Any) -> None:
         if not fields:
             return
-        json_fields = {"router_decision", "final_result", "pending_approval"}
+        json_fields = {"router_decision", "final_result", "pending_approval", "pending_clarification"}
         columns = []
         values = []
         for key, value in fields.items():
@@ -90,7 +104,7 @@ class UIJobStore:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
-    for key in ("router_decision", "final_result", "pending_approval"):
+    for key in ("router_decision", "final_result", "pending_approval", "pending_clarification"):
         if data.get(key):
             try:
                 data[key] = json.loads(data[key])

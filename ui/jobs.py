@@ -20,7 +20,9 @@ from batch.store import BatchStore
 from browser.page_model import ElementRef
 from inference.llama_client import InferenceClient, create_inference_client
 from research.discovery import discover_sources
-from router.policy import RoutingError, route, to_batch_policy
+from router.plan_schema import ReplanDecisionKind
+from router.policy import NeedsInput, RoutingError, route, route_with_answer, to_batch_policy
+from router.replanner import ReplanOutputError, decide_replan, finding_source_url
 from router.schema import RouterDecision, TaskType
 from ui.store import UIJobStore
 from workflow.models import WorkflowPolicy
@@ -28,6 +30,10 @@ from workflow.orchestrator import WorkflowOrchestrator
 from workflow.store import WorkflowStore
 
 RESEARCH_MAX_SOURCES_DEFAULT = 20
+# Bounds the clarification loop (Section 14 of the semantic planner task): a resource that's
+# still unresolved after this many user responses stops asking and fails cleanly instead of
+# turning into the "continuous free-form planning loop" Section 12 explicitly forbids.
+MAX_CLARIFICATION_ROUNDS = 3
 
 
 def _assignment_contract() -> ResultContract:
@@ -45,6 +51,7 @@ class _JobControl:
         self.stop_event = asyncio.Event()
         self.login_event = asyncio.Event()
         self.approval_future: Optional[asyncio.Future] = None
+        self.clarification_future: Optional[asyncio.Future] = None
 
 
 class JobRunner:
@@ -79,6 +86,13 @@ class JobRunner:
         control.login_event.set()
         return True
 
+    def clarify(self, job_id: str, answer_text: str) -> bool:
+        control = self._control.get(job_id)
+        if control is None or control.clarification_future is None or control.clarification_future.done():
+            return False
+        control.clarification_future.set_result(answer_text)
+        return True
+
     def stop(self, job_id: str) -> bool:
         control = self._control.get(job_id)
         if control is None:
@@ -87,6 +101,8 @@ class JobRunner:
         control.login_event.set()  # unblock a login wait so the driver can observe stop
         if control.approval_future is not None and not control.approval_future.done():
             control.approval_future.set_result(False)
+        if control.clarification_future is not None and not control.clarification_future.done():
+            control.clarification_future.set_result(None)
         return True
 
     # ---- driver --------------------------------------------------------
@@ -95,10 +111,13 @@ class JobRunner:
         control = self._control[job_id]
         try:
             client = create_inference_client(self.config)
+            self.store.update(job_id, activity="Understanding task...")
             try:
-                decision = await route(prompt, client)
+                decision = await self._route_with_clarification(job_id, prompt, client, control)
             except RoutingError as exc:
                 self.store.update(job_id, status="failed", error=str(exc), activity="Could not route task")
+                return
+            if decision is None:  # stopped while waiting on a clarification, or rounds exhausted
                 return
             self.store.update(
                 job_id, kind=decision.task_type.value, router_decision=decision.model_dump(mode="json"),
@@ -111,7 +130,7 @@ class JobRunner:
             if decision.task_type == TaskType.SINGLE_SITE:
                 await self._run_single(job_id, decision, control)
             elif decision.task_type == TaskType.MULTISITE_SWEEP:
-                await self._run_sweep(job_id, decision, control)
+                await self._run_sweep(job_id, decision, control, client)
             elif decision.task_type == TaskType.ORDERED_WORKFLOW:
                 await self._run_workflow(job_id, decision, control)
             elif decision.task_type == TaskType.RESEARCH:
@@ -121,6 +140,56 @@ class JobRunner:
         finally:
             self._control.pop(job_id, None)
             self._tasks.pop(job_id, None)
+
+    async def _route_with_clarification(
+        self, job_id: str, original_prompt: str, client: InferenceClient, control: _JobControl,
+    ) -> Optional[RouterDecision]:
+        """Routes the prompt, looping on NeedsInput (Section 14): rather than failing with
+        "no targets found", persists a `waiting_for_input` state describing exactly what's
+        missing, waits for the user's answer via `clarify()`, and re-routes with that answer
+        appended (router.policy.route_with_answer) — bounded by MAX_CLARIFICATION_ROUNDS so
+        this can never become the open-ended planning loop Section 12 forbids. Returns None
+        if the job was stopped mid-wait or the round budget was exhausted (both already
+        persist their own terminal status before returning)."""
+        result = await route(original_prompt, client, self.config)
+        rounds = 0
+        while isinstance(result, NeedsInput):
+            rounds += 1
+            if rounds > MAX_CLARIFICATION_ROUNDS:
+                self.store.update(
+                    job_id, status="failed",
+                    error="could not resolve the requested resource after repeated clarification",
+                    activity="Needs more specific input than provided",
+                )
+                return None
+            future: asyncio.Future = asyncio.get_running_loop().create_future()
+            control.clarification_future = future
+            self.store.update(
+                job_id, status="waiting_for_input", activity="Waiting for input...",
+                pending_clarification={"question": result.question},
+            )
+            answer = await self._wait_clarification_or_stop(control, future)
+            control.clarification_future = None
+            if control.stop_event.is_set() or answer is None:
+                self.store.update(job_id, status="stopped", activity="Stopped while waiting for input")
+                return None
+            self.store.update(job_id, status="running", pending_clarification=None,
+                               activity="Got it, continuing...")
+            result = await route_with_answer(original_prompt, answer, client, self.config)
+        return result
+
+    async def _wait_clarification_or_stop(self, control: _JobControl, future: asyncio.Future) -> Optional[str]:
+        stop_wait = asyncio.ensure_future(control.stop_event.wait())
+        answer_wait = asyncio.ensure_future(future)
+        try:
+            done, _pending = await asyncio.wait({stop_wait, answer_wait}, return_when=asyncio.FIRST_COMPLETED)
+            if answer_wait in done:
+                return answer_wait.result()
+            return None
+        finally:
+            for t in (stop_wait, answer_wait):
+                if not t.done():
+                    t.cancel()
 
     # ---- single-site -----------------------------------------------------
 
@@ -221,7 +290,8 @@ class JobRunner:
 
     # ---- multisite sweep (batch) ------------------------------------------
 
-    async def _run_sweep(self, job_id: str, decision: RouterDecision, control: _JobControl) -> None:
+    async def _run_sweep(self, job_id: str, decision: RouterDecision, control: _JobControl,
+                          client: Optional[InferenceClient] = None) -> None:
         if not decision.targets:
             self.store.update(job_id, status="failed", error="no targets found in the task text",
                                activity="Failed")
@@ -252,6 +322,41 @@ class JobRunner:
             self.store.update(job_id, status="completed", activity="Completed", final_result=final)
         finally:
             store.close()
+
+        if decision.mixed_intent_followup and not control.stop_event.is_set():
+            await self._maybe_replan(job_id, decision, final, control, client)
+
+    async def _maybe_replan(self, job_id: str, decision: RouterDecision, final: dict[str, Any],
+                             control: _JobControl, client: Optional[InferenceClient]) -> None:
+        """One bounded replan round (Section 12-13): only reached when the originating plan
+        was intent=mixed (e.g. "find the nearest deadline and open it"). Never loops — either
+        this single schema-constrained call finds a deterministic follow-up worth running, or
+        the sweep's own findings remain the job's final result."""
+        if client is None:
+            return
+        findings = final.get("findings") or []
+        if not findings:
+            return
+        self.store.update(job_id, activity="Checking whether a follow-up action is needed...")
+        try:
+            replan = await decide_replan(client, decision.objective, findings)
+        except ReplanOutputError:
+            return  # best-effort: keep the sweep's own completed result untouched
+        if replan.decision != ReplanDecisionKind.REVISE or replan.finding_ref is None:
+            return
+        target_url = finding_source_url(findings, replan.finding_ref)
+        if not target_url:
+            return
+        followup = RouterDecision(
+            task_type=TaskType.SINGLE_SITE,
+            objective=replan.new_objective or decision.objective,
+            targets=[target_url],
+            requires_discovery=False,
+            preferred_policy=decision.preferred_policy,
+            result_contract="generic",
+        )
+        self.store.update(job_id, activity=f"Following up: {followup.objective}")
+        await self._run_single(job_id, followup, control)
 
     async def _run_cancelable(self, awaitable, control: _JobControl):
         """Cooperative stop: BatchOrchestrator/WorkflowOrchestrator only check policy budgets
