@@ -1,8 +1,10 @@
 # BrowserAgent Master Status
 
-Canonical handoff document. Written at the end of the "final integration pass"
-(router fixes + Playwright CDP-attach persistent-browser mode + real UI validation),
-branch `final/cdp-persistent-browser`, off `main` @ `c356b56` (tag `phase5b-pass`).
+Canonical handoff document. Originally written at the end of the "final integration pass"
+(router fixes + Playwright CDP-attach persistent-browser mode + real UI validation), branch
+`final/cdp-persistent-browser`, off `main` @ `c356b56` (tag `phase5b-pass`). Updated again at
+the end of the "semantic task planner" pass (branch `feature/semantic-task-planner`, off
+`main` @ `57d3599`, tag `browseragent-v1-ready`) — see Section 22 for that pass's evidence.
 Read this instead of re-reading the whole project history.
 
 ## 1. Project Goal
@@ -36,6 +38,15 @@ Open `http://127.0.0.1:8765`. Type a task in plain English, e.g.:
 - `Go to https://a.example.com and find the project code. Then go to https://b.example.com and enter that exact code in the matching field.`
 - `Research college essay advice from a number of good sources and give me an evidence-backed report.`
 
+As of the semantic-planner pass (Section 22), none of these need a literal URL at all —
+BrowserAgent resolves references against your actually-open tabs or the page you're on:
+
+- `Check all my course pages and tell me what I still need to do this week.`
+- `Tell me what I still need to do on this page.`
+- `Find the project code on the page where it's listed, then put that same code into the configuration page and verify it.`
+
+If it can't find a safe match for what you meant, it asks instead of failing — see Section 22.
+
 For quick one-off testing without a separate browser window, `browser-agent ui` alone works
 too (`launch` mode — BrowserAgent starts and owns its own throwaway Chromium, same as before
 this pass). Ollama (`ollama serve`, with `qwen3:8b` pulled) must be running either way.
@@ -60,8 +71,13 @@ and Section 21.
 
 ```
 UI (ui/app.py, ui/static/index.html)
-  -> router (router/policy.py: try_deterministic_route(), Qwen fallback route_with_model())
+  -> router (router/policy.py::route(), mode-aware — see Section 22)
+     1. router/extract.py::try_deterministic_route()   <- obvious literal-URL shapes, free
+     2. router/semantic_planner.py::plan_task()         <- Qwen, schema-constrained TaskPlan
+        -> router/resources.py::ResourceResolver        <- deterministic resolution
+     3. (fallback only) router/llm_router.py::route_with_model()  <- pre-existing Qwen router
      -> RouterDecision: single_site | multisite_sweep | ordered_workflow | research
+        | NeedsInput  <- ask the user instead of "no targets found" (Section 22)
         -> AgentLoop (single_site)            agent/loop.py
         -> BatchOrchestrator (multisite_sweep) batch/orchestrator.py
         -> WorkflowOrchestrator (ordered_workflow) workflow/orchestrator.py
@@ -98,9 +114,10 @@ is exactly what the BrowserOS feasibility research (Section 8 below) found and i
 | 4B | Fix "present but not applied" facts | 98/98 deterministic; long-horizon 15/15 + 9/9 holdout; crash/resume 9/9; 54/54 facts applied | A deterministic constraint guard (not embeddings/bigger model) fixed application reliability |
 | 5 | Durable multi-site batch orchestration | Assignment/research precision=recall=1.00 at 10-100 targets; crash/resume 3/3; 134/134 suite | Most "extraction failures" were infra/evaluator bugs, not model quality; sequential processing sufficient |
 | 5B | NL router, local UI, ordered workflows, research | Router 39/39 + 15/15 live; workflow 2/4->4/4 after a fix, repeated 4/4 twice; 215 deterministic tests | The "unreliable" cross-site fact-passing was an interface bug (JSON-in-a-string), fixed via schema-validated fields |
-| final (this pass) | Fix 2 router bugs from real-UI use; add persistent-browser (CDP attach) mode | See Section 6 | Both bugs were router-internal (target isolation, verb coverage), unrelated to backend choice; Playwright `connect_over_cdp` gives the persistence win with zero new dependency |
+| final (CDP pass) | Fix 2 router bugs from real-UI use; add persistent-browser (CDP attach) mode | 45/45 router, 192/192 combined, real persistence experiment passed | Both bugs were router-internal (target isolation, verb coverage), unrelated to backend choice; Playwright `connect_over_cdp` gives the persistence win with zero new dependency |
+| semantic planner (this pass) | Replace the brittle keyword-first router's failure mode ("no targets found" on semantic requests like "check my course pages") with a schema-constrained planner + deterministic resource resolver | 98.4% overall / 100% holdout planner accuracy, 100% schema validity, 0 hallucinations (232 deterministic tests); exact reported failure resolved end to end with real open tabs — see Section 22 | The model is good at understanding *what* the user means; code must stay the sole authority on *what actually exists* — every resource reference resolves to a real, enumerable candidate (extracted URL or real open tab) the model only ever selects *by id*, never invents |
 
-## 6. Proven Validation Results (this pass)
+## 6. Proven Validation Results (CDP persistent-browser pass)
 
 - **Router regression**: 39/39 pre-existing deterministic router tests still pass, plus 6
   new tests for the two fixed findings — 45/45 total (`tests/unit/test_router.py`).
@@ -271,8 +288,21 @@ dashboard, just enough to tell the user whether their persistent browser needs s
   from whatever the user is actually looking at.
 - CDP page-selection "most recently active tab" is a `context.pages`-order approximation,
   not a true focus timestamp (CDP doesn't expose one) — a tab opened long ago but manually
-  refocused most recently may not be detected as such.
+  refocused most recently may not be detected as such. Consequence observed during the
+  semantic-planner pass's E2E validation: a batch/workflow child task in `cdp_attach` mode
+  reuses/renavigates whatever tab this policy picks rather than opening one dedicated tab per
+  work item — correct end-target per item, but it can "borrow" one of the user's other open
+  tabs along the way. Not fixed (out of scope — see Section 22).
 - No macOS validation to date.
+- Semantic open-tab resolution (Section 22) has a small residual miss rate (~1/13 in the live
+  benchmark) — it's tuned toward asking for clarification rather than guessing wrong, but
+  it's not perfect pattern matching.
+- Bounded replanning (Section 22, Section 9 of docs/SEMANTIC_PLANNER.md) was validated at the
+  planner-classification level (`intent=mixed` detection, 100% in the live benchmark) and via
+  fake-client unit tests, but not with a full live execution against fixture data that
+  actually contains something to select between (the available fixture pages have no due-date
+  content) — the mechanism itself (one bounded schema-constrained call, id-based selection,
+  reusing `_run_single`) is the same pattern already proven elsewhere in this codebase.
 
 ## 16. Things Explicitly NOT Needed Yet
 
@@ -283,13 +313,15 @@ various phases (see Section 5) or, for BrowserOS, this pass's own research
 
 ## 17. Git State
 
-- `main` @ `c356b56` (tag `phase5b-pass`) before this pass.
+- `main` @ `57d3599` (tag `browseragent-v1-ready`) before the semantic-planner pass; `c356b56`
+  (tag `phase5b-pass`) before the CDP pass.
 - `research/browseros-backend-feasibility` — pushed to origin, preserved, not merged into
-  `main` (the feasibility study itself; its one file is also copied into this branch so
-  in-repo doc links resolve — see Section 8).
-- `final/cdp-persistent-browser` — this pass's branch, off `main`.
-- Tags: `phase1b-pass`, `phase5b-pass`; `browseragent-v1-ready` created only if Section 30's
-  gate fully passes (see the final response for this run's actual outcome).
+  `main` (the feasibility study itself; its one file is also copied into `main` so in-repo doc
+  links resolve — see Section 8).
+- `final/cdp-persistent-browser` — CDP pass's branch, merged into `main`.
+- `feature/semantic-task-planner` — this pass's branch, off `main`, pushed, not merged pending
+  review (Section 42 of the semantic planner task: "do not merge until validation passes").
+- Tags: `phase1b-pass`, `phase5b-pass`, `browseragent-v1-ready`.
 
 ## 18. Important Docs
 
@@ -297,17 +329,18 @@ various phases (see Section 5) or, for BrowserOS, this pass's own research
 - `docs/PHASE1_REPORT.md`, `PHASE1B_REPORT.md`, `PHASE2_REPORT.md`, `PHASE3_REPORT.md`,
   `PHASE4_REPORT.md`, `PHASE4B_REPORT.md`, `PHASE5_REPORT.md`, `PHASE5B_REPORT.md`
 - `docs/BROWSEROS_BACKEND_FEASIBILITY.md`
+- `docs/SEMANTIC_PLANNER.md`
 - `docs/USING_BROWSERAGENT.md`
 - `docs/BROWSERAGENT_MASTER_STATUS.md` (this file)
 
 ## 19. How To Run Tests
 
 ```powershell
-# deterministic unit suite
+# deterministic unit suite (includes tests/unit/test_semantic_planner.py)
 python -m pytest tests/unit -q
 
 # router-specific
-python -m pytest tests/unit/test_router.py -v
+python -m pytest tests/unit/test_router.py tests/unit/test_semantic_planner.py -v
 
 # browser/CDP integration (real Playwright, no Ollama needed)
 python -m pytest tests/integration/test_cdp_attach.py -v
@@ -315,6 +348,10 @@ python -m pytest tests/integration/test_phase1_browser_actions.py tests/integrat
 
 # UI (test_ui_app.py only — see Section 15 for the test_ui_jobs.py caveat)
 python -m pytest tests/integration/test_ui_app.py -q
+
+# semantic planner live-model benchmark (real Ollama, ~15-20 min for all 8 categories)
+python benchmarks/run_semantic_planner_live.py
+python benchmarks/run_semantic_planner_live.py --categories open_tabs,clarification  # subset
 ```
 
 Run integration test files individually rather than all together where possible — batching
@@ -328,10 +365,13 @@ stall in Section 15 has been observed to trigger; each file run alone has been g
    automatically, launches it with a dedicated profile and `--remote-debugging-port=9222`).
 3. Start the UI attached to it: `browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222`.
 4. Open `http://127.0.0.1:8765`.
-5. Type a task in plain English, press Run.
+5. Type a task in plain English, press Run — no need to paste URLs if you mean something
+   already open ("my course pages") or the page you're on ("this page").
 6. If prompted, log in manually in the browser window, then click Continue.
 7. If prompted, Approve or Deny a consequential action.
-8. Read the final result in the UI (or check the history list later).
+8. If BrowserAgent asks a clarifying question (it couldn't find a safe match for what you
+   meant), answer in the text box and click Continue.
+9. Read the final result in the UI (or check the history list later).
 
 Core BrowserAgent is ready for real use; future work should be driven by failures
 encountered in actual tasks, not another speculative phase.
@@ -367,3 +407,134 @@ Run on this machine, this session, with real Chrome and real Ollama/Qwen3-8B (no
 
 Conclusion: browser process survival, tab survival, disconnect-without-closing, and
 reconnect-to-the-same-session all confirmed with real evidence, not simulated.
+
+## 22. Semantic Task Planner Pass — Evidence Log
+
+Motivation: `router/extract.py`/`router/llm_router.py` could only route a target already
+spelled out as a literal URL. "Check all my course pages and tell me what I still need to do
+this week" produced `multisite_sweep` with `targets=[]`, `requires_discovery=True`, and
+`ui/jobs.py::_run_sweep` failed it outright with "no targets found in the task text" — a
+reasonable natural-language request treated as an error. Full design:
+[`docs/SEMANTIC_PLANNER.md`](SEMANTIC_PLANNER.md).
+
+### What changed
+
+New: `router/plan_schema.py` (TaskPlan/ResourceRequirement/PlannedStep/ReplanDecision),
+`router/semantic_planner.py` (Qwen planning call), `router/resources.py` (deterministic
+resource resolver + open-tab selection), `router/replanner.py` (bounded mixed-intent
+follow-up), `browser/tabs.py` (CDP HTTP tab enumeration). Modified: `router/policy.py`
+(mode-aware `route()` + plan->RouterDecision translation + `NeedsInput`), `router/schema.py`
+(`mixed_intent_followup` field, additive), `agent/config.py`/`config/default.yaml`
+(`routing.mode`, default `hybrid`), `ui/jobs.py`/`ui/app.py`/`ui/store.py`/
+`ui/static/index.html` (clarification loop + bounded replan). Zero changes to `AgentLoop`,
+`BatchOrchestrator`, `WorkflowOrchestrator`, `research/discovery.py`, or `PlaywrightBackend`.
+
+### Live planner benchmark (`benchmarks/run_semantic_planner_live.py`, real Qwen3-8B/Ollama)
+
+128 prompts (104 tuned + 24 holdout, unseen phrasings) across 8 categories. Final run:
+
+```json
+{
+  "per_category": {
+    "single_explicit": {"tuned": "12/13", "holdout": "3/3"},
+    "current_page": {"tuned": "13/13", "holdout": "3/3"},
+    "sweep_explicit": {"tuned": "13/13", "holdout": "3/3"},
+    "ordered_workflow": {"tuned": "13/13", "holdout": "3/3"},
+    "mixed_intent": {"tuned": "13/13", "holdout": "3/3"},
+    "research": {"tuned": "13/13", "holdout": "3/3"},
+    "open_tabs": {"tuned": "12/13", "holdout": "3/3"},
+    "clarification": {"tuned": "13/13", "holdout": "3/3"}
+  },
+  "tuned_accuracy": 0.9807692307692307,
+  "holdout_accuracy": 1.0,
+  "overall_accuracy": 0.984375,
+  "schema_validity_rate": 1.0,
+  "hallucinated_target_count": 0,
+  "total_prompts": 128
+}
+```
+
+Two real bugs found and fixed mid-benchmark (not just prompt tuning against noise):
+
+1. **sweep vs ordered_workflow confusion**: an early full run scored 76.6% overall because
+   the planner defaulted multi-URL "check A and B and tell me X" prompts (no sequencing
+   language) to `ordered_workflow` instead of `sweep`, and "find the cheapest and open it"
+   style prompts to `intent=act` instead of `intent=mixed`. Fixed by rewriting the planner
+   prompt's execution-shape/intent rules as an explicit ordered decision list with a
+   contrastive example ("Check A and B and tell me which is cheaper -> sweep, NOT
+   ordered_workflow"). Re-run after the fix: those categories went to 13/13 and 16/16.
+2. **Over-inclusive open-tab selection**: the `clarification` category (same prompts as
+   `open_tabs`, against a tab pool with no matching tabs) initially failed 3/16 — the
+   selection sub-call, told to "select every tab that plausibly matches," defaulted to
+   selecting unrelated tabs (email/shopping) rather than nothing when unsure. Tightened the
+   prompt to make an empty result the explicitly-correct answer when nothing is a clear
+   match. Re-run: `clarification` went to 16/16; `open_tabs` gave up exactly one match it
+   previously had (a real, if small, precision/recall trade — but the failure mode moved from
+   "silently picks the wrong tab" to "asks for clarification," which is the safer direction).
+
+A benchmark-script bug was also caught and fixed before the first real numbers were usable:
+the script never set `config.browser.mode = "cdp_attach"`, so `ResourceResolver.get_open_tabs()`
+short-circuited to "no tabs" before the patched tab list was ever consulted — every `open_tabs`
+prompt failed with a suspiciously fast ~1.6s latency (a single planner call, no selection
+call) until this was noticed and fixed.
+
+### Real end-to-end validation (real Chrome, real Ollama/Qwen3-8B, real tabs — not mocked)
+
+Persistent Chromium started via `browser-agent browser start`; 7 real tabs opened against the
+local fixture site with realistic titles set via a throwaway Playwright connection: 3
+"course-like" tabs (`AP Chemistry - Course Home`, `AP Calculus - Assignments`,
+`US History - Course Page`), 2 distractors (`Online Shopping - Cart`,
+`YouTube - Funny Cat Video`), and 2 tabs for the cross-site scenario (`Project Info - Code
+Lookup`, `Settings - Configuration Panel`). UI started with `--browser-mode cdp_attach`
+(default `routing.mode: hybrid`).
+
+- **Exact reported failure, reproduced and fixed**: `"Check all my course pages and combine
+  everything I still need to do this week."` -> routed `multisite_sweep`, resolved to exactly
+  the 3 course tabs (`workflow_site_a/b/c.html`), zero shopping/YouTube tabs included, zero
+  invented URLs. Batch ran 3/3 items to completion. No "no targets found" error.
+- **Current page**: `"Tell me everything I still need to do on this page."` -> `single_site`,
+  empty targets, completed against whatever tab was attached.
+- **Cross-site, no URLs, no "Site A/B" phrasing**: `"Find the project code on the page where
+  it's listed, then put that same code into the configuration page and verify it."` -> first
+  attempt produced `NeedsInput` because the planner classified both references as
+  `current_page` (a single page can't be two different pages) — fixed by adding an explicit
+  planner-prompt rule ("2+ distinct implicit targets with no URLs -> open_tabs for each, never
+  current_page") plus a worked example matching this exact scenario. Re-run:
+  `ordered_workflow`, step 1 -> `workflow_dep_a.html` (via tab selection matching "the page
+  listing the project code"), steps 2-3 -> `workflow_dep_b.html` (via tab selection matching
+  "the configuration/settings page") — zero explicit URLs anywhere in the prompt. Ran to
+  completion: code `AX-42` extracted, entered, and verified.
+- **Clarification round-trip**: `"Check my internship application pages and tell me their
+  status."` (no internship-related tab open) -> `waiting_for_input` with a specific question.
+  Answered via `POST /api/jobs/{id}/clarify` with a pasted URL -> re-routed (deterministic
+  fast path picked up the now-literal URL immediately, no second planner call) -> completed.
+- **Research routing**: `"Research strong college essay advice from multiple reputable
+  sources and summarize the recurring themes."` -> `research`, `requires_discovery=True`,
+  `targets=[]` — real `discover_sources()` call found real candidate URLs
+  (`collegeessayguy.com` among them) and began sweeping them; stopped once the control-plane
+  routing was confirmed (per the task's own instruction, full open-web search success is not
+  required to validate this path — see Known Limitations for bot-detection risk).
+
+One pre-existing (not introduced by this pass) architectural quirk was surfaced during this
+validation: `PlaywrightBackend`'s `cdp_attach` page-selection policy causes sequential
+batch/workflow child tasks to reuse and renavigate whichever tab was last attached rather than
+opening one tab per work item — each item still ends up on the correct target URL (via
+`open_url`), but a long sweep can "borrow" the user's other open tabs along the way. Recorded
+as a known limitation (Section 15), not fixed — out of scope for a control-plane-only pass.
+
+### Tests
+
+- `tests/unit/test_semantic_planner.py`: 31 new tests (schema validity, resolver resolution
+  incl. positional explicit-URL assignment for multi-step workflows, tab-selection
+  hallucination guard, plan translation for all 4 execution shapes, NeedsInput triggers,
+  routing-mode selection legacy/semantic/hybrid, clarification round-trip, replanner schema).
+- Full deterministic suite: 232/232 passed (`tests/unit` + `test_cdp_attach.py` +
+  `test_ui_app.py`), no regressions in any pre-existing router/CDP/UI test.
+
+### Performance
+
+Planner call: ~1.5-2.5s (single Qwen3-8B call, same order of magnitude as the existing
+action-decision calls). Resource resolution adds one more call only for `open_tabs`
+requirements (~1.5-2.5s tab-selection call) — negligible next to actual browser
+observe/act/verify cycles (multi-second each). Deterministic fast-path prompts (literal URLs)
+pay zero planner overhead, unchanged from before this pass.
