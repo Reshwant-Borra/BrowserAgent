@@ -24,7 +24,8 @@ class ScriptedLlamaClient:
         self.endpoint = "scripted://fake"
         self.calls: list[str] = []
 
-    async def complete(self, prompt: str, grammar: Optional[str] = None, max_tokens: int = 256) -> CompletionResult:
+    async def complete(self, prompt: str, grammar: Optional[str] = None, max_tokens: int = 256,
+                        json_schema: Optional[dict] = None) -> CompletionResult:
         self.calls.append(prompt)
         if self._index >= len(self._script):
             raise AssertionError(
