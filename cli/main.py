@@ -1,4 +1,4 @@
-"""CLI entry point: `browser-agent run|resume|status`.
+"""CLI entry point: `browser-agent start|stop|status|run|resume|ui|browser|batch`.
 
 Kept intentionally thin — argparse only, no framework — since every real behavior lives in
 agent.loop.AgentLoop. This module's job is turning operational failures (model server down,
@@ -11,18 +11,17 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import shutil
+import os
 import sqlite3
-import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 from agent.config import load_config
 from agent.loop import AgentLoop
 from batch.models import BatchPolicy, NavigationScope, ResultContract, SessionMode
 from batch.orchestrator import BatchOrchestrator
 from batch.store import BatchStore
+from cli import launcher
 from inference.llama_client import ModelUnavailableError, active_model_endpoint, create_inference_client
 
 
@@ -47,45 +46,23 @@ def _apply_browser_overrides(config, args: argparse.Namespace) -> None:
         config.browser.cdp_endpoint = args.cdp_endpoint
 
 
-def _find_chrome() -> Optional[str]:
-    candidates = [
-        shutil.which("chrome"),
-        shutil.which("chrome.exe"),
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        str(Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "Application" / "chrome.exe"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return candidate
-    return None
-
-
 async def cmd_browser_start(args: argparse.Namespace) -> None:
-    chrome = _find_chrome()
-    if chrome is None:
-        print(
-            "Could not find chrome.exe automatically. Start it manually with:\n"
-            f'  chrome.exe --remote-debugging-port={args.port} --user-data-dir="{args.profile_dir}"\n'
-            "(bind to 127.0.0.1 only — never expose remote debugging to a LAN/public network)."
-        )
+    """Kept for debugging/backward compatibility; `browser-agent start` is the normal path.
+
+    This used to print "Started persistent Chromium" as soon as subprocess.Popen returned,
+    even if Chrome exited immediately and CDP never bound (verified via `netstat` showing
+    nothing on the port). It now goes through the same launcher.ensure_chrome_cdp() used by
+    `browser-agent start`, which only reports success after /json/version actually answers.
+    """
+    endpoint = f"http://127.0.0.1:{args.port}"
+    step, _pid = launcher.ensure_chrome_cdp(endpoint, Path(args.profile_dir))
+    print(launcher.format_step(step))
+    if not step.ok:
         sys.exit(1)
-    profile_dir = Path(args.profile_dir)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    creationflags = 0
-    if sys.platform == "win32":
-        creationflags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen(
-        [chrome, f"--remote-debugging-port={args.port}", f"--user-data-dir={profile_dir}"],
-        creationflags=creationflags, close_fds=True,
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    print(f"Started persistent Chromium: {chrome}")
-    print(f"  remote debugging: http://127.0.0.1:{args.port} (localhost only)")
-    print(f"  profile dir:      {profile_dir}")
+    print(f"  profile dir: {args.profile_dir}")
     print("Log in to any sites you need in that window - the session persists across restarts,")
     print("since BrowserAgent only attaches to it and never stores your passwords.")
-    print(f"\nThen start the UI with:\n  browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:{args.port}")
+    print(f"\nThen start the UI with:\n  browser-agent ui --browser-mode cdp_attach --cdp-endpoint {endpoint}")
 
 
 async def cmd_browser_status(args: argparse.Namespace) -> None:
@@ -148,6 +125,9 @@ async def cmd_resume(args: argparse.Namespace) -> None:
 
 async def cmd_status(args: argparse.Namespace) -> None:
     config = load_config(args.config)
+    if getattr(args, "task_id", None) is None:
+        await cmd_health_status(args, config)
+        return
     from memory.event_store import EventStore
     from memory.task_state import TaskStateStore
 
@@ -163,6 +143,176 @@ async def cmd_status(args: argparse.Namespace) -> None:
         _print_status(state, task)
     finally:
         es.close()
+
+
+async def cmd_health_status(args: argparse.Namespace, config) -> None:
+    """`browser-agent status` with no task id: a non-mutating snapshot of the three services
+    `browser-agent start` brings up. Never starts or stops anything."""
+    ollama_endpoint = config.model.ollama_endpoint
+    tags = launcher.check_ollama(ollama_endpoint)
+    if tags is None:
+        print("Ollama:       NOT RUNNING")
+        print(f"Model:        unknown ({config.model.model_name})")
+    else:
+        print("Ollama:       RUNNING")
+        models = [m.get("name", "") for m in tags.get("models", [])]
+        model_name = config.model.model_name
+        ready = any(m == model_name or m.split(":")[0] == model_name.split(":")[0] for m in models)
+        print(f"Model:        {model_name} {'READY' if ready else 'NOT INSTALLED'}")
+
+    cdp_endpoint = config.browser.cdp_endpoint
+    cdp_info = launcher.check_cdp(cdp_endpoint)
+    print(f"Chrome/CDP:   {'CONNECTED' if cdp_info is not None else 'NOT CONNECTED'} ({cdp_endpoint})")
+
+    ui_host, ui_port = args.host, args.port
+    port_in_use, is_ours = launcher.probe_ui_owner(ui_host, ui_port)
+    if port_in_use and is_ours:
+        print(f"UI:           RUNNING (http://{ui_host}:{ui_port})")
+    elif port_in_use:
+        print(f"UI:           PORT OCCUPIED BY OTHER PROCESS (http://{ui_host}:{ui_port})")
+    else:
+        print("UI:           NOT RUNNING")
+
+    if tags is not None:
+        gpu_info = launcher.query_gpu_info(ollama_endpoint)
+        print(f"GPU:          {gpu_info or '(no model currently loaded - start a task to see GPU usage)'}")
+
+
+async def cmd_start(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if args.cdp_endpoint:
+        config.browser.cdp_endpoint = args.cdp_endpoint
+    runtime_dir = Path(config.storage.runtime_dir)
+    paths = launcher.LauncherPaths(runtime_dir)
+
+    try:
+        launcher.acquire_start_lock(paths)
+    except launcher.AlreadyRunningError as e:
+        print(str(e))
+        sys.exit(1)
+
+    import atexit
+    atexit.register(launcher.release_start_lock, paths)
+
+    print("BrowserAgent startup\n")
+    state = launcher.load_state(paths)
+    try:
+        ollama_endpoint = config.model.ollama_endpoint
+        step, pid = launcher.ensure_ollama(ollama_endpoint, config.model.model_name)
+        print(launcher.format_step(step))
+        if pid:
+            state.ollama_pid = pid
+            state.ollama_started_by_us = True
+            state.ollama_endpoint = ollama_endpoint
+        if step.ok:
+            gpu_info = launcher.query_gpu_info(ollama_endpoint)
+            if gpu_info:
+                print(f"       {gpu_info}")
+        launcher.save_state(paths, state)
+        if not step.ok:
+            sys.exit(1)
+        print()
+
+        cdp_endpoint = config.browser.cdp_endpoint
+        profile_dir = runtime_dir / "browser_profile"
+        step, pid = launcher.ensure_chrome_cdp(cdp_endpoint, profile_dir)
+        print(launcher.format_step(step))
+        if pid:
+            state.chrome_pid = pid
+            state.chrome_started_by_us = True
+            state.chrome_profile_dir = str(profile_dir)
+            state.chrome_cdp_endpoint = cdp_endpoint
+        launcher.save_state(paths, state)
+        if not step.ok:
+            sys.exit(1)
+        print()
+
+        ui_host, ui_port = args.host, args.port
+        port_in_use, is_ours = launcher.probe_ui_owner(ui_host, ui_port)
+        if port_in_use and not is_ours:
+            print(launcher.format_step(launcher.StepResult(
+                False, "Port already in use",
+                f"http://{ui_host}:{ui_port} is occupied by something other than BrowserAgent.\n"
+                "Free the port or pass --port to use a different one.",
+            )))
+            sys.exit(1)
+
+        if port_in_use and is_ours:
+            print(launcher.format_step(launcher.StepResult(
+                True, "BrowserAgent UI", f"http://{ui_host}:{ui_port} (reused existing)",
+            )))
+            print("\nBrowserAgent is ready.")
+            if not args.no_open:
+                import webbrowser
+                webbrowser.open(f"http://{ui_host}:{ui_port}")
+            return
+
+        config.browser.mode = "cdp_attach"
+        state.ui_port = ui_port
+        state.ui_pid = os.getpid()
+        launcher.save_state(paths, state)
+
+        import uvicorn
+
+        from ui.app import create_app
+
+        app = create_app(config)
+        server = uvicorn.Server(uvicorn.Config(app, host=ui_host, port=ui_port, log_level="warning"))
+        serve_task = asyncio.create_task(server.serve())
+        loop = asyncio.get_event_loop()
+        ui_info = await loop.run_in_executor(
+            None,
+            lambda: launcher.poll_until_healthy(lambda: launcher.check_ui(ui_host, ui_port), timeout_s=15.0),
+        )
+        if ui_info is None:
+            print(launcher.format_step(launcher.StepResult(
+                False, "BrowserAgent UI failed to start",
+                f"Server process started but http://{ui_host}:{ui_port} never responded.",
+            )))
+            server.should_exit = True
+            await serve_task
+            sys.exit(1)
+
+        print(launcher.format_step(launcher.StepResult(True, "BrowserAgent UI", f"http://{ui_host}:{ui_port}")))
+        print("\nBrowserAgent is ready.")
+        if not args.no_open:
+            import webbrowser
+            webbrowser.open(f"http://{ui_host}:{ui_port}")
+        print("Type tasks into the UI. Ctrl+C stops the UI only -")
+        print("the persistent Chrome window and Ollama keep running.")
+        await serve_task
+    finally:
+        launcher.release_start_lock(paths)
+
+
+async def cmd_stop(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    runtime_dir = Path(config.storage.runtime_dir)
+    paths = launcher.LauncherPaths(runtime_dir)
+    state = launcher.load_state(paths)
+
+    stopped_any = False
+    if state.ui_pid and launcher.process_alive(state.ui_pid):
+        launcher.stop_pid(state.ui_pid)
+        print(f"Stopped BrowserAgent UI (pid {state.ui_pid})")
+        state.ui_pid = None
+        stopped_any = True
+    else:
+        print("BrowserAgent UI: not running (or not started by this launcher)")
+
+    if args.browser:
+        if state.chrome_started_by_us and state.chrome_pid and launcher.process_alive(state.chrome_pid):
+            launcher.stop_pid(state.chrome_pid)
+            print(f"Stopped persistent Chrome (pid {state.chrome_pid})")
+            state.chrome_pid = None
+            stopped_any = True
+        else:
+            print("Persistent Chrome: not running, or not started by this launcher (left untouched)")
+
+    print("\nOllama is left running (BrowserAgent never stops it automatically).")
+    launcher.save_state(paths, state)
+    if not stopped_any:
+        print("\nNothing to stop.")
 
 
 def _batch_dir(config, batch_id: str) -> Path:
@@ -318,6 +468,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--debug", action="store_true", help="show full tracebacks instead of clean error messages")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    p_start = sub.add_parser("start", help="one-command startup: Ollama + persistent Chrome/CDP + UI, then open the UI")
+    p_start.add_argument("--host", default="127.0.0.1", help="UI bind address (never expose beyond localhost)")
+    p_start.add_argument("--port", type=int, default=8765, help="UI port")
+    p_start.add_argument("--cdp-endpoint", default=None, help="override config/default.yaml's browser.cdp_endpoint")
+    p_start.add_argument("--no-open", action="store_true", help="don't auto-open the UI in a browser tab")
+    p_start.set_defaults(func=cmd_start)
+
+    p_stop = sub.add_parser("stop", help="stop BrowserAgent-owned service processes (never a broad process-name kill)")
+    p_stop.add_argument("--browser", action="store_true", help="also stop the dedicated persistent Chrome instance, if BrowserAgent started it")
+    p_stop.set_defaults(func=cmd_stop)
+
     p_ui = sub.add_parser("ui", help="start the local BrowserAgent web console (Section 4-6 of Phase 5B)")
     p_ui.add_argument("--host", default="127.0.0.1", help="bind address (never expose beyond localhost)")
     p_ui.add_argument("--port", type=int, default=8765)
@@ -343,8 +504,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("--cdp-endpoint", default=None)
     p_resume.set_defaults(func=cmd_resume)
 
-    p_status = sub.add_parser("status", help="show a task's current persisted state")
-    p_status.add_argument("task_id")
+    p_status = sub.add_parser(
+        "status",
+        help="show a task's persisted state, or (with no task id) a non-mutating snapshot of Ollama/Chrome/UI health",
+    )
+    p_status.add_argument("task_id", nargs="?", default=None)
+    p_status.add_argument("--host", default="127.0.0.1", help="UI host to probe when task_id is omitted")
+    p_status.add_argument("--port", type=int, default=8765, help="UI port to probe when task_id is omitted")
     p_status.set_defaults(func=cmd_status)
 
     p_browser = sub.add_parser("browser", help="manage the persistent Chromium instance used by cdp_attach mode")
