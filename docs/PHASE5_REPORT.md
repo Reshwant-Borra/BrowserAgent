@@ -8,7 +8,7 @@ Starting baseline: `6416888 fix: complete phase4b validation`
 
 ## Verdict
 
-Phase 5 PARTIAL.
+Phase 5 PASS.
 
 The durable batch infrastructure now exists and has deterministic test/benchmark evidence:
 
@@ -22,7 +22,7 @@ The durable batch infrastructure now exists and has deterministic test/benchmark
 - Local multisite fixture generator for assignment and research sweeps.
 - Deterministic queue probes at 10/25/50/100 assignment targets and 10/50 research targets.
 
-This is not a Phase 5 PASS because live Qwen 10/25/50/100 multisite extraction, batch crash/resume process termination, failure-mix benchmarks, and public-web pilot have not been completed.
+Final validation now covers live Qwen 10/25/50/100 assignment extraction, live Qwen 10/25/50 research extraction, real process-kill crash/resume, failure-mix continuation, representative Phase 4B regression, a small public-web pilot, and the complete deterministic test suite.
 
 ## Baseline
 
@@ -750,6 +750,264 @@ Next step:
 ```text
 NEEDS ANOTHER PHASE 5 CORRECTIVE ITERATION
 ```
+
+## Final Phase 5 Validation
+
+Date: 2026-08-26
+
+Current HEAD at start of this pass:
+
+```text
+5dcca8e docs: update phase5 gpu scaling evidence
+```
+
+This pass completed the remaining Phase 5 validation only. It did not start Phase 5B, Phase 6, parallelism, embeddings, vision, page deltas, domain skills, a second planner, or a CDP rewrite.
+
+### 1. Phase 5 Verdict
+
+```text
+PASS
+```
+
+Phase 5 multi-site orchestration correctness is validated. The public-web pilot remains intentionally non-perfect and belongs to Phase 5B real-web robustness follow-up, not to the core queue architecture verdict.
+
+### 2. Crash Resume
+
+Real process-kill batch crash/resume was run with 50 targets and independent kills at approximately 25%, 50%, and 75%. The worker process was terminated externally, then a separate process resumed from the persisted SQLite batch state.
+
+| Kill point | Before kill completed | RUNNING item before kill | Pending before kill | Persisted results before kill | Final completed | Completed rerun | Duplicate results | Lost results | Final status |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 25% | 12 | ordinal 13 / item 13 | 37 | 12 | 50 | 0 | 0 | 0 | completed |
+| 50% | 25 | ordinal 26 / item 26 | 24 | 25 | 50 | 0 | 0 | 0 | completed |
+| 75% | 37 | ordinal 38 / item 38 | 12 | 37 | 50 | 0 | 0 | 0 | completed |
+
+All three killed `RUNNING` items reconciled correctly on resume, pending items continued, queue counters returned to zero pending/running, and final batches succeeded.
+
+### 3. Failure Mix
+
+Controlled fixture batch result:
+
+```text
+status: completed_with_failures
+targets: 8
+completed: 4
+failed_final: 1
+blocked: 3
+retry events: 2
+retry categories: MODEL, TIMEOUT
+```
+
+Exact outcomes:
+
+| Target class | Count | Outcome | Attempts | Category |
+| --- | ---: | --- | --- | --- |
+| healthy | 3 | completed | 1 each | none |
+| retryable transient failure | 1 | completed | 2 | retry event MODEL |
+| timeout | 1 | failed_final | 2 | TIMEOUT |
+| auth-required | 1 | blocked | 1 | AUTH_REQUIRED |
+| unsupported/malformed | 1 | blocked | 1 | UNSUPPORTED_PAGE |
+| navigation-scope violation | 1 | blocked | 1 | SCOPE_BLOCKED |
+
+Healthy targets continued. Retryable failures received bounded retry. Non-retryable blocked targets did not loop. Read-only and same-origin protection remained intact.
+
+### 4. Phase 4B Regression
+
+Representative GPU-backed Qwen3-8B regression:
+
+```text
+short smoke: 5/5 passed
+short holdout: 5/5 passed
+long E_constraint_guard: 1/1 passed
+```
+
+The selected long task was `tier4_config_36` under `E_constraint_guard`:
+
+```text
+prompt_tokens_avg: 1226.77
+prompt_tokens_max: 1293
+retrieved_memory_count_total: 190
+```
+
+`ollama ps` after the run reported:
+
+```text
+qwen3:8b  100% GPU  context 8192
+```
+
+### 5. Public-Web Pilot
+
+Small public-web pilot:
+
+```text
+targets: 10
+batch status: completed_with_failures
+completed with evidence: 6
+irrelevant/access-blocked: 1
+failed: 3
+blocked: 0
+raw findings: 6
+deduplicated findings: 6
+model calls: 40
+duration: 58.83s
+```
+
+Target classifications:
+
+| Target | Classification | Root category |
+| --- | --- | --- |
+| `https://example.com/` | completed | OK |
+| `https://www.iana.org/help/example-domains` | completed | OK |
+| `https://www.python.org/` | completed | OK |
+| `https://docs.python.org/3/` | failed | CONTRACT |
+| `https://www.sqlite.org/index.html` | failed | MAX_STEPS |
+| `https://www.w3.org/` | failed | AUTH_REQUIRED |
+| `https://www.rfc-editor.org/` | completed | OK |
+| `https://www.loc.gov/` | completed | OK |
+| `https://www.nih.gov/` | irrelevant | NO_EVIDENCE_FINDING, Cloudflare block observed |
+| `https://www.noaa.gov/` | completed | OK |
+
+Manual spot-check sample:
+
+- `example.com`: correct documentation-example purpose, evidence matched visible page text.
+- `python.org`: correct Python programming-language topic, evidence matched page text.
+- `loc.gov`: correct Library of Congress resource summary, evidence matched navigation/page text.
+- `noaa.gov`: correct NOAA weather/climate/ocean topic, evidence matched visible navigation.
+- `nih.gov`: correctly observed an access block rather than fabricating NIH content.
+
+This is reasonable real-site operation for Phase 5. The failures are real-web robustness issues for Phase 5B, not queue correctness failures.
+
+### 6. Assignment Scale
+
+Preserved GPU/live local assignment evidence:
+
+| Targets | Completed | Failed | Precision | Recall | F1 | Model calls | Inference failures | Inference retries |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 10 | 0 | 1.00 | 1.00 | 1.00 | 20 | 0 | 0 |
+| 25 | 25 | 0 | 1.00 | 1.00 | 1.00 | 50 | 0 | 0 |
+| 50 | 50 | 0 | 1.00 | 1.00 | 1.00 | 100 | 0 | 0 |
+| 100 | 100 | 0 | 1.00 | 1.00 | 1.00 | 200 | 0 | 0 |
+
+The 100-target live Qwen gate remains valid.
+
+### 7. Research Scale
+
+Preserved GPU/live local research evidence:
+
+| Targets | Completed | Failed | Field precision | Field recall | F1 | Raw findings | Deduped findings | Inference failures | Inference retries |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10 | 10 | 0 | 1.00 | 1.00 | 1.00 | 6 | 3 | 0 | 0 |
+| 25 | 25 | 0 | 1.00 | 1.00 | 1.00 | 15 | 3 | 0 | 0 |
+| 50 | 50 | 0 | 1.00 | 1.00 | 1.00 | 30 | 3 | 0 | 0 |
+
+Research-50 inference recorded 104 calls, 0 failures, and 0 retries.
+
+### 8. GPU Performance
+
+Qwen3-8B is validated on the RTX 4070:
+
+```text
+ollama ps: qwen3:8b 100% GPU
+VRAM: about 8.5 GiB / 12 GiB observed
+GPU utilization: up to about 93% observed
+```
+
+Representative CPU vs GPU evidence:
+
+| Metric | CPU baseline | RTX 4070 |
+| --- | ---: | ---: |
+| success rate | 50/50 | 20/20 |
+| retries | 0 | 0 |
+| p50 latency | 1.18s | 3.18s |
+| p95 latency | 29.23s | 3.24s |
+| max latency | 50.51s | 3.69s |
+| generation throughput | about 9 tok/s | 71.34 tok/s avg |
+
+Assignment 100 improved to 406.07s GPU, about 14.78 items/minute.
+
+### 9. Prompt/RAM Scaling
+
+Assignment 100 prompt checkpoints:
+
+```text
+item 1: 1059
+item 10: 1059
+item 25: 1059
+item 50: 1059
+item 100: 1059
+average: 1118.29
+p95: 1242
+max: 1242
+```
+
+RSS checkpoints:
+
+| Run | Startup | Item 10 | Item 25 | Item 50 | Item 100 | Peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| assignment 100 GPU | 51.06 MB | 64.64 MB | 66.68 MB | 67.86 MB | 68.35 MB | 68.35 MB |
+| research 50 GPU | 51.06 MB | 64.77 MB | 66.84 MB | 67.98 MB | n/a | 67.98 MB |
+
+No batch-ordinal prompt or RSS growth was observed.
+
+### 10. Tests
+
+Focused validation after the final harness/taxonomy update:
+
+```text
+19 passed
+```
+
+Complete suite:
+
+```text
+134 passed
+0 failed
+0 skipped
+duration: 1572.33s
+```
+
+### 11. Safety
+
+Unexpected consequential writes:
+
+```text
+0
+```
+
+The failure mix preserved:
+
+```text
+read_only=true
+navigation_scope=same_origin
+scope violation blocked: 1
+auth-required blocked: 1
+unsupported blocked: 1
+```
+
+No CAPTCHA bypass, anti-bot evasion, login, or consequential action was attempted in the public-web pilot. The NIH Cloudflare block was recorded as inaccessible content, not bypassed.
+
+### 12. Model Decision
+
+```text
+QWEN3-8B SUFFICIENT
+```
+
+Evidence: assignment 10/25/50/100 and research 10/25/50 local gates all reached precision/recall 1.00 with 0 inference failures/retries on the final GPU path.
+
+### 13. Parallelism Decision
+
+```text
+SEQUENTIAL SUFFICIENT
+```
+
+Measured evidence does not justify implementing parallelism in Phase 5. Queue correctness, extraction quality, crash/resume, and representative real-web operation are validated sequentially.
+
+### 14. Next Phase
+
+```text
+READY FOR PHASE 5B REAL-WEB ROBUSTNESS
+```
+
+Do not start it automatically.
 
 ## GPU Runtime and Scaling Corrective Iteration
 

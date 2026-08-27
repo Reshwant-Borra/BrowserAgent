@@ -98,6 +98,7 @@ def _variant_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tasks-file", default=str(ROOT / "benchmarks" / "long_horizon_tasks.yaml"))
+    parser.add_argument("--task-id", default=None, help="run only one task id from the tasks file")
     parser.add_argument("--trials", type=int, default=1)
     parser.add_argument("--output-dir", default=str(ROOT / "runtime" / "benchmark_runs" / ("phase4_" + time.strftime("%Y%m%d_%H%M%S"))))
     parser.add_argument("--variant", choices=[*VARIANTS.keys(), "all"], default="all")
@@ -107,6 +108,10 @@ async def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     with open(args.tasks_file, "r", encoding="utf-8") as f:
         tasks = yaml.safe_load(f)["tasks"]
+    if args.task_id:
+        tasks = [task for task in tasks if task["id"] == args.task_id]
+        if not tasks:
+            raise ValueError(f"task id not found: {args.task_id}")
 
     selected = VARIANTS.items() if args.variant == "all" else [(args.variant, VARIANTS[args.variant])]
     server, base_url = _start_fixture_server()
