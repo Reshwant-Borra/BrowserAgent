@@ -342,51 +342,57 @@ class BatchOrchestrator:
             f"{name}: {description}" for name, description in self.result_contract.field_definitions.items()
         )
         contract_details = f"\nRequested field meanings: {field_defs}" if field_defs else ""
-        result_shape = self._result_shape()
+        finding_guide = self._finding_field_guide()
+        intro = self._target_intro(item, target)
         return (
-            f"Open this target page and determine whether it contains information relevant to the batch goal.\n"
+            f"{intro}\n"
             f"Batch goal: {self.store.get_job(self.batch_id)['goal']}\n"
             f"Target: {target}\n"
             f"Required result contract: {self.result_contract.description}\n"
             f"Required fields: {fields}.{contract_details}\n"
-            "When finished, put only compact JSON in the finish result. "
-            f"Use this JSON shape exactly: {result_shape} "
-            "Use an empty findings array when nothing relevant is present. "
+            "When finished, call finish with a short one-sentence plain-text `result` summary, and fill in "
+            "the structured `structured_result` field directly (relevant, summary, findings) — it is a real "
+            "typed field, never write JSON text into `result`. "
+            f"{finding_guide} "
+            "Leave structured_result.findings empty when nothing relevant is present. "
             "Do not inspect unrelated websites unless navigation within this target site is needed."
         )
 
-    def _result_shape(self) -> str:
+    def _target_intro(self, item: dict[str, Any], target: str) -> str:
+        payload = _parse_target_payload(item)
+        if payload.get("type") == "open_tab":
+            return (
+                f"This is an already-open browser tab at {target} (one of several tabs you were asked to "
+                "look through) — it is already the active page. Do not navigate away from it or open a new "
+                "tab; read its current content directly and determine whether it contains information "
+                "relevant to the batch goal."
+            )
+        return "Open this target page and determine whether it contains information relevant to the batch goal."
+
+    def _finding_field_guide(self) -> str:
         if self.result_contract.name == "assignment":
             return (
-                "{\"relevant\": true|false, \"summary\": \"...\", \"findings\": ["
-                "{\"type\": \"assignment\", \"course\": \"...\", \"title\": \"...\", "
-                "\"due_date\": \"...\", \"status\": \"upcoming|current_incomplete|completed|closed|past_archived|unknown\", "
-                "\"actionable\": true|false, \"source_url\": \"...\", "
-                "\"evidence\": \"short exact page excerpt proving the status\"}]}. "
-                "Report only assignments that still require action as actionable=true. "
-                "Do not mark completed, submitted, graded, closed, archived, or historical assignments actionable. "
-                "If status is not reliable, use status=unknown and actionable=false."
+                "Each finding should set: type=\"assignment\", course, title, due_date, "
+                "status (upcoming|current_incomplete|completed|closed|past_archived|unknown), "
+                "actionable (true only if it still requires action), source_url, and evidence (a short exact "
+                "page excerpt proving the status). Do not mark completed, submitted, graded, closed, "
+                "archived, or historical assignments actionable. If status is not reliable, use "
+                "status=unknown and actionable=false."
             )
         if self.result_contract.name == "research":
-            fields = self.result_contract.required_fields
-            field_slots = ", ".join(
-                f"\"{field}\": \"found|not_found|unresolved\""
-                for field in fields
-                if field not in {"relevant", "source", "source_url", "evidence"}
+            fields = ", ".join(
+                f for f in self.result_contract.required_fields
+                if f not in {"relevant", "source", "source_url", "evidence"}
             )
             return (
-                "{\"relevant\": true|false, \"summary\": \"...\", "
-                f"\"fields\": {{{field_slots}}}, "
-                "\"findings\": [{\"field\": \"requested_field_name\", \"value\": \"...\", "
-                "\"source_url\": \"...\", \"evidence\": \"short exact page excerpt\"}]}. "
-                "For each requested field, set fields[field] to found, not_found, or unresolved. "
-                "For found fields, add exactly one matching finding with field, value, source_url, and evidence. "
-                "Do not output generic labels such as Relevant source as facts."
+                f"Each finding should set: field (one of the requested field names: {fields}), value, "
+                "source_url, and evidence (a short exact page excerpt). Add at most one finding per "
+                "requested field that was actually found on this page. Do not output generic labels such "
+                "as 'Relevant source' as facts."
             )
         return (
-            "{\"relevant\": true|false, \"summary\": \"...\", \"findings\": ["
-            "{\"type\": \"...\", \"title\": \"...\", \"value\": \"...\", "
-            "\"source_url\": \"...\", \"evidence\": \"short exact page excerpt\"}]}"
+            "Each finding should set: type, title, value, source_url, and evidence (a short exact page "
+            "excerpt)."
         )
 
     def _success_criteria(self) -> list[str]:
@@ -398,12 +404,14 @@ class BatchOrchestrator:
         return None
 
     def _runtime_policy(self, item: dict[str, Any]) -> BatchRuntimePolicy:
+        payload = _parse_target_payload(item)
         return BatchRuntimePolicy(
             target_url=item["target"],
             read_only=self.policy.read_only,
             navigation_scope=NavigationScopePolicy(self.policy.navigation_scope.value),
             batch_id=self.batch_id,
             work_item_id=int(item["id"]),
+            is_open_tab=payload.get("type") == "open_tab",
         )
 
 
@@ -424,6 +432,17 @@ def _requires_structured_result_json(contract: ResultContract) -> bool:
     return contract.name != "generic" or bool(contract.required_fields) or bool(contract.field_definitions)
 
 
+def _parse_target_payload(item: dict[str, Any]) -> dict[str, Any]:
+    raw = item.get("target_payload")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
 def _extract_structured_result(
     events: list[Event],
     target: str,
@@ -434,20 +453,27 @@ def _extract_structured_result(
     observations = [e for e in events if e.type == EventType.OBSERVATION]
     final_url = completed.payload.get("final_url") if completed else (observations[-1].payload.get("url") if observations else target)
     result_text = completed.payload.get("result", "") if completed else ""
+    typed_structured = completed.payload.get("structured_result") if completed else None
     structured: dict[str, Any]
-    try:
-        parsed = json.loads(result_text)
-        if require_json and not isinstance(parsed, dict):
-            raise StructuredResultContractError(
-                f"structured batch result for task {task_id} was JSON but not an object"
-            )
-        structured = parsed if isinstance(parsed, dict) else {"relevant": bool(parsed), "findings": []}
-    except json.JSONDecodeError as exc:
-        if require_json:
-            raise StructuredResultContractError(
-                f"structured batch result for task {task_id} was not valid JSON: {exc.msg}"
-            ) from exc
-        structured = {"relevant": bool(result_text.strip()), "summary": result_text, "findings": []}
+    if isinstance(typed_structured, dict):
+        # The model filled the typed FinishAction.structured_result field directly (a real,
+        # grammar-constrained object/array) — no JSON-in-a-string to re-parse, and therefore
+        # no "not valid JSON" failure mode possible for this path at all.
+        structured = dict(typed_structured)
+    else:
+        try:
+            parsed = json.loads(result_text)
+            if require_json and not isinstance(parsed, dict):
+                raise StructuredResultContractError(
+                    f"structured batch result for task {task_id} was JSON but not an object"
+                )
+            structured = parsed if isinstance(parsed, dict) else {"relevant": bool(parsed), "findings": []}
+        except json.JSONDecodeError as exc:
+            if require_json:
+                raise StructuredResultContractError(
+                    f"structured batch result for task {task_id} was not valid JSON: {exc.msg}"
+                ) from exc
+            structured = {"relevant": bool(result_text.strip()), "summary": result_text, "findings": []}
     structured.setdefault("findings", [])
     summary = structured.get("summary") or result_text or "Completed without a textual summary."
     evidence_text = completed.payload.get("final_text_excerpt", "") if completed else ""

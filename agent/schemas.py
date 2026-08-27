@@ -134,6 +134,36 @@ class OutputItem(_StrictAction):
     evidence: Optional[str] = None
 
 
+class FinishFinding(_StrictAction):
+    """One structured finding a batch child discovered. A generic superset of every result
+    contract's finding shape (generic/assignment/research) — each field optional so the
+    model only fills the ones its contract actually asked for. Same anti-fragility reasoning
+    as OutputItem above: a real JSON field the grammar constrains directly, never a value
+    the model has to hand-serialize into a string."""
+
+    type: Optional[str] = None
+    field: Optional[str] = None
+    course: Optional[str] = None
+    title: Optional[str] = None
+    due_date: Optional[str] = None
+    status: Optional[str] = None
+    actionable: Optional[bool] = None
+    value: Optional[str] = None
+    source_url: Optional[str] = None
+    evidence: Optional[str] = None
+
+
+class FinishStructuredResult(_StrictAction):
+    """Typed replacement for a batch child writing `{...json text...}` into `result` (a
+    plain GBNF string) and having the orchestrator re-parse it — the exact fragility that
+    produced repeated 'not valid JSON' CONTRACT failures with Qwen. Optional and additive:
+    single-task/workflow finish calls never mention this field and are unaffected."""
+
+    relevant: Optional[bool] = None
+    summary: Optional[str] = None
+    findings: list[FinishFinding] = Field(default_factory=list)
+
+
 class FinishAction(_StrictAction):
     action: Literal["finish"]
     result: str
@@ -143,6 +173,7 @@ class FinishAction(_StrictAction):
     # confirmed" downstream, never silently coerced to True.
     verified: Optional[bool] = None
     outputs: list[OutputItem] = Field(default_factory=list)
+    structured_result: Optional[FinishStructuredResult] = None
 
 
 ModelAction = Annotated[

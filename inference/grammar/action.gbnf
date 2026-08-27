@@ -22,14 +22,37 @@ wait-for-text ::= "\"for_text\"" ws ":" ws string
 wait-url ::= "\"url_contains\"" ws ":" ws string
 wait-ms ::= "\"ms\"" ws ":" ws integer
 
-# Optional, additive finish fields (workflow cross-site fact passing): repeatable so either
-# or both may appear in any order, same pattern as wait-field above but generalized.
-finish-field ::= ws "," ws (finish-verified | finish-outputs)
+# Optional, additive finish fields (workflow cross-site fact passing / batch structured
+# results): repeatable so any of these may appear in any order, same pattern generalized.
+finish-field ::= ws "," ws (finish-verified | finish-outputs | finish-structured-result)
 finish-verified ::= "\"verified\"" ws ":" ws boolean
 finish-outputs ::= "\"outputs\"" ws ":" ws output-array
 output-array ::= "[" ws (output-item (ws "," ws output-item)*)? ws "]"
 output-item ::= "{" ws "\"key\"" ws ":" ws string ws "," ws "\"value\"" ws ":" ws string output-evidence? ws "}"
 output-evidence ::= ws "," ws "\"evidence\"" ws ":" ws string
+
+# Typed batch structured result (replaces asking the model to hand-serialize JSON text into
+# the `result` string — see agent/schemas.py::FinishStructuredResult for why). A real,
+# grammar-constrained object/array, same anti-fragility shape as outputs above.
+finish-structured-result ::= "\"structured_result\"" ws ":" ws "{" ws structured-result-body ws "}"
+structured-result-body ::= structured-result-field (ws "," ws structured-result-field)*
+structured-result-field ::= sr-relevant | sr-summary | sr-findings
+sr-relevant ::= "\"relevant\"" ws ":" ws boolean
+sr-summary ::= "\"summary\"" ws ":" ws string
+sr-findings ::= "\"findings\"" ws ":" ws finding-array
+finding-array ::= "[" ws (finding-item (ws "," ws finding-item)*)? ws "]"
+finding-item ::= "{" ws (finding-field (ws "," ws finding-field)*)? ws "}"
+finding-field ::= finding-type | finding-field-name | finding-course | finding-title | finding-due-date | finding-status | finding-actionable | finding-value | finding-source-url | finding-evidence
+finding-type ::= "\"type\"" ws ":" ws string
+finding-field-name ::= "\"field\"" ws ":" ws string
+finding-course ::= "\"course\"" ws ":" ws string
+finding-title ::= "\"title\"" ws ":" ws string
+finding-due-date ::= "\"due_date\"" ws ":" ws string
+finding-status ::= "\"status\"" ws ":" ws string
+finding-actionable ::= "\"actionable\"" ws ":" ws boolean
+finding-value ::= "\"value\"" ws ":" ws string
+finding-source-url ::= "\"source_url\"" ws ":" ws string
+finding-evidence ::= "\"evidence\"" ws ":" ws string
 
 direction ::= "\"up\"" | "\"down\""
 

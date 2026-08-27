@@ -95,6 +95,8 @@ def normalize_model_action(action: ModelAction) -> ModelDecision:
             params["verified"] = action.verified
         if action.outputs:
             params["outputs"] = [item.model_dump() for item in action.outputs]
+        if action.structured_result is not None:
+            params["structured_result"] = action.structured_result.model_dump(exclude_none=True)
         return ModelDecision(action=ActionType.FINISH, params=params, verification_mode="action_default")
     raise DecisionValidationError(ValidationErrorKind.SCHEMA_INVALID, f"unsupported action: {action!r}")
 

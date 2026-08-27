@@ -57,6 +57,10 @@ class ResolvedResource:
     requirement_index: int
     urls: list[str]
     labels: dict[str, str] = field(default_factory=dict)  # url -> title, UI/debug only
+    # url -> canonical open-tab id, only ever populated for OPEN_TABS resolutions. This is
+    # what lets the plan translator (router/policy.py) preserve "this is an existing browser
+    # tab" identity instead of collapsing the resolved tab down to a bare URL.
+    tab_ids: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -131,6 +135,7 @@ class ResourceResolver:
             requirement_index,
             [t.url for t in selected],
             labels={t.url: t.title for t in selected},
+            tab_ids={t.url: t.id for t in selected},
         )
 
 

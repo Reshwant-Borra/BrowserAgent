@@ -53,6 +53,32 @@ def test_bad_confidence_raises():
     assert exc.value.kind == ValidationErrorKind.SCHEMA_INVALID
 
 
+def test_finish_action_plain_result_parses():
+    raw = '{"action": "finish", "result": "Page summarized."}'
+    decision = parse_model_output(raw)
+    assert decision.action.value == "finish"
+    assert decision.params["result"] == "Page summarized."
+    assert "structured_result" not in decision.params
+
+
+def test_finish_action_typed_structured_result_parses_without_json_in_string():
+    """The fix for the batch 'not valid JSON' failures: structured_result is a real,
+    schema-constrained field — the model never has to hand-serialize JSON text into the
+    `result` string, so there is no second json.loads() to fail."""
+    raw = (
+        '{"action": "finish", "result": "IANA is the registry for internet numbers.", '
+        '"structured_result": {"relevant": true, "summary": "IANA is the registry.", '
+        '"findings": [{"field": "topic", "value": "registry", "source_url": "https://www.iana.org/", '
+        '"evidence": "Internet Assigned Numbers Authority"}]}}'
+    )
+    decision = parse_model_output(raw)
+    assert decision.action.value == "finish"
+    structured = decision.params["structured_result"]
+    assert structured["relevant"] is True
+    assert structured["findings"][0]["field"] == "topic"
+    assert structured["findings"][0]["evidence"] == "Internet Assigned Numbers Authority"
+
+
 def test_reason_is_capped():
     raw = ('{"action": "click", "target": 1, "params": {}, "expected_result": {}, '
            '"confidence": 0.9, "reason": "' + ("x" * 500) + '"}')

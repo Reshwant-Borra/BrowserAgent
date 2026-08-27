@@ -21,6 +21,13 @@ class BatchRuntimePolicy:
     navigation_scope: NavigationScopePolicy = NavigationScopePolicy.SAME_ORIGIN
     batch_id: str | None = None
     work_item_id: int | None = None
+    # True only for a work item whose target is an already-open browser tab the semantic
+    # resolver picked out (not a plain URL to navigate to). AgentLoop uses this to tell
+    # PlaywrightBackend to attach to that exact tab (by matching target_url against the
+    # attached browser's open pages) instead of the default "most recently active tab"
+    # heuristic, which is what let one batch child's navigation leak onto a sibling item's
+    # tab in cdp_attach mode.
+    is_open_tab: bool = False
 
 
 @dataclass(frozen=True)
