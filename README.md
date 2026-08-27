@@ -6,6 +6,20 @@ a compact-observation decision loop, deterministic verification/recovery, and ev
 crash-safe state — driven by Qwen3-8B running locally via Ollama or llama.cpp, with
 Playwright as the browser backend.
 
+## Quick Start
+
+Once installed (see below) and with Ollama running `qwen3:8b`:
+
+```powershell
+browser-agent ui
+```
+
+Then open the printed URL (default `http://127.0.0.1:8765`), type a task in plain English —
+e.g. "Check these URLs and tell me which assignments I still have to do: https://..." — and
+press **Run**. See [`docs/USING_BROWSERAGENT.md`](docs/USING_BROWSERAGENT.md) for the full
+walkthrough (approvals, manual login, stop/resume). The CLI commands below remain available
+for scripted/power-user workflows.
+
 ## Requirements
 
 - Python 3.11+
