@@ -193,6 +193,78 @@ def test_model_fallback_validates_against_schema():
     assert decision.targets == ["http://a.test"]
 
 
+# ---- router bug fixes (Findings 7 & 8 from real-UI testing) --------------
+
+def test_ordered_workflow_steps_have_isolated_objectives():
+    """Finding 7: the deterministic router used to assign the *entire* raw prompt as every
+    step's objective, so step 1 (site A) would also be told to do step 2's (site B's) work.
+    Each step's objective must mention only its own instruction."""
+    prompt = (
+        "Go to https://a.test and set the display mode to Compact. "
+        "Then go to https://b.test and enable the weekly summary."
+    )
+    decision = try_deterministic_route(prompt)
+    assert decision is not None
+    assert decision.task_type == TaskType.ORDERED_WORKFLOW
+    step_a, step_b = decision.workflow_steps
+    assert "compact" in step_a.objective.lower()
+    assert "weekly summary" not in step_a.objective.lower()
+    assert "weekly summary" in step_b.objective.lower()
+    assert "compact" not in step_b.objective.lower()
+
+
+def test_ordered_workflow_steps_isolated_when_action_precedes_target():
+    """Same isolation guarantee, but for the "change X on <url>" phrasing where the verb
+    comes before the target instead of after it."""
+    prompt = (
+        "First change the theme on https://a.test, then toggle alerts on https://b.test, "
+        "finally verify status on https://c.test."
+    )
+    decision = try_deterministic_route(prompt)
+    assert decision is not None
+    step_a, step_b, step_c = decision.workflow_steps
+    assert "theme" in step_a.objective.lower() and "alerts" not in step_a.objective.lower()
+    assert "alerts" in step_b.objective.lower() and "theme" not in step_b.objective.lower()
+    assert "status" in step_c.objective.lower() and "alerts" not in step_c.objective.lower()
+
+
+def test_ordered_workflow_cross_site_fact_pass_routes_and_isolates():
+    """Finding 8: 'enter' was missing from the action-verb set, so this fell through to
+    multisite_sweep instead of ordered_workflow. It must also isolate step objectives."""
+    prompt = "Find the code on https://a.test, then enter it on https://b.test."
+    decision = try_deterministic_route(prompt)
+    assert decision is not None
+    assert decision.task_type == TaskType.ORDERED_WORKFLOW
+    step_a, step_b = decision.workflow_steps
+    assert "find" in step_a.objective.lower()
+    assert "enter" in step_b.objective.lower()
+
+
+def test_ordered_workflow_type_then_select_routes_correctly():
+    prompt = "Type the username on https://a.test then select the role on https://b.test."
+    decision = try_deterministic_route(prompt)
+    assert decision is not None
+    assert decision.task_type == TaskType.ORDERED_WORKFLOW
+    assert len(decision.workflow_steps) == 2
+
+
+def test_check_multiple_sites_for_assignments_is_sweep_not_workflow():
+    """'check' + 'and' alone (no sequence marker, no action verb) must stay a sweep."""
+    prompt = "Check https://a.test and https://b.test for assignments."
+    decision = try_deterministic_route(prompt)
+    assert decision is not None
+    assert decision.task_type == TaskType.MULTISITE_SWEEP
+
+
+def test_research_multiple_sites_is_not_action_workflow():
+    """Broadening the action-verb set must not turn a research-style multi-URL prompt into
+    an ordered_workflow just because it mentions multiple targets."""
+    prompt = "Research https://a.test and https://b.test and summarize what they say."
+    decision = try_deterministic_route(prompt)
+    assert decision is not None
+    assert decision.task_type in (TaskType.MULTISITE_SWEEP, TaskType.RESEARCH)
+
+
 def test_model_fallback_drops_hallucinated_targets():
     """Section 12: the router must never invent extra websites/targets."""
     client = _FakeModelClient({
