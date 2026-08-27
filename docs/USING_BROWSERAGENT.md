@@ -6,6 +6,14 @@ English and BrowserAgent figures out how to run it.
 
 ## Start it
 
+The recommended everyday path uses a **persistent browser**: a Chromium window BrowserAgent
+attaches to instead of launching its own throwaway one. You log in to sites once, and that
+session (cookies, etc.) survives even after you close and reopen BrowserAgent — see
+"Persistent browser (recommended)" below.
+
+For quick one-off testing, or if you don't want a separate persistent browser window,
+BrowserAgent can also just launch and manage its own Chromium (`launch` mode, the default):
+
 ```powershell
 browser-agent ui
 ```
@@ -19,6 +27,34 @@ To pick a different port, or skip auto-opening a browser tab:
 ```powershell
 browser-agent ui --port 9000 --no-browser
 ```
+
+### Persistent browser (recommended)
+
+Start a dedicated Chromium once, with remote debugging enabled and its own profile (never
+your everyday Chrome profile):
+
+```powershell
+browser-agent browser start
+```
+
+Log in to any sites you'll need (school portal, email, etc.) in that window — normal manual
+login, BrowserAgent never sees or stores your password. Then start the UI pointed at it:
+
+```powershell
+browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222
+```
+
+Now BrowserAgent's UI page shows a small **Browser: Connected** indicator. Close the UI
+(Ctrl+C) any time — the Chromium window, your open tabs, and your logged-in sessions stay
+exactly as they were, since BrowserAgent only disconnects, it never closes them. Re-run the
+same `browser-agent ui --browser-mode cdp_attach ...` command later to reattach to the same
+browser and pick up where you left off. If the persistent browser isn't running when you
+start the UI this way, the status indicator shows **Browser: Not connected** with the exact
+`browser-agent browser start` command to fix it.
+
+Remote debugging is bound to `127.0.0.1` only — never expose it to a LAN or the public
+internet; anyone who can reach that port has full control of the browser, including any
+logged-in sessions in it.
 
 ## Type a task
 
@@ -87,6 +123,8 @@ Login required. Please complete login in the browser, then click Continue.
 A visible browser window is open on that page (browser visibility is on by default) — log in
 there normally, then click **Continue** in the BrowserAgent tab. The task picks up from
 there using the same browser session, so you only have to log in once per site per session.
+In persistent-browser (`cdp_attach`) mode that login also survives BrowserAgent restarts,
+since it's stored in the persistent Chromium profile, not anything BrowserAgent manages.
 
 ## Stopping and resuming
 

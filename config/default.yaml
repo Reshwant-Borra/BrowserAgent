@@ -21,6 +21,9 @@ browser:
   user_data_dir: "./runtime/tasks"   # actual profile: {user_data_dir}/{task_id}/browser_profile
   action_timeout_ms: 10000
   interactive_approval: true          # prompt on CLI before CONSEQUENTIAL actions
+  mode: "launch"                      # "launch" or "cdp_attach" — default stays "launch" for
+                                       # tests/fixtures; everyday use may set "cdp_attach"
+  cdp_endpoint: "http://127.0.0.1:9222"  # only used when mode: "cdp_attach"
 
 context:
   max_page_chars: 3000

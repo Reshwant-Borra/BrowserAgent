@@ -40,6 +40,30 @@ def create_app(config: AppConfig) -> FastAPI:
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.get("/api/browser/status")
+    async def browser_status() -> dict[str, Any]:
+        """Section 20: small connection indicator, not a dashboard. Only meaningful in
+        cdp_attach mode — launch mode always reports connected since AgentLoop starts its own
+        Chromium on demand and there's nothing external to check ahead of time."""
+        if config.browser.mode != "cdp_attach":
+            return {"mode": config.browser.mode, "connected": True}
+        import httpx
+
+        endpoint = config.browser.cdp_endpoint.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                resp = await client.get(f"{endpoint}/json/version")
+                resp.raise_for_status()
+            return {"mode": "cdp_attach", "connected": True, "endpoint": endpoint}
+        except Exception:
+            return {
+                "mode": "cdp_attach", "connected": False, "endpoint": endpoint,
+                "message": (
+                    f"Persistent browser is not running at {endpoint}. "
+                    "Start it with: browser-agent browser start"
+                ),
+            }
+
     @app.post("/api/jobs")
     async def submit_job(req: SubmitRequest) -> dict[str, str]:
         if not req.prompt or not req.prompt.strip():
