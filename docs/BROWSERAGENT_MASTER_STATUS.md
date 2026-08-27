@@ -538,3 +538,77 @@ action-decision calls). Resource resolution adds one more call only for `open_ta
 requirements (~1.5-2.5s tab-selection call) — negligible next to actual browser
 observe/act/verify cycles (multi-second each). Deterministic fast-path prompts (literal URLs)
 pay zero planner overhead, unchanged from before this pass.
+
+## 23. Production Readiness — Final Summary (Post-Merge)
+
+`feature/semantic-task-planner` merged into `main` with `--no-ff` (merge commit `054048d`,
+history preserved, not squashed), tag `browseragent-v1-semantic-ready`. This section is the
+one-stop summary; Section 22 above has the full narrative and evidence.
+
+**Semantic planner architecture**: `router/semantic_planner.py::plan_task()` — one
+schema-constrained Qwen3-8B call turns a plain-English prompt into a validated `TaskPlan`
+(goal, intent, execution_shape, resource_requirements, steps, constraints). The plan proposes
+*what the user means*; it has no field anywhere capable of holding a URL, so hallucination is
+structurally impossible at this layer.
+
+**Resource resolver**: `router/resources.py::ResourceResolver` — the sole deterministic
+authority on what actually exists. `explicit_urls` resolves via the pre-existing
+`extract_urls()`; `open_tabs` and `current_page` are covered next; `web_discovery` hands off
+untouched to the existing `research/discovery.py` pipeline.
+
+**Open-tab semantic selection**: `browser/tabs.py::list_open_tabs()` enumerates the attached
+browser's real tabs via the CDP HTTP API; `router/resources.py::select_relevant_tabs()` asks
+Qwen to choose relevant tabs by **id only** (never a URL) against the plan's description —
+same anti-hallucination shape as `research/discovery.py`'s existing link selection.
+
+**Current-page resolution**: an empty (or `current_page`-only) resource list translates to
+`RouterDecision(targets=[])`, which `AgentLoop` already correctly treats as "act on whatever
+page is already attached" — no new mechanism required.
+
+**NEEDS_INPUT clarification/resume**: an unresolvable resource produces
+`router.policy.NeedsInput` instead of a hard failure. `ui/jobs.py` persists a
+`waiting_for_input` job state with the exact missing-resource question, waits for the user's
+answer via `POST /api/jobs/{id}/clarify`, and re-routes with the answer appended to the
+original prompt (`route_with_answer()`) — bounded at `MAX_CLARIFICATION_ROUNDS = 3`.
+
+**Dynamic replanning**: `router/replanner.py::decide_replan()` — one bounded, schema-
+constrained call after a `mixed`-intent sweep finishes with findings (never a loop), selecting
+a follow-up target by finding-id and running it through the existing `_run_single()`.
+
+**Benchmark results (128 prompts: 104 tuned + 24 holdout, real Qwen3-8B/Ollama)**:
+- Overall planning accuracy: **98.4%**
+- Holdout accuracy: **100%**
+- Schema validity: **100%**
+- Hallucinated resources: **0**
+- Residual known gap: **~1/13 open-tab semantic-selection miss rate**, deliberately tuned
+  toward the safer failure direction — see the principle below.
+
+**Live end-to-end results, real Chrome + real Ollama, not mocked**:
+- Exact course-pages test: **PASS** — `"Check all my course pages and combine everything I
+  still need to do this week"` resolved to exactly the real course tabs, zero distractors,
+  zero invented URLs, no "no targets found" failure.
+- URL-free cross-site test: **PASS** — `"Find the project code on the page where it's listed,
+  then put that same code into the configuration page and verify it"` resolved both steps
+  correctly from tab content alone (no URLs, no "Site A/B" phrasing), extracted and verified
+  code `AX-42` end to end.
+- Research routing: **PASS** — routed to `requires_discovery=True` and invoked the existing
+  discovery pipeline correctly; full open-web search success not required to validate this
+  (bot-detection risk is a pre-existing, documented limitation).
+
+**Governing principle**: when a resource reference can't be resolved with confidence, the
+system asks rather than guesses. Every tuning decision made during this pass (the sweep-vs-
+ordered_workflow fix, the open-tab selection retune) moved failure modes in the direction of
+"ask the user" over "silently pick something that might be wrong" — this is why the residual
+open-tab miss rate above manifests as an occasional extra clarification question, not a wrong
+action taken on the wrong page.
+
+**Post-merge regression**: 251/251 deterministic tests passed (217 `tests/unit` incl. 31 new
+semantic-planner tests + 76 router/planner-specific; 6 `test_cdp_attach.py`; 9 `test_ui_app.py`;
+19 phase1-4 Playwright integration tests). Zero failures, zero regressions.
+
+**Production configuration confirmed**: `config/default.yaml`'s `routing.mode: "hybrid"` —
+deterministic fast paths first, semantic planner for everything else, legacy Qwen router only
+as a last-resort fallback if planning itself errors.
+
+BrowserAgent is ready for real-world use. Future changes should be driven by failures observed
+during actual tasks, not further speculative architecture work.
