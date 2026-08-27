@@ -16,13 +16,17 @@ browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222
 ```
 
 Then open the printed URL (default `http://127.0.0.1:8765`), type a task in plain English —
-e.g. "Check these URLs and tell me which assignments I still have to do: https://..." — and
-press **Run**. The persistent-browser Chromium window stays open (and your logins with it)
-across BrowserAgent restarts. For quick one-off testing, `browser-agent ui` alone launches
-and manages its own throwaway browser instead. See
+e.g. "Check these URLs and tell me which assignments I still have to do: https://..." or,
+just as well, "Check all my course pages and tell me what I still need to do this week" with
+no URLs at all — and press **Run**. A semantic planner + deterministic resource resolver
+(see [`docs/SEMANTIC_PLANNER.md`](docs/SEMANTIC_PLANNER.md)) figures out what you mean and
+resolves it against your actually-open tabs; if it can't find a safe match it asks rather than
+failing. The persistent-browser Chromium window stays open (and your logins with it) across
+BrowserAgent restarts. For quick one-off testing, `browser-agent ui` alone launches and
+manages its own throwaway browser instead. See
 [`docs/USING_BROWSERAGENT.md`](docs/USING_BROWSERAGENT.md) for the full walkthrough
-(approvals, manual login, stop/resume). The CLI commands below remain available for
-scripted/power-user workflows.
+(approvals, manual login, stop/resume, clarification). The CLI commands below remain
+available for scripted/power-user workflows.
 
 ## Requirements
 

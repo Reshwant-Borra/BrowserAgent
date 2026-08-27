@@ -27,6 +27,10 @@ class ApproveRequest(BaseModel):
     approved: bool
 
 
+class ClarifyRequest(BaseModel):
+    text: str
+
+
 def create_app(config: AppConfig) -> FastAPI:
     runtime_dir = Path(config.storage.runtime_dir)
     store = UIJobStore(runtime_dir / "ui" / "jobs.db")
@@ -96,6 +100,15 @@ def create_app(config: AppConfig) -> FastAPI:
         ok = runner.approve(job_id, req.approved)
         if not ok:
             raise HTTPException(409, "no pending approval for this job")
+        return {"ok": True}
+
+    @app.post("/api/jobs/{job_id}/clarify")
+    async def clarify_job(job_id: str, req: ClarifyRequest) -> dict[str, bool]:
+        if not req.text or not req.text.strip():
+            raise HTTPException(400, "clarification text is empty")
+        ok = runner.clarify(job_id, req.text)
+        if not ok:
+            raise HTTPException(409, "job is not waiting for input")
         return {"ok": True}
 
     @app.post("/api/jobs/{job_id}/login-continue")

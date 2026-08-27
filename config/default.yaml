@@ -57,3 +57,6 @@ logging:
   level: "INFO"
   dir: "./runtime/logs"
   redact_secrets: true
+
+routing:
+  mode: "hybrid"  # "legacy" | "semantic" | "hybrid" — see router/policy.py

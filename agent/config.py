@@ -88,6 +88,16 @@ class LoggingConfig:
 
 
 @dataclass
+class RoutingConfig:
+    """See router/policy.py's module docstring for what each mode does. Default is "hybrid":
+    deterministic fast paths stay an optimization, everything else goes through the semantic
+    planner, with the old keyword/regex-adjacent Qwen router kept only as a last-resort
+    fallback if planning itself fails (Section 32 of the semantic planner task)."""
+
+    mode: str = "hybrid"  # "legacy" | "semantic" | "hybrid"
+
+
+@dataclass
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
@@ -95,6 +105,7 @@ class AppConfig:
     recovery: RecoveryConfig = field(default_factory=RecoveryConfig)
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    routing: RoutingConfig = field(default_factory=RoutingConfig)
 
 
 def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
@@ -154,6 +165,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         recovery=_coerce(RecoveryConfig, raw.get("recovery", {})),
         storage=_coerce(StorageConfig, raw.get("storage", {})),
         logging=_coerce(LoggingConfig, raw.get("logging", {})),
+        routing=_coerce(RoutingConfig, raw.get("routing", {})),
     )
     _resolve_runtime_paths(config)
     return config

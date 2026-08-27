@@ -36,13 +36,14 @@
   .dot.running { background: #d29922; animation: pulse 1.4s infinite; }
   .dot.completed { background: #3fb950; }
   .dot.failed, .dot.stopped { background: #f85149; }
-  .dot.waiting_for_approval, .dot.waiting_for_login { background: #58a6ff; }
+  .dot.waiting_for_approval, .dot.waiting_for_login, .dot.waiting_for_input { background: #58a6ff; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   .activity { color: #8b949e; font-size: 13px; margin-top: 6px; }
-  .approval-box, .login-box {
+  .approval-box, .login-box, .clarify-box {
     margin-top: 14px; padding: 12px 14px; border-radius: 8px; background: #1c2333;
     border: 1px solid #58a6ff;
   }
+  .clarify-box textarea { min-height: 60px; margin-top: 8px; font-size: 14px; }
   .result-box { margin-top: 24px; padding: 16px; border-radius: 10px; background: #161b22; border: 1px solid #30363d; }
   pre { white-space: pre-wrap; word-break: break-word; font-size: 13px; background: #0d1117; padding: 12px; border-radius: 8px; }
   details { margin-top: 18px; }
@@ -93,6 +94,12 @@
       <div class="row"><button id="continueBtn" class="primary">Continue</button></div>
     </div>
 
+    <div id="clarifyBox" class="clarify-box" style="display:none">
+      <div id="clarifyText"></div>
+      <textarea id="clarifyInput" placeholder="Paste a URL, or tell BrowserAgent where to find it..."></textarea>
+      <div class="row"><button id="clarifySendBtn" class="primary">Continue</button></div>
+    </div>
+
     <details id="detailsBox">
       <summary>Details</summary>
       <pre id="detailsText"></pre>
@@ -134,7 +141,14 @@ function setStatus(job) {
 
   $('loginBox').style.display = job.status === 'waiting_for_login' ? 'block' : 'none';
 
-  const running = ['starting', 'running', 'waiting_for_approval', 'waiting_for_login'].includes(job.status);
+  const clarifying = job.status === 'waiting_for_input' && job.pending_clarification;
+  $('clarifyBox').style.display = clarifying ? 'block' : 'none';
+  if (clarifying) {
+    $('clarifyText').textContent = job.pending_clarification.question;
+    $('clarifyInput').value = '';
+  }
+
+  const running = ['starting', 'running', 'waiting_for_approval', 'waiting_for_login', 'waiting_for_input'].includes(job.status);
   $('stopBtn').disabled = !running;
   $('runBtn').disabled = running;
 
@@ -149,7 +163,8 @@ function setStatus(job) {
 function statusLabel(s) {
   return {
     starting: 'Starting', running: 'Running', waiting_for_approval: 'Waiting for approval',
-    waiting_for_login: 'Waiting for login', completed: 'Completed', failed: 'Failed', stopped: 'Stopped',
+    waiting_for_login: 'Waiting for login', waiting_for_input: 'Waiting for input',
+    completed: 'Completed', failed: 'Failed', stopped: 'Stopped',
   }[s] || s;
 }
 
@@ -194,6 +209,14 @@ $('denyBtn').onclick = async () => {
 };
 $('continueBtn').onclick = async () => {
   await fetch(`/api/jobs/${currentJobId}/login-continue`, {method: 'POST'});
+};
+
+$('clarifySendBtn').onclick = async () => {
+  const text = $('clarifyInput').value.trim();
+  if (!text || !currentJobId) return;
+  await fetch(`/api/jobs/${currentJobId}/clarify`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({text}),
+  });
 };
 
 $('clearHistory').onclick = async () => {
@@ -242,7 +265,7 @@ async function loadBrowserStatus() {
   await loadHistory();
   const resp = await fetch('/api/jobs');
   const jobs = await resp.json();
-  const active = jobs.find(j => ['starting', 'running', 'waiting_for_approval', 'waiting_for_login'].includes(j.status));
+  const active = jobs.find(j => ['starting', 'running', 'waiting_for_approval', 'waiting_for_login', 'waiting_for_input'].includes(j.status));
   if (active) {
     $('prompt').value = active.prompt;
     connect(active.id);

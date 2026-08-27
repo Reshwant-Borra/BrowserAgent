@@ -86,6 +86,33 @@ You don't need to say "batch" or "single task" or anything about the internal
 architecture — BrowserAgent decides on its own whether this is a single page, a sweep across
 several pages, an ordered sequence of actions, or a research task.
 
+### Talking about pages you haven't pasted a link for
+
+In persistent-browser (`cdp_attach`) mode, BrowserAgent can also work from what you already
+have open, or the page you're currently looking at — no need to copy-paste every URL:
+
+```text
+Check all my course pages and tell me what I still need to do this week.
+```
+
+```text
+Tell me what I still need to do on this page.
+```
+
+```text
+Look through everything I currently have open for school and tell me what's due.
+```
+
+```text
+Check my course pages, find the assignment with the nearest deadline, and open it.
+```
+
+BrowserAgent reads these the same way a person would: it figures out you mean your currently
+open tabs (or the tab you're on), looks at what's actually there, and only ever acts on real
+pages it can see — it never invents a URL. If nothing you have open matches what you asked
+for, it asks rather than failing silently — see "When BrowserAgent needs more information"
+below. (Details: docs/SEMANTIC_PLANNER.md.)
+
 ## Watch progress
 
 While a task runs you'll see a status line (Running / Waiting for approval / Waiting for
@@ -125,6 +152,25 @@ there normally, then click **Continue** in the BrowserAgent tab. The task picks 
 there using the same browser session, so you only have to log in once per site per session.
 In persistent-browser (`cdp_attach`) mode that login also survives BrowserAgent restarts,
 since it's stored in the persistent Chromium profile, not anything BrowserAgent manages.
+
+## When BrowserAgent needs more information
+
+If you ask for something that refers to a page BrowserAgent can't find — "check my course
+pages" when nothing course-related is actually open — it doesn't fail with an error. It asks:
+
+```text
+Waiting for input
+
+I understand that you want me to work with the user's course pages, but I don't have
+any matching pages open or saved. Open those pages in the persistent browser, paste
+their URLs, or tell me where to find them.
+
+[text box]  [Continue]
+```
+
+Open the pages it's asking about (or just paste a URL) and click **Continue** — it picks up
+right where it left off, with your answer added to the original request. This only happens in
+`cdp_attach` mode, since `launch` mode has no persistent set of "your open tabs" to look at.
 
 ## Stopping and resuming
 

@@ -44,6 +44,12 @@ class RouterDecision(BaseModel):
     preferred_policy: SafetyPolicy = SafetyPolicy.READ_ONLY
     result_contract: str = "generic"  # "generic" | "assignment" | "research"
     workflow_steps: list[WorkflowStepPlan] = Field(default_factory=list)
+    # Set only by the semantic planner's plan->decision translation (router/policy.py) when
+    # the original TaskPlan's intent was "mixed" (Section 21 of the semantic planner task:
+    # "find X, then deterministically act on it") and task_type is multisite_sweep — signals
+    # ui/jobs.py to offer one bounded replan round after the sweep completes, rather than
+    # ending the job at the raw findings. Always False for legacy/deterministic decisions.
+    mixed_intent_followup: bool = False
 
     @field_validator("result_contract")
     @classmethod
