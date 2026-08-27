@@ -24,12 +24,14 @@ lifetime fully decoupled from it.
 ## 2. Current User Experience
 
 ```powershell
-# one-time-ish: start a persistent, dedicated Chromium with remote debugging
-browser-agent browser start
-
-# start the UI attached to it
-browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222
+browser-agent start
 ```
+
+One command: checks/starts Ollama, verifies `qwen3:8b`, checks/starts the persistent
+CDP-attached Chrome (only ever reports success once `/json/version` actually responds — see
+Section 25), starts the UI, and opens it. `browser-agent status` / `browser-agent stop` are
+also available; the two-step `browser-agent browser start` + `browser-agent ui ...` sequence
+below still works for debugging one stage in isolation.
 
 Open `http://127.0.0.1:8765`. Type a task in plain English, e.g.:
 
@@ -360,18 +362,23 @@ stall in Section 15 has been observed to trigger; each file run alone has been g
 
 ## 20. How To Use BrowserAgent Today
 
-1. Start Ollama (`ollama serve`) with `qwen3:8b` pulled.
-2. Start a persistent browser once: `browser-agent browser start` (finds Chrome
-   automatically, launches it with a dedicated profile and `--remote-debugging-port=9222`).
-3. Start the UI attached to it: `browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222`.
-4. Open `http://127.0.0.1:8765`.
-5. Type a task in plain English, press Run — no need to paste URLs if you mean something
+1. `browser-agent start` — one command. It checks/starts Ollama, verifies `qwen3:8b` is
+   installed, checks/starts the persistent CDP-attached Chrome (only ever reports success
+   after `/json/version` actually responds — never on process creation alone), starts the
+   UI, and opens it in your browser. Pass `--no-open` to skip the auto-open.
+2. Type a task in plain English, press Run — no need to paste URLs if you mean something
    already open ("my course pages") or the page you're on ("this page").
-6. If prompted, log in manually in the browser window, then click Continue.
-7. If prompted, Approve or Deny a consequential action.
-8. If BrowserAgent asks a clarifying question (it couldn't find a safe match for what you
+3. If prompted, log in manually in the browser window, then click Continue.
+4. If prompted, Approve or Deny a consequential action.
+5. If BrowserAgent asks a clarifying question (it couldn't find a safe match for what you
    meant), answer in the text box and click Continue.
-9. Read the final result in the UI (or check the history list later).
+6. Read the final result in the UI (or check the history list later).
+7. `Ctrl+C` stops the UI only; the persistent Chrome window and Ollama both keep running.
+   `browser-agent status` shows what's currently up without changing anything;
+   `browser-agent stop` (optionally `--browser`) tears down what BrowserAgent itself started.
+
+The lower-level commands (`browser-agent browser start`, `browser-agent ui ...`) still work
+individually for debugging one stage in isolation — see `cli/launcher.py` and section 25.
 
 Core BrowserAgent is ready for real use; future work should be driven by failures
 encountered in actual tasks, not another speculative phase.
@@ -707,3 +714,59 @@ bugs were purely in execution/attachment plumbing downstream of a correct plan. 
 all); launch-mode batches were left untouched (`preferred_tab_url` is only ever set when
 `BatchRuntimePolicy.is_open_tab` is true, which only `create_batch(..., target_resources=...)`
 from a resolved `open_tabs` requirement ever sets).
+
+## 25. One-Command Startup (`browser-agent start`) — Evidence Log
+
+**Goal**: stop requiring manual Ollama/Chrome/UI startup on Windows, and fix a real
+false-success bug where `browser-agent browser start` printed "Started persistent Chromium"
+even when Chrome exited immediately and CDP never bound (`netstat -ano | findstr :9222`
+returned nothing while the old command claimed success).
+
+**What changed**: new `cli/launcher.py` (health-check/start/poll orchestration for Ollama,
+CDP Chrome, and the UI — no changes to AgentLoop/BatchOrchestrator/WorkflowOrchestrator/
+routing/memory), new `browser-agent start`/`stop` subcommands in `cli/main.py`, `status`'s
+`task_id` made optional to double as a non-mutating health snapshot. The old
+`cmd_browser_start` now calls the same `launcher.ensure_chrome_cdp()` used by `start`, so it
+can no longer report success without a real `/json/version` response — this is also the
+regression fix and regression test (`test_chrome_process_starts_but_cdp_never_appears_is_failure`,
+`test_chrome_exits_early_reports_exit_code_diagnostic`).
+
+**Process ownership**: PIDs for services *we* start are recorded in
+`<runtime_dir>/launcher/state.json`; `stop` only ever acts on a PID it recorded itself via
+`taskkill /PID <pid>` — never `/IM chrome.exe` or `/IM python.exe` (see
+`test_stop_pid_targets_only_the_given_pid`). Ollama is never stopped by `stop`, even if
+`start` launched it. A `start.lock` file (holding the PID of the running `start` process)
+prevents two concurrent `start` invocations from racing into duplicate services, and
+self-heals if the recorded PID is no longer alive.
+
+**Deterministic tests**: `tests/unit/test_launcher.py`, 21 tests, all mocked (no live
+Ollama/Chrome/sockets) — healthy-reuse and cold-start-and-poll-to-healthy for both Ollama
+and Chrome/CDP, start-timeout-is-failure for both, missing model, missing executable, UI
+port reuse vs. occupied-by-something-else vs. free, lock acquire/duplicate-reject/stale
+recovery, state round-trip, corrupt state fallback, targeted `stop_pid`, and GPU-telemetry
+best-effort parsing. Full suite: 256/256 `tests/unit` passed after this change (0 regressions).
+
+**Real validation on this machine** (RTX 4070, Ollama with `qwen3:8b` already pulled, Chrome
+already running on CDP 9222 from an earlier session, port 8765 free):
+
+- `browser-agent start --no-open` printed all three `[PASS]` lines, correctly reusing the
+  already-running Ollama and Chrome (no duplicate processes spawned — `state.json` recorded
+  `chrome_started_by_us: false`, `ollama_started_by_us: false`, only `ui_pid` populated) and
+  started the UI fresh, verified healthy via `GET /api/browser/status` before printing PASS.
+- Running `browser-agent start` again while the first was still up was correctly rejected:
+  `Another 'browser-agent start' is already running (pid <n>)`.
+- `browser-agent stop` killed exactly the recorded UI PID (`taskkill /PID <n>`, confirmed via
+  `netstat` that port 8765 stopped listening) while port 9222 (Chrome) and Ollama's
+  `/api/tags` both remained up afterward, confirmed by direct `curl`/`netstat` checks.
+- `browser-agent status` output matched observed reality exactly at every stage, including
+  `GPU: GPU offload 100% (qwen3:8b)` sourced from `ollama`'s `/api/ps` while a task was
+  running.
+- Real agent smoke test through the freshly-started UI: submitted "Go to https://example.com
+  and tell me what this page is about, with evidence." via `POST /api/jobs`; job completed
+  with `final_result.summary` correctly describing the page and quoting the actual page text
+  as evidence. No writes, submissions, uploads, or messages were performed.
+
+**Not validated in this pass**: macOS. OS-specific process launching stays isolated
+(`cli/launcher.py`'s `sys.platform == "win32"` branches for detached-process creation and
+`taskkill`); the POSIX fallback paths (`os.kill`, plain `SIGTERM`) are written but only
+unit-tested with mocks, not run on real macOS hardware.

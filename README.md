@@ -8,12 +8,51 @@ Playwright as the browser backend.
 
 ## Quick Start
 
-Once installed (see below) and with Ollama running `qwen3:8b`:
+Once installed (see below):
 
 ```powershell
-browser-agent browser start                                                  # once, persistent Chromium
-browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222
+browser-agent start
 ```
+
+That one command checks Ollama (starting it if needed), verifies `qwen3:8b` is installed,
+checks the persistent CDP-attached Chrome (starting a dedicated instance if needed — it
+always *verifies* `/json/version` actually responds before reporting success, never just
+that a process was launched), starts the BrowserAgent UI, and opens it in your browser:
+
+```
+BrowserAgent startup
+
+[PASS] Ollama
+       qwen3:8b available
+
+[PASS] Persistent Chrome
+       CDP http://127.0.0.1:9222
+
+[PASS] BrowserAgent UI
+       http://127.0.0.1:8765
+
+BrowserAgent is ready.
+```
+
+Pass `--no-open` to skip auto-opening a browser tab. Re-running `browser-agent start` is
+safe — it reuses anything already healthy instead of starting duplicates. `Ctrl+C` stops
+only the UI; the persistent Chrome window and Ollama keep running so your logins and loaded
+model survive. To check what's currently up without starting or stopping anything:
+
+```powershell
+browser-agent status
+```
+
+To stop the UI (and, with `--browser`, the dedicated persistent Chrome too — Ollama is
+never stopped automatically):
+
+```powershell
+browser-agent stop
+browser-agent stop --browser
+```
+
+If `browser-agent start` reports Ollama is missing `qwen3:8b`, it will tell you to run
+`ollama pull qwen3:8b` and exit — it never auto-downloads a multi-GB model for you.
 
 Then open the printed URL (default `http://127.0.0.1:8765`), type a task in plain English —
 e.g. "Check these URLs and tell me which assignments I still have to do: https://..." or,
@@ -121,6 +160,17 @@ and drive the real agent loop with a *scripted* (non-live) model client
 verification, recovery, event sourcing) works correctly without depending on model quality.
 Only `pytest -m model` tests exercise an actual local-model call end-to-end.
 
+## Advanced / debugging commands
+
+`browser-agent start` composes these lower-level commands, which remain available for
+scripted workflows or debugging a specific stage in isolation:
+
+```powershell
+browser-agent browser start   --port 9222                 # verified CDP startup only
+browser-agent browser status  --cdp-endpoint http://127.0.0.1:9222
+browser-agent ui --browser-mode cdp_attach --cdp-endpoint http://127.0.0.1:9222
+```
+
 ## Starting an agent task
 
 ```bash
@@ -146,6 +196,9 @@ profile, and continues.
 ```bash
 browser-agent status <task_id>
 ```
+
+Called with no `task_id`, `status` instead prints the one-command-startup health snapshot
+(Ollama / model / Chrome-CDP / UI / GPU) described above — it never mutates anything.
 
 ## Configuration
 
