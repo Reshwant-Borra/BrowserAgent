@@ -57,11 +57,18 @@
   .history-prompt { color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .history-meta { color: #8b949e; white-space: nowrap; }
   .clear-link { color: #8b949e; font-size: 12px; cursor: pointer; text-decoration: underline; }
+  .browser-status { display: flex; align-items: center; gap: 7px; font-size: 12px; color: #8b949e; margin-bottom: 18px; }
+  .browser-status .dot { width: 7px; height: 7px; }
+  .browser-status .dot.connected { background: #3fb950; }
+  .browser-status .dot.disconnected { background: #f85149; }
 </style>
 </head>
 <body>
   <h1>BrowserAgent</h1>
   <div class="sub">Type a task in plain English. It figures out how to run it.</div>
+  <div id="browserStatus" class="browser-status" style="display:none">
+    <span id="browserDot" class="dot"></span><span id="browserStatusText"></span>
+  </div>
 
   <textarea id="prompt" placeholder="e.g. Check these URLs and tell me which assignments I still have to do:&#10;https://example.com/course1&#10;https://example.com/course2"></textarea>
   <div class="row">
@@ -214,8 +221,24 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+async function loadBrowserStatus() {
+  try {
+    const resp = await fetch('/api/browser/status');
+    const s = await resp.json();
+    if (s.mode !== 'cdp_attach') { $('browserStatus').style.display = 'none'; return; }
+    $('browserStatus').style.display = 'flex';
+    $('browserDot').className = 'dot ' + (s.connected ? 'connected' : 'disconnected');
+    $('browserStatusText').textContent = s.connected
+      ? `Browser: Connected (${s.endpoint})`
+      : (s.message || 'Browser: Not connected');
+  } catch (e) {
+    $('browserStatus').style.display = 'none';
+  }
+}
+
 // Survive a page refresh: reconnect to whatever job is still running, if any (Section 59).
 (async function init() {
+  await loadBrowserStatus();
   await loadHistory();
   const resp = await fetch('/api/jobs');
   const jobs = await resp.json();

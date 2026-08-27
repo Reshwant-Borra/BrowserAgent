@@ -86,6 +86,7 @@ class AgentLoop:
         self.browser = PlaywrightBackend(
             self.profile_dir, config.browser.headless, config.browser.action_timeout_ms,
             config.context.max_page_chars, config.context.max_visible_text_items,
+            mode=config.browser.mode, cdp_endpoint=config.browser.cdp_endpoint,
         )
         self.grammar = GRAMMAR_PATH.read_text(encoding="utf-8")
         self.log = get_logger("agent.loop", config.logging.level)

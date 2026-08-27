@@ -42,6 +42,8 @@ class BrowserConfig:
     user_data_dir: str = "./runtime/tasks"
     action_timeout_ms: int = 10000
     interactive_approval: bool = True
+    mode: str = "launch"  # "launch" (default, tests/fixtures) or "cdp_attach" (everyday use)
+    cdp_endpoint: str = "http://127.0.0.1:9222"  # only used when mode == "cdp_attach"
 
 
 @dataclass
