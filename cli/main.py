@@ -34,6 +34,23 @@ def _print_status(state, task=None) -> None:
         print(f"blocked_reason: {state.blocked_reason}")
 
 
+async def cmd_ui(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    from ui.app import create_app
+
+    config = load_config(args.config)
+    app = create_app(config)
+    url = f"http://{args.host}:{args.port}"
+    print(f"BrowserAgent UI running at {url}")
+    print("Type a task in plain English in the browser tab. Ctrl+C to stop.")
+    if not args.no_browser:
+        import webbrowser
+        webbrowser.open(url)
+    server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning"))
+    await server.serve()
+
+
 async def cmd_run(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     llama = create_inference_client(config)
@@ -227,6 +244,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None, help="path to a config YAML (default: config/default.yaml)")
     parser.add_argument("--debug", action="store_true", help="show full tracebacks instead of clean error messages")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    p_ui = sub.add_parser("ui", help="start the local BrowserAgent web console (Section 4-6 of Phase 5B)")
+    p_ui.add_argument("--host", default="127.0.0.1", help="bind address (never expose beyond localhost)")
+    p_ui.add_argument("--port", type=int, default=8765)
+    p_ui.add_argument("--no-browser", action="store_true", help="don't auto-open a browser tab")
+    p_ui.set_defaults(func=cmd_ui)
 
     p_run = sub.add_parser("run", help="start a new task")
     p_run.add_argument("goal", help='natural-language task, e.g. "Find the assignment"')
