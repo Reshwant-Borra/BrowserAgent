@@ -120,9 +120,12 @@ def create_app(config: AppConfig) -> FastAPI:
 
     @app.post("/api/jobs/{job_id}/stop")
     async def stop_job(job_id: str) -> dict[str, bool]:
+        """Idempotent by design (JobRunner.stop): a job that's already terminal, or one whose
+        driving process no longer exists (e.g. after a UI server restart) still returns {"ok":
+        true} rather than an error — only a job_id that was never created returns 404."""
         ok = runner.stop(job_id)
         if not ok:
-            raise HTTPException(404, "no such running job")
+            raise HTTPException(404, "no such job")
         return {"ok": True}
 
     return app
