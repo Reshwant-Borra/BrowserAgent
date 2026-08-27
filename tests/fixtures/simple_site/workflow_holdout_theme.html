@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Appearance</title></head>
+<body>
+  <h1>Appearance</h1>
+  <table>
+    <tr><td><label for="theme-select">Theme</label></td>
+        <td><select id="theme-select" onchange="onThemeChange()">
+              <option value="light" selected>Light</option>
+              <option value="dark">Dark</option>
+            </select></td></tr>
+    <tr><td colspan="2" id="theme-row">Active theme: Light</td></tr>
+  </table>
+  <script>
+    function onThemeChange() {
+      const sel = document.getElementById('theme-select');
+      const label = sel.options[sel.selectedIndex].text;
+      document.getElementById('theme-row').textContent = 'Active theme: ' + label;
+    }
+  </script>
+</body>
+</html>

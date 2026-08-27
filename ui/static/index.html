@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>BrowserAgent</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    max-width: 780px; margin: 0 auto; padding: 32px 20px 80px;
+    background: #0d1117; color: #e6edf3;
+  }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: #8b949e; font-size: 13px; margin-bottom: 24px; }
+  textarea {
+    width: 100%; min-height: 110px; font-size: 15px; padding: 14px;
+    border-radius: 10px; border: 1px solid #30363d; background: #161b22; color: #e6edf3;
+    resize: vertical; font-family: inherit;
+  }
+  textarea:focus { outline: 2px solid #58a6ff; outline-offset: -1px; }
+  .row { display: flex; gap: 10px; margin-top: 12px; align-items: center; }
+  button {
+    font-size: 14px; padding: 9px 18px; border-radius: 8px; border: 1px solid #30363d;
+    background: #21262d; color: #e6edf3; cursor: pointer;
+  }
+  button.primary { background: #238636; border-color: #2ea043; }
+  button.primary:hover { background: #2ea043; }
+  button.danger { background: #21262d; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button:hover:not(:disabled) { border-color: #58a6ff; }
+  .status-block { margin-top: 28px; padding: 16px; border-radius: 10px; background: #161b22; border: 1px solid #30363d; }
+  .status-line { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #8b949e; }
+  .dot.running { background: #d29922; animation: pulse 1.4s infinite; }
+  .dot.completed { background: #3fb950; }
+  .dot.failed, .dot.stopped { background: #f85149; }
+  .dot.waiting_for_approval, .dot.waiting_for_login { background: #58a6ff; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .activity { color: #8b949e; font-size: 13px; margin-top: 6px; }
+  .approval-box, .login-box {
+    margin-top: 14px; padding: 12px 14px; border-radius: 8px; background: #1c2333;
+    border: 1px solid #58a6ff;
+  }
+  .result-box { margin-top: 24px; padding: 16px; border-radius: 10px; background: #161b22; border: 1px solid #30363d; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: 13px; background: #0d1117; padding: 12px; border-radius: 8px; }
+  details { margin-top: 18px; }
+  summary { cursor: pointer; color: #8b949e; font-size: 13px; }
+  .history { margin-top: 34px; }
+  .history h2 { font-size: 14px; color: #8b949e; text-transform: uppercase; letter-spacing: .04em; }
+  .history-item {
+    padding: 10px 12px; border-radius: 8px; border: 1px solid #30363d; margin-bottom: 8px;
+    cursor: pointer; font-size: 13px; display: flex; justify-content: space-between; gap: 10px;
+  }
+  .history-item:hover { border-color: #58a6ff; }
+  .history-prompt { color: #e6edf3; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .history-meta { color: #8b949e; white-space: nowrap; }
+  .clear-link { color: #8b949e; font-size: 12px; cursor: pointer; text-decoration: underline; }
+</style>
+</head>
+<body>
+  <h1>BrowserAgent</h1>
+  <div class="sub">Type a task in plain English. It figures out how to run it.</div>
+
+  <textarea id="prompt" placeholder="e.g. Check these URLs and tell me which assignments I still have to do:&#10;https://example.com/course1&#10;https://example.com/course2"></textarea>
+  <div class="row">
+    <button id="runBtn" class="primary">Run</button>
+    <button id="stopBtn" class="danger" disabled>Stop</button>
+  </div>
+
+  <div id="statusBlock" class="status-block" style="display:none">
+    <div class="status-line"><span id="dot" class="dot"></span><span id="statusText">Idle</span></div>
+    <div id="activity" class="activity"></div>
+
+    <div id="approvalBox" class="approval-box" style="display:none">
+      <div id="approvalText"></div>
+      <div class="row">
+        <button id="approveBtn" class="primary">Approve</button>
+        <button id="denyBtn" class="danger">Deny</button>
+      </div>
+    </div>
+
+    <div id="loginBox" class="login-box" style="display:none">
+      <div>Login required. Complete login in the browser window, then click Continue.</div>
+      <div class="row"><button id="continueBtn" class="primary">Continue</button></div>
+    </div>
+
+    <details id="detailsBox">
+      <summary>Details</summary>
+      <pre id="detailsText"></pre>
+    </details>
+  </div>
+
+  <div id="resultBox" class="result-box" style="display:none">
+    <strong>Result</strong>
+    <pre id="resultText"></pre>
+  </div>
+
+  <div class="history">
+    <h2>Recent tasks <span class="clear-link" id="clearHistory">clear</span></h2>
+    <div id="historyList"></div>
+  </div>
+
+<script>
+let currentJobId = null;
+let eventSource = null;
+
+const $ = (id) => document.getElementById(id);
+
+function setStatus(job) {
+  $('statusBlock').style.display = 'block';
+  $('dot').className = 'dot ' + job.status;
+  $('statusText').textContent = statusLabel(job.status);
+  $('activity').textContent = job.activity || '';
+  $('detailsText').textContent = JSON.stringify({
+    job_id: job.id, kind: job.kind, task_id: job.task_id, batch_id: job.batch_id,
+    workflow_id: job.workflow_id, router_decision: job.router_decision, error: job.error,
+  }, null, 2);
+
+  const approving = job.status === 'waiting_for_approval' && job.pending_approval;
+  $('approvalBox').style.display = approving ? 'block' : 'none';
+  if (approving) {
+    const p = job.pending_approval;
+    $('approvalText').textContent = `BrowserAgent wants to: ${p.action} on "${p.target || '(no target)'}" — ${p.reason || ''}`;
+  }
+
+  $('loginBox').style.display = job.status === 'waiting_for_login' ? 'block' : 'none';
+
+  const running = ['starting', 'running', 'waiting_for_approval', 'waiting_for_login'].includes(job.status);
+  $('stopBtn').disabled = !running;
+  $('runBtn').disabled = running;
+
+  if (job.status === 'completed' || job.status === 'failed') {
+    $('resultBox').style.display = 'block';
+    $('resultText').textContent = JSON.stringify(job.final_result || {error: job.error}, null, 2);
+  } else {
+    $('resultBox').style.display = 'none';
+  }
+}
+
+function statusLabel(s) {
+  return {
+    starting: 'Starting', running: 'Running', waiting_for_approval: 'Waiting for approval',
+    waiting_for_login: 'Waiting for login', completed: 'Completed', failed: 'Failed', stopped: 'Stopped',
+  }[s] || s;
+}
+
+function connect(jobId) {
+  if (eventSource) eventSource.close();
+  currentJobId = jobId;
+  eventSource = new EventSource(`/api/jobs/${jobId}/stream`);
+  eventSource.onmessage = (e) => {
+    const job = JSON.parse(e.data);
+    setStatus(job);
+    if (['completed', 'failed', 'stopped'].includes(job.status)) {
+      eventSource.close();
+      loadHistory();
+    }
+  };
+}
+
+$('runBtn').onclick = async () => {
+  const prompt = $('prompt').value.trim();
+  if (!prompt) return;
+  const resp = await fetch('/api/jobs', {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prompt}),
+  });
+  const data = await resp.json();
+  connect(data.job_id);
+};
+
+$('stopBtn').onclick = async () => {
+  if (!currentJobId) return;
+  await fetch(`/api/jobs/${currentJobId}/stop`, {method: 'POST'});
+};
+
+$('approveBtn').onclick = async () => {
+  await fetch(`/api/jobs/${currentJobId}/approve`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({approved: true}),
+  });
+};
+$('denyBtn').onclick = async () => {
+  await fetch(`/api/jobs/${currentJobId}/approve`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({approved: false}),
+  });
+};
+$('continueBtn').onclick = async () => {
+  await fetch(`/api/jobs/${currentJobId}/login-continue`, {method: 'POST'});
+};
+
+$('clearHistory').onclick = async () => {
+  await fetch('/api/jobs', {method: 'DELETE'});
+  loadHistory();
+};
+
+async function loadHistory() {
+  const resp = await fetch('/api/jobs');
+  const jobs = await resp.json();
+  const list = $('historyList');
+  list.innerHTML = '';
+  for (const job of jobs) {
+    const div = document.createElement('div');
+    div.className = 'history-item';
+    div.innerHTML = `<span class="history-prompt">${escapeHtml(job.prompt)}</span><span class="history-meta">${statusLabel(job.status)}</span>`;
+    div.onclick = () => { $('prompt').value = job.prompt; connect(job.id); };
+    list.appendChild(div);
+  }
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+// Survive a page refresh: reconnect to whatever job is still running, if any (Section 59).
+(async function init() {
+  await loadHistory();
+  const resp = await fetch('/api/jobs');
+  const jobs = await resp.json();
+  const active = jobs.find(j => ['starting', 'running', 'waiting_for_approval', 'waiting_for_login'].includes(j.status));
+  if (active) {
+    $('prompt').value = active.prompt;
+    connect(active.id);
+  }
+})();
+</script>
+</body>
+</html>

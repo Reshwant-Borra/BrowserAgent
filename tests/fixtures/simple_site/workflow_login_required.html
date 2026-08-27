@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Sign in</title></head>
+<body>
+  <h1>Sign in required</h1>
+  <p>Please sign in to continue.</p>
+  <label for="username">Username</label>
+  <input type="text" id="username">
+  <label for="password">Password</label>
+  <input type="password" id="password">
+  <button onclick="signIn()">Sign in</button>
+  <div id="after-login" hidden>
+    <h1>Account Status</h1>
+    <div id="account-status">Account status: Active</div>
+  </div>
+  <script>
+    // Simulates "the user manually logs in in the visible browser window" — clicking Sign in
+    // (or, for automated tests standing in for a human taking a moment to type credentials,
+    // a short timer) hides the login form and reveals the page the workflow actually needs,
+    // standing in for a real site's session cookie taking effect after manual sign-in.
+    function signIn() {
+      document.title = 'Account Status';
+      document.querySelector('h1').remove();
+      document.querySelectorAll('p, label, input, button').forEach(el => el.remove());
+      document.getElementById('after-login').hidden = false;
+    }
+    setTimeout(signIn, 1500);
+  </script>
+</body>
+</html>

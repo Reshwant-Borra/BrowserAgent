@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Configuration</title></head>
+<body>
+  <h1>Configuration</h1>
+  <label for="code-input">Project code</label>
+  <input type="text" id="code-input">
+  <button onclick="saveCode()">Save configuration</button>
+  <p id="save-status"></p>
+  <script>
+    function saveCode() {
+      const value = document.getElementById('code-input').value;
+      document.getElementById('save-status').textContent = 'Saved project code: ' + value;
+    }
+  </script>
+</body>
+</html>

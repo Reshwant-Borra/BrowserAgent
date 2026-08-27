@@ -39,6 +39,6 @@ def tmp_config(tmp_path) -> AppConfig:
                                recent_actions=5, max_visible_text_items=12),
         recovery=RecoveryConfig(max_action_retries=2, identical_action_limit=3,
                                  navigation_cycle_limit=2, verification_retry_limit=2),
-        storage=StorageConfig(tasks_dir=str(tmp_path / "tasks")),
+        storage=StorageConfig(runtime_dir=str(tmp_path / "runtime"), tasks_dir=str(tmp_path / "tasks")),
         logging=LoggingConfig(level="INFO", dir=str(tmp_path / "logs"), redact_secrets=True),
     )

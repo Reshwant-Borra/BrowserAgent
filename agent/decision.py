@@ -10,7 +10,7 @@ as something that reaches Playwright.
 from __future__ import annotations
 
 import json
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -90,7 +90,12 @@ def normalize_model_action(action: ModelAction) -> ModelDecision:
         }
         return ModelDecision(action=ActionType.WAIT, params=params, verification_mode="action_default")
     if isinstance(action, FinishAction):
-        return ModelDecision(action=ActionType.FINISH, params={"result": action.result}, verification_mode="action_default")
+        params: dict[str, Any] = {"result": action.result}
+        if action.verified is not None:
+            params["verified"] = action.verified
+        if action.outputs:
+            params["outputs"] = [item.model_dump() for item in action.outputs]
+        return ModelDecision(action=ActionType.FINISH, params=params, verification_mode="action_default")
     raise DecisionValidationError(ValidationErrorKind.SCHEMA_INVALID, f"unsupported action: {action!r}")
 
 

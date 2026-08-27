@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Alerts</title></head>
+<body>
+  <h1>Alert Preferences</h1>
+  <table>
+    <tr><td><label for="sms-alerts">SMS alerts</label></td>
+        <td><input type="checkbox" id="sms-alerts" onchange="onToggle()"></td></tr>
+    <tr><td colspan="2" id="alerts-row">SMS alerts: Off</td></tr>
+  </table>
+  <script>
+    function onToggle() {
+      const on = document.getElementById('sms-alerts').checked;
+      document.getElementById('alerts-row').textContent = 'SMS alerts: ' + (on ? 'On' : 'Off');
+    }
+  </script>
+</body>
+</html>

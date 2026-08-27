@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Preferences</title></head>
+<body>
+  <h1>Display Preferences</h1>
+  <label for="mode">Mode</label>
+  <select id="mode" onchange="onModeChange()">
+    <option value="standard" selected>Standard</option>
+    <option value="compact">Compact</option>
+  </select>
+  <div id="mode-status">Current mode: Standard</div>
+  <p><a href="workflow_site_b.html">Next: Notifications</a></p>
+  <script>
+    function onModeChange() {
+      const mode = document.getElementById('mode');
+      const label = mode.options[mode.selectedIndex].text;
+      document.getElementById('mode-status').textContent = 'Current mode: ' + label;
+    }
+  </script>
+</body>
+</html>
