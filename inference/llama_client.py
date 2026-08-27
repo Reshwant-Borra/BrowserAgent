@@ -78,6 +78,7 @@ class InferenceClient(Protocol):
         prompt: str,
         grammar: Optional[str] = None,
         max_tokens: int = 256,
+        json_schema: Optional[dict[str, Any]] = None,
     ) -> CompletionResult:
         ...
 
@@ -101,7 +102,12 @@ class LlamaClient:
         prompt: str,
         grammar: Optional[str] = None,
         max_tokens: int = 256,
+        json_schema: Optional[dict[str, Any]] = None,
     ) -> CompletionResult:
+        # llama.cpp's structured-output path here is GBNF (`grammar`), not JSON Schema.
+        # `json_schema` is accepted for interface parity with OllamaClient (router/llm_router.py
+        # picks whichever backend is configured) but is not schema-enforced on this backend;
+        # callers must validate the returned JSON themselves, same as any non-grammar completion.
         payload: dict[str, Any] = {
             "prompt": prompt,
             "temperature": self.temperature,
@@ -190,6 +196,7 @@ class OllamaClient:
         prompt: str,
         grammar: Optional[str] = None,
         max_tokens: int = 256,
+        json_schema: Optional[dict[str, Any]] = None,
     ) -> CompletionResult:
         action_decision = grammar is not None
         request_id = hashlib.sha256(
@@ -209,7 +216,13 @@ class OllamaClient:
         }
         if self.keep_alive:
             payload["keep_alive"] = self.keep_alive
-        payload["format"] = self.schema if action_decision else "json"
+        # `json_schema` (e.g. router/llm_router.py's RouterDecision schema) takes priority over
+        # the fixed per-instance action schema, so callers other than the agent decision loop
+        # can reuse this same client/retry/diagnostics machinery for other structured calls.
+        if json_schema is not None:
+            payload["format"] = json_schema
+        else:
+            payload["format"] = self.schema if action_decision else "json"
 
         attempts: list[dict[str, Any]] = []
         for attempt in range(1, self.max_inference_attempts + 1):
@@ -219,7 +232,7 @@ class OllamaClient:
                     request_id=request_id,
                     prompt=prompt,
                     prompt_hash=prompt_hash,
-                    schema_type="action_json_schema" if action_decision else "json",
+                    schema_type="custom_json_schema" if json_schema is not None else ("action_json_schema" if action_decision else "json"),
                     attempt=attempt,
                 )
                 attempts.append(diagnostics)
