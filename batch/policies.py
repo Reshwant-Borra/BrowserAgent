@@ -5,6 +5,7 @@ import re
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from agent.auth_detect import blob_indicates_auth_required
 from agent.schemas import ActionType, ModelDecision, RiskLevel, classify_risk
 from batch.models import FailureCategory, NavigationScope
 from memory.event_store import Event, EventType
@@ -55,8 +56,10 @@ def classify_child_failure(events: list[Event], status: str, last_error: str | N
     blob = "\n".join([json.dumps(e.payload).lower() for e in events] + [(last_error or "").lower()])
     if "captcha" in blob or "bot challenge" in blob:
         return FailureCategory.CAPTCHA_OR_BOT_CHALLENGE
-    if "login" in blob or "sign in" in blob or "authentication" in blob:
+    if blob_indicates_auth_required(blob):
         return FailureCategory.AUTH_REQUIRED
+    if "unsupported" in blob or "malformed target" in blob or "malformed url" in blob:
+        return FailureCategory.UNSUPPORTED_PAGE
     if "connect_timeout" in blob or "read_timeout" in blob or "total_request_timeout" in blob or "timeout" in blob:
         return FailureCategory.TIMEOUT
     if (

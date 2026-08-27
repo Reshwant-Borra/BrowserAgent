@@ -4,7 +4,7 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Awaitable, Callable, Optional, Protocol
 
 from agent.config import AppConfig
 from agent.runtime_policy import BatchRuntimePolicy, NavigationScopePolicy
@@ -28,6 +28,7 @@ class ChildRunner(Protocol):
         max_steps: int,
         resume_task_id: str | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        approval_callback: Optional[Callable[[Any, Any], Awaitable[bool]]] = None,
     ) -> str:
         ...
 
@@ -44,11 +45,13 @@ class AgentLoopChildRunner:
         max_steps: int,
         resume_task_id: str | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        approval_callback: Optional[Callable[[Any, Any], Awaitable[bool]]] = None,
     ) -> str:
         from agent.loop import AgentLoop
 
         loop = (
-            AgentLoop.resume(config, resume_task_id, profile_dir=profile_dir, runtime_policy=runtime_policy)
+            AgentLoop.resume(config, resume_task_id, profile_dir=profile_dir, runtime_policy=runtime_policy,
+                              approval_callback=approval_callback)
             if resume_task_id
             else AgentLoop.create_new(
                 config,
@@ -56,6 +59,7 @@ class AgentLoopChildRunner:
                 success_criteria,
                 profile_dir=profile_dir,
                 runtime_policy=runtime_policy,
+                approval_callback=approval_callback,
             )
         )
         await loop.run(max_steps=max_steps)
@@ -193,7 +197,8 @@ class BatchOrchestrator:
                 raise
         except Exception as exc:
             retryable = int(item["attempt_count"]) < self.policy.work_item_max_attempts
-            self.store.fail_item(item["id"], FailureCategory.UNKNOWN.value, str(exc), retryable)
+            category = classify_child_failure([], "unknown", str(exc))
+            self.store.fail_item(item["id"], category.value, str(exc), retryable)
             self._after_item(dict(self.store.get_item(item["id"])))
             if not self.policy.continue_on_failure:
                 raise

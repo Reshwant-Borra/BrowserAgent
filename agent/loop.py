@@ -10,8 +10,9 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
+from agent.auth_detect import looks_like_login_page
 from agent.config import AppConfig
 from agent.context_builder import build_contract_repair_prompt, build_replan_prompt, build_tiered_context
 from agent.decision import parse_model_output, validate_against_observation
@@ -56,6 +57,7 @@ class AgentLoop:
         task_id: str,
         profile_dir: Path | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
     ):
         self.config = config
         self.task_id = task_id
@@ -63,6 +65,11 @@ class AgentLoop:
         self.db_path = self.tasks_dir / task_id / "task.db"
         self.profile_dir = profile_dir or self.tasks_dir / task_id / "browser_profile"
         self.runtime_policy = runtime_policy
+        # When set (the UI wires this in, see ui/jobs.py), consequential-action approval is
+        # awaited via this callback instead of blocking on stdin `input()` — lets a caller
+        # pause/resume the loop from an HTTP request instead of a terminal prompt. CLI usage
+        # (cli/main.py) never sets this, so `input()` remains the default (Section 20/21).
+        self.approval_callback = approval_callback
 
         self.event_store = EventStore(self.db_path)
         self.state_store = TaskStateStore(self.event_store)
@@ -85,9 +92,11 @@ class AgentLoop:
         success_criteria: list[str],
         profile_dir: Path | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
     ) -> "AgentLoop":
         task_id = uuid.uuid4().hex[:12]
-        loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy)
+        loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy,
+                   approval_callback=approval_callback)
         loop.event_store.create_task(task_id, goal, success_criteria)
         loop.event_store.append(task_id, 0, EventType.TASK_CREATED,
                                  {"goal": goal, "success_criteria": success_criteria})
@@ -101,8 +110,10 @@ class AgentLoop:
         task_id: str,
         profile_dir: Path | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
     ) -> "AgentLoop":
-        loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy)
+        loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy,
+                   approval_callback=approval_callback)
         if not loop.event_store.task_exists(task_id):
             raise ValueError(f"no such task: {task_id}")
         return loop
@@ -213,6 +224,19 @@ class AgentLoop:
         self.metrics.log(event="observation", task_id=self.task_id, step=step_no,
                           element_count=observation.element_count, char_count=observation.char_count,
                           truncated=observation.truncated)
+
+        if looks_like_login_page(observation):
+            # Section 49/50: never automate credential entry. Short-circuit straight to a
+            # blocked/login_required state instead of burning the recovery ladder (retry ->
+            # refresh -> deep recovery -> replan) on a page no amount of retrying gets past —
+            # the UI (ui/jobs.py) surfaces this as "Login required" with a Continue action that
+            # resumes this same task_id/browser_profile once the user has signed in manually.
+            state.status = "blocked"
+            state.blocked_reason = "login_required"
+            self.event_store.append(self.task_id, step_no, EventType.TASK_BLOCKED,
+                                     {"reason": state.blocked_reason, "url": observation.url})
+            self.state_store.save(state)
+            return state
 
         if state.recovery_level == RecoveryLevel.REPLAN_REQUIRED.value:
             return await self._replan(task, state, step_no)
@@ -373,7 +397,7 @@ class AgentLoop:
             return self._block_by_runtime_policy(state, step_no, violation.category, violation.reason)
 
         if requires_approval(risk, self.config.browser.interactive_approval):
-            if not self._prompt_for_approval(decision, element):
+            if not await self._request_approval(decision, element):
                 state = self.state_store.load(self.task_id)
                 state.status = "blocked"
                 state.blocked_reason = (f"user declined consequential action: {decision.action.value} "
@@ -898,6 +922,11 @@ class AgentLoop:
                           category=category, reason=reason)
         self.state_store.save(state)
         return state
+
+    async def _request_approval(self, decision: ModelDecision, element: Optional[ElementRef]) -> bool:
+        if self.approval_callback is not None:
+            return await self.approval_callback(decision, element)
+        return self._prompt_for_approval(decision, element)
 
     def _prompt_for_approval(self, decision: ModelDecision, element: Optional[ElementRef]) -> bool:
         name = element.name if element else "(no target)"
