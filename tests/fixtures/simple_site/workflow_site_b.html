@@ -1,0 +1,18 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Notifications</title></head>
+<body>
+  <h1>Notification Settings</h1>
+  <label for="weekly-summary">
+    <input type="checkbox" id="weekly-summary" onchange="onToggle()"> Enable weekly summary emails
+  </label>
+  <div id="notif-status">Weekly summary: Disabled</div>
+  <p><a href="workflow_site_c.html">Next: Account status</a></p>
+  <script>
+    function onToggle() {
+      const on = document.getElementById('weekly-summary').checked;
+      document.getElementById('notif-status').textContent = 'Weekly summary: ' + (on ? 'Enabled' : 'Disabled');
+    }
+  </script>
+</body>
+</html>
