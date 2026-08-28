@@ -132,6 +132,93 @@ async def test_single_site_job_completes(tmp_config, tmp_path, fixture_site_url,
         es.close()
 
 
+async def test_fresh_single_site_job_ignores_stale_cdp_tab(tmp_config, tmp_path, fixture_site_url, monkeypatch):
+    """End-to-end regression for the real reported bug: in cdp_attach mode, a stale unrelated
+    tab left open by a previous task (e.g. goodhousekeeping.com) must never be what a brand-new
+    explicit-URL job ("Open <url> and tell me what this page is about") observes or answers
+    from — it must navigate to its own resolved target."""
+    from playwright.async_api import async_playwright
+
+    cdp_port = 9335
+    pw = await async_playwright().start()
+    user_browser = await pw.chromium.launch(headless=True, args=[f"--remote-debugging-port={cdp_port}"])
+    try:
+        context = user_browser.contexts[0] if user_browser.contexts else await user_browser.new_context()
+        stale = context.pages[0] if context.pages else await context.new_page()
+        await stale.goto(f"{fixture_site_url}/workflow_site_b.html")  # the stale leftover tab
+
+        tmp_config.browser.mode = "cdp_attach"
+        tmp_config.browser.cdp_endpoint = f"http://127.0.0.1:{cdp_port}"
+        _patch_model(monkeypatch, FakeUIClient(finish_result="fixture site a"))
+        store = UIJobStore(tmp_path / "ui_jobs.db")
+        runner = JobRunner(tmp_config, store, tmp_path / "runtime")
+        job_id = runner.submit(
+            f"Open {fixture_site_url}/workflow_site_a.html and tell me what this page is about."
+        )
+        job = await _wait_for(store, job_id, {"completed", "failed"}, timeout=15.0)
+        await _wait_task_done(runner, job_id)
+        assert job["status"] == "completed"
+
+        from memory.event_store import EventStore, EventType
+        from pathlib import Path as _P
+        es = EventStore(_P(tmp_config.storage.tasks_dir) / job["task_id"] / "task.db")
+        try:
+            observations = [e for e in es.all_events(job["task_id"]) if e.type == EventType.OBSERVATION]
+            assert any("workflow_site_a" in (e.payload.get("url") or "") for e in observations)
+            assert not any("workflow_site_b" in (e.payload.get("url") or "") for e in observations)
+        finally:
+            es.close()
+    finally:
+        if user_browser.is_connected():
+            await user_browser.close()
+        await pw.stop()
+
+
+async def test_previous_job_stopped_new_job_does_not_inherit_its_tab(tmp_config, tmp_path, fixture_site_url, monkeypatch):
+    """Fresh job must not inherit a previous (now-stopped) job's page selection unless the new
+    plan explicitly references it — same cdp_attach stale-tab risk, triggered by a stop/start
+    cycle within one JobRunner instead of a completely separate process."""
+    from playwright.async_api import async_playwright
+
+    cdp_port = 9336
+    pw = await async_playwright().start()
+    user_browser = await pw.chromium.launch(headless=True, args=[f"--remote-debugging-port={cdp_port}"])
+    try:
+        tmp_config.browser.mode = "cdp_attach"
+        tmp_config.browser.cdp_endpoint = f"http://127.0.0.1:{cdp_port}"
+        store = UIJobStore(tmp_path / "ui_jobs.db")
+        runner = JobRunner(tmp_config, store, tmp_path / "runtime")
+
+        # First job: opens workflow_site_b.html and completes, leaving that tab open in the
+        # attached browser exactly like a finished/stopped prior task would.
+        _patch_model(monkeypatch, FakeUIClient())
+        job_one = runner.submit(f"Open {fixture_site_url}/workflow_site_b.html and tell me what this is.")
+        await _wait_for(store, job_one, {"completed", "failed"}, timeout=15.0)
+        await _wait_task_done(runner, job_one)
+
+        # Second, brand-new job: explicit different target. Must not inherit job_one's tab.
+        _patch_model(monkeypatch, FakeUIClient(finish_result="fixture site a"))
+        job_two = runner.submit(
+            f"Open {fixture_site_url}/workflow_site_a.html and tell me what this page is about."
+        )
+        job = await _wait_for(store, job_two, {"completed", "failed"}, timeout=15.0)
+        await _wait_task_done(runner, job_two)
+        assert job["status"] == "completed"
+
+        from memory.event_store import EventStore, EventType
+        from pathlib import Path as _P
+        es = EventStore(_P(tmp_config.storage.tasks_dir) / job["task_id"] / "task.db")
+        try:
+            observations = [e for e in es.all_events(job["task_id"]) if e.type == EventType.OBSERVATION]
+            assert any("workflow_site_a" in (e.payload.get("url") or "") for e in observations)
+        finally:
+            es.close()
+    finally:
+        if user_browser.is_connected():
+            await user_browser.close()
+        await pw.stop()
+
+
 async def test_sweep_job_completes(tmp_config, tmp_path, fixture_site_url, monkeypatch):
     _patch_model(monkeypatch, FakeUIClient())
     store = UIJobStore(tmp_path / "ui_jobs.db")

@@ -28,12 +28,13 @@ class FakeBrowser:
         self.contexts = contexts
 
 
-def _backend(preferred_tab_url=None) -> PlaywrightBackend:
+def _backend(preferred_tab_url=None, explicit_target_url=None) -> PlaywrightBackend:
     return PlaywrightBackend(
         Path("/tmp/profile"), headless=True, action_timeout_ms=1000,
         max_page_chars=1000, max_visible_text_items=10,
         mode="cdp_attach", cdp_endpoint="http://127.0.0.1:9222",
         preferred_tab_url=preferred_tab_url,
+        explicit_target_url=explicit_target_url,
     )
 
 
@@ -82,3 +83,26 @@ def test_select_preferred_page_falls_back_to_none_when_tab_closed():
     browser = FakeBrowser([FakeContext([other])])
     backend = _backend(preferred_tab_url="https://example.com/")
     assert backend._select_preferred_page(browser) is None
+
+
+def test_select_page_by_url_finds_exact_match_even_when_not_most_recently_active():
+    """Regression for the stale-tab-reuse bug: a fresh explicit-URL task's target must be
+    matched by URL, not by 'last in context.pages order' (the most-recently-active proxy)."""
+    stale = FakePage("https://goodhousekeeping.com/")  # last => "most recently active"
+    target = FakePage("https://example.com/")
+    browser = FakeBrowser([FakeContext([target, stale])])
+
+    backend = _backend(explicit_target_url="https://example.com/")
+    selected = backend._select_page_by_url(browser, backend.explicit_target_url)
+    assert selected is target
+    assert selected is not stale
+
+
+def test_select_page_by_url_returns_none_when_no_tab_matches():
+    """No open tab matches the explicit target -> None, so the caller creates a fresh blank
+    page rather than falling back to an unrelated stale tab."""
+    stale = FakePage("https://goodhousekeeping.com/")
+    browser = FakeBrowser([FakeContext([stale])])
+
+    backend = _backend(explicit_target_url="https://example.com/")
+    assert backend._select_page_by_url(browser, backend.explicit_target_url) is None

@@ -37,9 +37,11 @@ async def user_browser():
     await pw.stop()
 
 
-def _make_backend(cdp_endpoint: str = f"http://127.0.0.1:{CDP_PORT}") -> PlaywrightBackend:
+def _make_backend(cdp_endpoint: str = f"http://127.0.0.1:{CDP_PORT}",
+                   explicit_target_url: str | None = None) -> PlaywrightBackend:
     return PlaywrightBackend(Path("./_unused"), True, 5000, 3000, 12,
-                              mode="cdp_attach", cdp_endpoint=cdp_endpoint)
+                              mode="cdp_attach", cdp_endpoint=cdp_endpoint,
+                              explicit_target_url=explicit_target_url)
 
 
 async def test_attach_to_unavailable_endpoint_raises_clear_error():
@@ -109,6 +111,80 @@ async def test_empty_browser_creates_one_page_without_launching_new_browser(user
     finally:
         await backend.close()
     assert user_browser.is_connected()  # still the same browser process, never a second one
+
+
+async def test_current_page_task_reuses_most_recently_active_tab(user_browser, fixture_site_url):
+    """No explicit_target_url (a 'tell me what this page is about' current-page task) ->
+    the existing 'most recently active tab' heuristic is the intended, unchanged behavior."""
+    context = user_browser.contexts[0] if user_browser.contexts else await user_browser.new_context()
+    page = context.pages[0] if context.pages else await context.new_page()
+    await page.goto(f"{fixture_site_url}/workflow_site_a.html")
+
+    backend = _make_backend()
+    await backend.start()
+    try:
+        assert backend.page.url.endswith("workflow_site_a.html")
+    finally:
+        await backend.close()
+
+
+async def test_explicit_target_url_reuses_matching_existing_tab(user_browser, fixture_site_url):
+    """A fresh single-site task whose resolved target already matches an open tab reuses it,
+    even when a different, unrelated tab is more 'recently active'."""
+    context = user_browser.contexts[0] if user_browser.contexts else await user_browser.new_context()
+    stale = context.pages[0] if context.pages else await context.new_page()
+    await stale.goto(f"{fixture_site_url}/workflow_site_b.html")
+    matching = await context.new_page()
+    await matching.goto(f"{fixture_site_url}/workflow_site_a.html")
+
+    backend = _make_backend(explicit_target_url=f"{fixture_site_url}/workflow_site_a.html")
+    await backend.start()
+    try:
+        assert backend.page.url.endswith("workflow_site_a.html")
+    finally:
+        await backend.close()
+
+
+async def test_explicit_target_url_never_reuses_stale_unrelated_tab(user_browser, fixture_site_url):
+    """The core stale-tab-reuse bug: a brand-new task with an explicit target ('Open
+    https://example.com') must never silently attach to and answer from an unrelated tab a
+    previous task left open — even though that stale tab is the 'most recently active' one
+    the old default heuristic would have picked. No tab matches the target here, so the
+    backend must land on a fresh blank page instead, ready for the model's own open_url step."""
+    context = user_browser.contexts[0] if user_browser.contexts else await user_browser.new_context()
+    stale = context.pages[0] if context.pages else await context.new_page()
+    await stale.goto(f"{fixture_site_url}/workflow_site_b.html")  # e.g. a stale goodhousekeeping.com tab
+
+    backend = _make_backend(explicit_target_url=f"{fixture_site_url}/workflow_site_a.html")
+    await backend.start()
+    try:
+        assert not backend.page.url.endswith("workflow_site_b.html")
+        assert backend.page.url in ("about:blank", "")
+    finally:
+        await backend.close()
+
+
+async def test_explicit_target_url_reconnect_finds_same_tab(user_browser, fixture_site_url):
+    """Reconnect regression: a resumed job's explicit_target_url (its last-known current_url)
+    must reattach to that same tab across a disconnect/reconnect cycle, not whatever else is
+    open at reconnect time."""
+    context = user_browser.contexts[0] if user_browser.contexts else await user_browser.new_context()
+    target_page = context.pages[0] if context.pages else await context.new_page()
+    await target_page.goto(f"{fixture_site_url}/workflow_site_a.html")
+    other = await context.new_page()
+    await other.goto(f"{fixture_site_url}/workflow_site_b.html")
+
+    target_url = f"{fixture_site_url}/workflow_site_a.html"
+    first = _make_backend(explicit_target_url=target_url)
+    await first.start()
+    await first.close()
+
+    second = _make_backend(explicit_target_url=target_url)
+    await second.start()
+    try:
+        assert second.page.url.endswith("workflow_site_a.html")
+    finally:
+        await second.close()
 
 
 async def test_launch_mode_still_works_unchanged(tmp_path, fixture_site_url):

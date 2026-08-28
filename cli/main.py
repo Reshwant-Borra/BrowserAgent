@@ -23,6 +23,7 @@ from batch.orchestrator import BatchOrchestrator
 from batch.store import BatchStore
 from cli import launcher
 from inference.llama_client import ModelUnavailableError, active_model_endpoint, create_inference_client
+from router.extract import extract_urls
 
 
 def _print_status(state, task=None) -> None:
@@ -108,7 +109,15 @@ async def cmd_run(args: argparse.Namespace) -> None:
               f"Start the configured {config.model.backend} backend before running the agent.")
         sys.exit(1)
 
-    loop = AgentLoop.create_new(config, args.goal, args.criteria or [])
+    # cli's --goal is raw text with no router pass, so pull out an explicit URL the same way
+    # router/extract.py would — this is what stops "Open https://example.com" from attaching
+    # to whatever stale tab a previous cdp_attach task left open (see PlaywrightBackend's
+    # explicit_target_url handling / agent/loop.py's AgentLoop.create_new).
+    goal_urls = extract_urls(args.goal)
+    loop = AgentLoop.create_new(
+        config, args.goal, args.criteria or [],
+        explicit_target_url=goal_urls[0] if goal_urls else None,
+    )
     print(f"Starting task {loop.task_id}: {args.goal}")
     state = await loop.run(max_steps=args.max_steps)
     _print_status(state)

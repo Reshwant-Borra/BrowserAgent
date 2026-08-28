@@ -861,3 +861,107 @@ target rather than trusting the model to read the URL out of its own objective t
 stale tab is already showing content?), explicitly out of this task's scope
 ("do not change AgentLoop... unless required for stop-state integration") and left for a
 future pass.
+
+## 27. Fresh Single-Site Task Reusing a Stale CDP Tab — Root Cause and Fix
+
+Follow-up to Section 26's "separate anomaly observed, not fixed here" note — this is that fix.
+
+**Reported bug**: a brand-new single-site task ("Open https://example.com...") started right
+after a previous task's job ended, with a persistent CDP-attached Chrome that still had an
+unrelated tab open (e.g. goodhousekeeping.com left over from that previous task). BrowserAgent
+attached to and answered from the stale goodhousekeeping.com tab instead of navigating to
+example.com — silently, with no error, no scope block, nothing in the job's own status to
+suggest anything was wrong.
+
+**Root cause**: `PlaywrightBackend._start_cdp_attach()`'s page-selection policy had exactly one
+non-default path — `preferred_tab_url`, set only for a semantic *open-tab* work item
+(`BatchRuntimePolicy.is_open_tab`, Section 24's open-tab sweep fix). Every other caller,
+including a plain single-site task with a perfectly well-known explicit target URL, fell
+through to `_select_page()`'s "most recently active tab" heuristic — a heuristic that has no
+notion of *any* task having a specific target at all. `router/policy.py`'s
+`_translate_single()` already resolves a single-site task's explicit URL into
+`RouterDecision.targets[0]`, but `ui/jobs.py`'s `_run_single()` never passed it anywhere near
+`AgentLoop`/`PlaywrightBackend` — it was computed, stored in the job's persisted
+`router_decision` for the UI to display, and then dropped on the floor as far as tab selection
+was concerned. `cli/main.py`'s `cmd_run` had the same gap for its own raw `--goal` text (no
+router pass at all). The batch/workflow orchestrators were *not* affected the same way for
+their own `is_open_tab=False` targets, since even before this fix they always constructed a
+`BatchRuntimePolicy` with the item's `target_url` — but that value only ever reached
+`preferred_tab_url` when `is_open_tab` was true, so a non-open-tab batch/workflow item's
+initial attach page was subject to the exact same "most recently active tab" heuristic before
+its own `open_url` step (if the model ever issued one) corrected it — same class of bug,
+smaller blast radius because `pre_action_violation`/`post_navigation_violation`'s scope
+policy would at least block a *cross-origin* stale tab rather than silently answering from it.
+
+**Fresh-task page-selection rule** (`browser/playwright_backend.py`,
+`_start_cdp_attach`/`explicit_target_url`): a page-selection *target* is now one of three
+kinds, decided once per `AgentLoop`/`PlaywrightBackend` instance:
+- **Open-tab-semantic** (`preferred_tab_url`, unchanged): exact URL match only; if the tab
+  isn't found (closed between resolution and attach), falls back to the "most recently active
+  tab" heuristic — a normal, recoverable case, not a hard failure.
+- **Explicit target** (new: `explicit_target_url`): a fresh single-site task's resolved URL
+  (`ui/jobs.py`), a raw-goal CLI run's extracted URL (`cli/main.py`), a non-open-tab
+  batch/workflow item's `target_url` (`agent/loop.py`, derived from `runtime_policy.target_url`
+  when `is_open_tab` is false), or a resumed job's last-known `current_url`
+  (`AgentLoop.resume`). Exact URL match reuses an existing tab already sitting on that page;
+  otherwise a fresh blank page is created — **never** the "most recently active tab" heuristic,
+  since an unmatched explicit target has no legitimate fallback tab, only a wrong one. The
+  model's own `open_url` step then navigates the blank page to the target, exactly as if no
+  tab existed at all.
+- **No known target** (a genuine current-page task, e.g. "tell me what this page is about"
+  with no URL in the prompt — `router/policy.py`'s `_translate_single()` returns
+  `targets=[]`): the original "most recently active tab" heuristic, unchanged — this is the
+  one case where reusing whatever's already open is the *correct*, intended behavior.
+
+**Fix** (`browser/playwright_backend.py`, `agent/loop.py`, `ui/jobs.py`, `cli/main.py`): added
+`PlaywrightBackend.explicit_target_url` and the `_select_page_by_url()` helper implementing
+the rule above; `AgentLoop.__init__`/`create_new` gained an `explicit_target_url` parameter
+(and derive one from `runtime_policy.target_url` for non-open-tab batch/workflow items, same
+as the existing `preferred_tab_url` derivation for open-tab ones); `AgentLoop.resume` now
+seeds `explicit_target_url` from the task's last-recorded `current_url` when nothing more
+specific already set it; `ui/jobs.py`'s `_run_single` passes `decision.targets[0]` through;
+`cli/main.py`'s `cmd_run` extracts a URL from the raw `--goal` text with `router/extract.py`'s
+existing `extract_urls()` and passes it the same way. No change to `_select_page()` itself, to
+scope-block enforcement, or to the open-tab-semantic path — this is additive, not a redesign.
+
+**Real CDP smoke test** (headless Chromium simulating the user's persistent browser, real
+network navigation, no local inference server available in this sandbox so the model decision
+content was stood in with the same `FakeUIClient` shape `tests/integration/test_ui_jobs.py`
+already uses — tab selection itself is real, unfaked code):
+1. Left a real `https://www.goodhousekeeping.com/` tab open via CDP (remote-debugging-port),
+   simulating the reported "previous task left this tab open" state.
+2. Submitted "Open https://example.com and tell me what this page is about." through the real
+   `JobRunner` → `AgentLoop` → `PlaywrightBackend` stack in `cdp_attach` mode.
+3. Re-ran the identical scenario against the pre-fix code (`git stash` of just the fix files)
+   to confirm it reproduces: the job attached directly to the stale goodhousekeeping.com tab
+   (`observed urls: ['https://www.goodhousekeeping.com/', ...] x5`, never navigated) and
+   errored out on an unrelated assertion in the harness rather than ever reaching example.com —
+   causal confirmation this is the real mechanism, not a coincidental pass/fail.
+4. With the fix restored: `observed urls: ['about:blank', 'https://example.com/',
+   'https://example.com/']`, job `status: "completed"`, `final_result.summary` about
+   example.com, and the goodhousekeeping.com tab still open and completely untouched
+   (`stale tab is still open, untouched: https://www.goodhousekeeping.com/`) — no leakage,
+   the correct existing-tabs-left-alone contract from Sections 8-11 held throughout.
+
+**Regression tests**:
+- `tests/unit/test_playwright_backend_tab_selection.py` — `_select_page_by_url` finds an exact
+  match even when a stale tab is more "recently active", and returns `None` (never a stale
+  fallback) when nothing matches.
+- `tests/unit/test_agent_loop_tab_wiring.py` — `explicit_target_url` reaches
+  `PlaywrightBackend` from `AgentLoop.create_new`'s own parameter, from a non-open-tab
+  `BatchRuntimePolicy.target_url`, and from `AgentLoop.resume`'s last-known `current_url`; a
+  genuine current-page task leaves both `preferred_tab_url`/`explicit_target_url` unset.
+- `tests/integration/test_cdp_attach.py` — real-Chromium-backed: explicit target reuses a
+  matching existing tab even when a stale tab is more recently active; explicit target with no
+  matching tab never reuses the stale one (lands on a fresh blank page instead); reconnect
+  (disconnect/reattach) with the same `explicit_target_url` finds the same tab again; a
+  current-page task (no `explicit_target_url`) still reuses the most-recently-active tab,
+  unchanged.
+- `tests/integration/test_ui_jobs.py` — full `JobRunner`-level, real headless Chromium in
+  `cdp_attach` mode: a fresh explicit-URL job never observes a stale tab left open at job
+  start, and a brand-new job started after a previous job completed/stopped does not inherit
+  that previous job's tab.
+
+Full suite after the fix: 263/263 unit, 54/54 integration, all passing (0 regressions),
+plus the real CDP smoke test above (pass) and its pre-fix reproduction (fails exactly as
+reported, confirming root cause).

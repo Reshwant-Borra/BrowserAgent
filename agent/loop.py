@@ -66,6 +66,7 @@ class AgentLoop:
         task_id: str,
         profile_dir: Path | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        explicit_target_url: Optional[str] = None,
         approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
     ):
         self.config = config
@@ -88,11 +89,25 @@ class AgentLoop:
             if runtime_policy is not None and runtime_policy.is_open_tab
             else None
         )
+        # A concrete target this task already knows about that is *not* an open-tab-semantic
+        # match: a batch/workflow item's plain URL target, or the caller's own
+        # `explicit_target_url` (a fresh single-site task's resolved URL, or — via `resume`
+        # below — a resumed job's last-known page). Kept separate from preferred_tab_url so an
+        # unmatched open-tab target can still fall back to the "most recently active tab"
+        # heuristic (existing, intended behavior) while an unmatched plain target never does
+        # (see PlaywrightBackend._start_cdp_attach) — that fallback is what let a brand-new
+        # explicit-URL task silently attach to and answer from a stale unrelated tab.
+        resolved_explicit_target_url = explicit_target_url or (
+            runtime_policy.target_url
+            if runtime_policy is not None and not runtime_policy.is_open_tab
+            else None
+        )
         self.browser = PlaywrightBackend(
             self.profile_dir, config.browser.headless, config.browser.action_timeout_ms,
             config.context.max_page_chars, config.context.max_visible_text_items,
             mode=config.browser.mode, cdp_endpoint=config.browser.cdp_endpoint,
             preferred_tab_url=preferred_tab_url,
+            explicit_target_url=resolved_explicit_target_url,
         )
         self.grammar = GRAMMAR_PATH.read_text(encoding="utf-8")
         self.log = get_logger("agent.loop", config.logging.level)
@@ -108,11 +123,12 @@ class AgentLoop:
         success_criteria: list[str],
         profile_dir: Path | None = None,
         runtime_policy: BatchRuntimePolicy | None = None,
+        explicit_target_url: Optional[str] = None,
         approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
     ) -> "AgentLoop":
         task_id = uuid.uuid4().hex[:12]
         loop = cls(config, task_id, profile_dir=profile_dir, runtime_policy=runtime_policy,
-                   approval_callback=approval_callback)
+                   explicit_target_url=explicit_target_url, approval_callback=approval_callback)
         loop.event_store.create_task(task_id, goal, success_criteria)
         loop.event_store.append(task_id, 0, EventType.TASK_CREATED,
                                  {"goal": goal, "success_criteria": success_criteria})
@@ -132,6 +148,15 @@ class AgentLoop:
                    approval_callback=approval_callback)
         if not loop.event_store.task_exists(task_id):
             raise ValueError(f"no such task: {task_id}")
+        # Preserve the resumed job's own page identity rather than letting cdp_attach's
+        # default heuristic hand it whatever tab is "most recently active" at resume time —
+        # the same stale-tab risk a fresh explicit-URL task has, just triggered by a restart
+        # instead of a new job. Only meaningful when nothing more specific (an is_open_tab
+        # runtime_policy) already set preferred_tab_url above.
+        if loop.browser.preferred_tab_url is None and loop.browser.explicit_target_url is None:
+            last_state = loop.state_store.load(task_id)
+            if last_state.current_url:
+                loop.browser.explicit_target_url = last_state.current_url
         return loop
 
     async def start_browser(self) -> None:
