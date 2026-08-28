@@ -965,3 +965,161 @@ already uses — tab selection itself is real, unfaked code):
 Full suite after the fix: 263/263 unit, 54/54 integration, all passing (0 regressions),
 plus the real CDP smoke test above (pass) and its pre-fix reproduction (fails exactly as
 reported, confirming root cause).
+
+## 28. Repository Consolidation — `main` Is Now the Single Canonical Branch
+
+**Date**: 2026-08-28.
+
+**Purpose**: this project accumulated one branch per phase/feature/fix. Several fixes (the
+UI Stop fix, Section 26; the fresh-task stale-tab fix, Section 27) had landed only on their
+own branches and had been pushed to `origin`, but not yet folded back into `main`. This
+section is a pure repository-consolidation pass — no new functionality, no live product
+runs — to make `main` alone sufficient to run the complete, current BrowserAgent.
+
+**Starting state**:
+- `main` local HEAD and `origin/main` HEAD: `fcb3227` (merge of `feature/one-command-startup`).
+- Working tree on `main` had **staged, uncommitted changes** matching the full diff of
+  `main..fix/fresh-task-tab-selection` — an artifact of the environment restoring disk state
+  from a checkpoint taken mid-session in a prior consolidation attempt. Protected first via
+  `git stash push -u` (nothing was discarded) before touching any refs.
+
+**Final state**:
+- `main` local HEAD and `origin/main` HEAD: `b4c0401` (`fix: fresh single-site task no longer
+  reuses a stale CDP-attached tab`), reached by a clean **fast-forward merge** — no new merge
+  commit, no rebase, no force-push.
+
+**Branches audited** (local + `origin`): `feature/one-command-startup`,
+`feature/semantic-task-planner`, `final/cdp-persistent-browser`, `fix/cdp-open-tab-sweep`,
+`fix/fresh-task-tab-selection`, `fix/ui-stop-waiting-jobs`, `phase5-multisite-orchestration`,
+`phase5b-real-world-ui`, `research/browseros-backend-feasibility`,
+`origin/phase4b-memory-application` (remote-only, no local branch).
+
+**Already fully contained in `main` before this pass** (verified with
+`git merge-base --is-ancestor <branch> main`, i.e. every commit on the branch is already an
+ancestor of `main`'s prior HEAD `fcb3227`):
+- `feature/one-command-startup` — merged via PR #3 (`main`'s prior HEAD *was* this merge).
+- `fix/cdp-open-tab-sweep` — merged via PR #2.
+- `final/cdp-persistent-browser` — merged (tag `browseragent-v1-ready`'s ancestry).
+- `feature/semantic-task-planner` — merged (tag `browseragent-v1-semantic-ready`'s ancestry).
+- `phase5-multisite-orchestration` — fully merged.
+- `phase5b-real-world-ui` — fully merged.
+- `origin/phase4b-memory-application` — fully merged.
+
+**Required reconciliation** (not contained by commit ancestry, needed integration):
+- `fix/ui-stop-waiting-jobs` (tip `707e6ad`) and `fix/fresh-task-tab-selection` (tip
+  `b4c0401`) both branched from `fcb3227` and both remained unmerged into `main`.
+  `fix/fresh-task-tab-selection`'s own history contains an intermediate commit (`0fd92ce`)
+  that *replays* the Stop fix but — verified via `git diff 0fd92ce 707e6ad`, before
+  reconciling — was missing part of `fix/ui-stop-waiting-jobs`'s fuller implementation
+  (`TERMINAL_JOB_STATUSES`, the idempotent-stop docstring/logic, `pending_clarification`/
+  `pending_approval` clearing on every stop path, and the stop-during-approval status fix).
+  Diffing the branch **tip** `b4c0401` against `fix/ui-stop-waiting-jobs` (`707e6ad`) directly
+  (`git diff 707e6ad b4c0401`) confirmed this was corrected within the branch's own second
+  commit: `cli/launcher.py`, `ui/app.py`, `tests/integration/test_ui_app.py`, and
+  `tests/unit/test_launcher.py` are **byte-for-byte identical** between the two branches, and
+  `ui/jobs.py` on `b4c0401` is a strict superset of `707e6ad`'s version (every line of the
+  Stop fix present, plus the additional `explicit_target_url` wiring for the stale-tab fix).
+  Conclusion: `fix/fresh-task-tab-selection`'s tip is the newest, most complete, validated
+  implementation and a strict superset of `fix/ui-stop-waiting-jobs` — reconciled by a single
+  `git merge --ff-only fix/fresh-task-tab-selection` onto `main` (no cherry-pick, no separate
+  merge of `fix/ui-stop-waiting-jobs` needed or performed, avoiding a duplicate/no-op commit).
+  Re-verified post-merge: `git diff fix/ui-stop-waiting-jobs main -- <the 4 shared files>` is
+  empty, and the `ui/jobs.py` diff shows only the *additional* stale-tab lines, confirming
+  zero content loss.
+
+**Intentionally NOT merged**:
+- `research/browseros-backend-feasibility` (tip `45eebf7`) — its single commit is explicitly
+  a feasibility study ("Feasibility study only, no production code changed") that recommends
+  **against** adopting BrowserOS and **for** keeping the existing Playwright `connect_over_cdp`
+  approach — i.e. it validates the status quo already in `main` rather than proposing a change
+  to merge. It also branched from a point far earlier in history (`c356b56`) and diffing it
+  against current `main` shows ~5,000 deleted lines purely because it never received any of
+  the later phases — not because any of that later work should be reverted. Left unmerged,
+  branch preserved for provenance.
+
+**Final feature checklist** (spot-checked directly against `main`'s tree, not inferred from
+branch names):
+
+| Capability | Present in `main` |
+|---|---|
+| Phase 4B bounded long-horizon context/memory | Yes — `memory/task_memory.py`, `agent/context_builder.py`, Section 14-15 |
+| Phase 5 persistent multi-site/batch orchestration | Yes — `batch/orchestrator.py` |
+| Phase 5 safety enforcement | Yes — `agent/runtime_policy.py`, `agent/schemas.classify_risk` |
+| Structured result contracts | Yes — `batch/models.ResultContract`, `batch/result_quality.py` |
+| GPU/Ollama reliability changes | Yes — `cli/launcher.py:query_gpu_info`, `check_ollama` |
+| Crash/resume support | Yes — `memory/replay.py:replay_task`, `AgentLoop.resume` |
+| Phase 5B local natural-language UI | Yes — `ui/app.py`, `ui/jobs.py`, `ui/static/index.html` |
+| Ordered multi-site workflows | Yes — `workflow/orchestrator.py`, `router/policy.py:_translate_workflow` |
+| Cross-site verified fact passing | Yes — `batch/orchestrator.py`/`workflow/orchestrator.py` `seed_facts` |
+| Research discovery improvements | Yes — `research/discovery.py:discover_sources` |
+| Semantic task planner | Yes — `router/semantic_planner.py:plan_task` |
+| Deterministic fast-path routing | Yes — `router/extract.py:try_deterministic_route` |
+| ResourceResolver | Yes — `router/resources.py:ResourceResolver` |
+| Open-tab semantic resolution | Yes — `browser/tabs.py:list_open_tabs`, `router/resources.py` |
+| NEEDS_INPUT clarification flow | Yes — `router/policy.NeedsInput`, `ui/jobs.py:_route_with_clarification` |
+| Persistent CDP attach mode | Yes — `browser/playwright_backend.py` `mode="cdp_attach"` |
+| Router ordered-step decomposition fixes | Yes — `router/extract.py:_split_ordered_steps` |
+| Expanded routing action recognition | Yes — `router/extract.py:_ROUTING_ACTION_VERBS` |
+| Open-tab identity preservation for batch sweeps | Yes — `agent/runtime_policy.BatchRuntimePolicy.is_open_tab`, Section 24 |
+| Typed structured batch finish results | Yes — `batch/orchestrator.py`, Section 24 |
+| Explicit runtime failure-category preservation | Yes — Section 24 |
+| One-command launcher (`browser-agent start`) | Yes — `cli/launcher.py:ensure_chrome_cdp`, `cli/main.py:cmd_start` |
+| Launcher status/stop functionality | Yes — `cli/main.py:cmd_status`/`cmd_stop`, `cli/launcher.py:stop_pid` |
+| Persisted UI job Stop fix | Yes — `ui/jobs.py:JobRunner.stop`, `TERMINAL_JOB_STATUSES`, Section 26 |
+| `waiting_for_input` cancellation | Yes — `ui/jobs.py:_route_with_clarification` |
+| `waiting_for_login` cancellation | Yes — `ui/jobs.py:_wait_login_or_stop` |
+| `waiting_for_approval` cancellation | Yes — `ui/jobs.py:_make_approval_callback` |
+| Stale Continue protection | Yes — Section 26 (idempotent `stop()` on orphaned rows) |
+| Fresh-job state isolation | Yes — Section 27 (`explicit_target_url` never inherited across jobs) |
+| Explicit-target CDP tab selection | Yes — `browser/playwright_backend.py:_select_page_by_url`, Section 27 |
+| Stale-tab prevention for fresh single-site jobs | Yes — Section 27 |
+| Current-page semantics | Yes — Section 27 (no-known-target path unchanged) |
+| Resume page identity | Yes — `AgentLoop.resume`'s `explicit_target_url` seeding, Section 27 |
+| Existing safety/approval behavior | Yes — unchanged, `agent/schemas.classify_risk`, approval callback |
+
+**Deterministic test result**: `python -m pytest tests/unit -q` → **263 passed**, 0 failures,
+0 errors, run on `main` @ `b4c0401` post-merge.
+
+**Intentionally skipped for this consolidation pass**: the entire `tests/integration/`
+directory (`test_cdp_attach.py`, `test_ui_jobs.py`, `test_phase1_browser_actions.py`,
+`test_phase1b_contract_repair.py`, `test_phase2_verification_recovery.py`,
+`test_phase3_crash_recovery.py`, `test_phase4_long_horizon.py`, `test_ui_app.py`) — every one
+of these drives a real `AgentLoop`/`PlaywrightBackend`, which launches a real (headless)
+Chromium process (`launch_persistent_context` or, for the `cdp_attach` tests, its own
+throwaway `chromium.launch(args=["--remote-debugging-port=..."])` to simulate a user
+browser). The task instructions for this pass explicitly prohibited starting Chrome/CDP or
+performing live browser tests, so these were not run here. They do not require Ollama or the
+UI server, and each individual fix's own branch/section (24, 26, 27) already carries its own
+full integration-test evidence (54/54 passing at the time each fix was validated) plus real
+CDP/live smoke-test evidence — that evidence is preserved in this document and was not
+re-collected in this pass.
+
+**Known remaining limitations** (carried forward, unchanged by this pass): macOS is not
+validated (Section 25); the documented Windows pytest+Playwright interaction stall noted in
+`tests/integration/test_cdp_attach.py`'s own docstring remains a known environment quirk, not
+a functional bug.
+
+## 29. Repository Development Policy
+
+**`main` is the default development branch for this repository.**
+
+Unless the repository owner explicitly requests otherwise for a specific piece of work:
+
+- Make changes directly on `main`.
+- Commit to `main`.
+- Push to `origin/main`.
+- Do **not** create a new `feature/*`/`fix/*`/`research/*` branch merely because a task
+  involves code changes.
+
+Create a separate branch only when the owner explicitly asks for isolation/experimentation,
+or when there is a compelling safety reason (e.g. a change risky enough that it should be
+reviewable/revertable as a unit before it ever touches `main`). This is a working policy for
+*this* repository's workflow — it does not change Git's behavior or any global tooling
+default.
+
+Historical branches (`feature/*`, `fix/*`, `phase*`, `final/*`, `research/*`) are kept for
+provenance and are **not** deleted. After Section 28's consolidation, `main` alone is
+sufficient to build/run the complete, current BrowserAgent — no production functionality
+should ever again be left stranded only on a side branch. Anyone continuing development on
+this repository should pull `main`, make their change, commit, and push to `main`, the same
+way this consolidation pass itself was performed.

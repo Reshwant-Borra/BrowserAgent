@@ -230,3 +230,10 @@ the metrics this implementation now collects (see `docs/PHASE1_REPORT.md`).
 - The CLI's consequential-action approval prompt (`input()`) blocks the event loop while
   waiting for a human response — acceptable since only one task runs per process.
 - `runtime/` (browser profiles, task databases, logs, downloads) is gitignored; never commit it.
+
+## Repository development policy
+
+`main` is the default development branch. Unless you explicitly need isolation or
+experimentation, make changes, commit, and push directly to `main` rather than opening a new
+`feature/*`/`fix/*` branch. See `docs/BROWSERAGENT_MASTER_STATUS.md` Section 29 for the full
+policy and Section 28 for the repository-consolidation pass that made `main` canonical.
