@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from agent.config import ContextConfig
 from agent.schemas import DecisionValidationError, ValidationErrorKind
 from agent.token_budget import PromptBlock, count_tokens, trim_to_token_budget
+from agent.workspace_models import WorkspaceView
 from browser.page_model import PageObservation
 from inference import prompt as prompt_templates
 from memory.event_store import EventStore
@@ -217,6 +218,27 @@ def build_replan_prompt(task: TaskRecord, state: TaskState) -> str:
         success_criteria=task.success_criteria,
         history_summary="\n".join(history_lines) or "(no actions yet)",
         blocked_reason=state.blocked_reason or "(unspecified)",
+    )
+
+
+def build_workspace_summary(workspace: WorkspaceView, max_entities: int, max_evidence: int) -> str:
+    """The general controller's "relevant workspace slice" (BrowserAgent_General_Autonomous_
+    Agent_Architecture_REVISED.pdf, section 8's agent/context_builder.py entry, config's
+    max_workspace_entities_in_context / max_workspace_evidence_in_context). Deliberately not
+    wired into build_tiered_context/build_prompt above — those remain AgentLoop's unmodified
+    click-level context; this is consumed only by agent/planner.py's controller-level prompts
+    (see inference/prompt.py's render_workspace_block docstring for why the split exists)."""
+    entities = workspace.entities[:max_entities]
+    evidence = workspace.evidence[:max_evidence]
+    # Keys prefixed "_" are controller-internal bookkeeping (e.g. agent/controller.py's hub
+    # URL tracking), never shown to the model — same convention as a private attribute.
+    visible_facts = {k: v for k, v in workspace.facts.items() if not k.startswith("_")}
+    return prompt_templates.render_workspace_block(
+        [e.model_dump() for e in entities],
+        [e.model_dump() for e in evidence],
+        workspace.open_questions,
+        workspace.completion_requirements,
+        visible_facts,
     )
 
 

@@ -98,6 +98,31 @@ class RoutingConfig:
 
 
 @dataclass
+class AgentControlConfig:
+    """General-controller migration (BrowserAgent_General_Autonomous_Agent_Architecture_
+    REVISED.pdf, section 17). `control_mode` defaults to "legacy" so nothing here changes
+    default behavior — the general controller (agent/controller.py) is only reachable by
+    explicitly constructing/running it (Phase 2 "shadow/fixture mode"), not via router/ or
+    the live UI yet.
+
+    `max_subgoal_attempts` and `max_steps_per_subgoal` are not in the architecture doc's
+    illustrative YAML snippet (section 17 says "conceptually" extend, not exhaustively) but
+    are required to make the controller's own bounds concrete: the doc's "repeated failure"
+    replan trigger needs a defined retry count per subgoal, and delegating to AgentLoop as
+    "one bounded interactive subgoal" (section 8) needs an explicit step budget per delegate.
+    """
+
+    control_mode: str = "legacy"  # "legacy" | "general" | "hybrid"
+    planner_max_subgoals: int = 5
+    max_replans: int = 6
+    max_subgoal_attempts: int = 2
+    max_steps_per_subgoal: int = 30
+    completion_check_after_subgoal: bool = True
+    max_workspace_entities_in_context: int = 12
+    max_workspace_evidence_in_context: int = 8
+
+
+@dataclass
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
@@ -106,6 +131,7 @@ class AppConfig:
     storage: StorageConfig = field(default_factory=StorageConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
+    agent: AgentControlConfig = field(default_factory=AgentControlConfig)
 
 
 def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
@@ -166,6 +192,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         storage=_coerce(StorageConfig, raw.get("storage", {})),
         logging=_coerce(LoggingConfig, raw.get("logging", {})),
         routing=_coerce(RoutingConfig, raw.get("routing", {})),
+        agent=_coerce(AgentControlConfig, raw.get("agent", {})),
     )
     _resolve_runtime_paths(config)
     return config

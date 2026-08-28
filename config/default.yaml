@@ -60,3 +60,13 @@ logging:
 
 routing:
   mode: "hybrid"  # "legacy" | "semantic" | "hybrid" — see router/policy.py
+
+agent:
+  control_mode: "legacy"      # "legacy" | "general" | "hybrid" — see agent/controller.py
+  planner_max_subgoals: 5
+  max_replans: 6
+  max_subgoal_attempts: 2     # consecutive failed delegate attempts before a subgoal replan
+  max_steps_per_subgoal: 30   # AgentLoop step budget per delegated subgoal
+  completion_check_after_subgoal: true
+  max_workspace_entities_in_context: 12
+  max_workspace_evidence_in_context: 8

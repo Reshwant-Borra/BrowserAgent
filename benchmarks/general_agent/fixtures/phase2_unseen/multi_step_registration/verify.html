@@ -1,0 +1,11 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Verify Invite Code</title></head>
+<body>
+  <h1>Verify Invite Code</h1>
+  <input id="code-input" type="text" />
+  <button id="verify-btn" type="button" onclick="document.getElementById('verify-result').textContent = document.getElementById('code-input').value === 'INV-2847' ? 'Verified' : 'Rejected'; document.getElementById('next-link').style.display = document.getElementById('code-input').value === 'INV-2847' ? 'inline' : 'none';">Verify</button>
+  <p id="verify-result"></p>
+  <a id="next-link" href="settings.html" style="display:none">Continue to settings</a>
+</body>
+</html>

@@ -1,0 +1,96 @@
+{
+  "scenario_count": 3,
+  "results": [
+    {
+      "scenario": "multi_step_registration",
+      "legacy": {
+        "status": "running",
+        "steps": 25,
+        "model_calls": 26,
+        "duration_s": 11.01
+      },
+      "general": {
+        "status": "completed",
+        "blocked_reason": null,
+        "completed_subgoals": [
+          "Read the invite code from the signup page",
+          "Navigate to the verification page and enter the invite code exactly"
+        ],
+        "model_calls": 25,
+        "controller_model_calls": 3,
+        "child_model_calls": 22,
+        "subgoal_children": 2,
+        "duration_s": 10.65,
+        "error": null,
+        "planner_schema_valid_count": 3,
+        "planner_schema_total_count": 3
+      },
+      "legacy_success": false,
+      "general_success": true,
+      "meets_success_gate": true,
+      "model_call_overhead_pct": -3.8,
+      "meets_overhead_gate": null
+    },
+    {
+      "scenario": "compare_and_report",
+      "legacy": {
+        "status": "completed",
+        "steps": 4,
+        "model_calls": 4,
+        "duration_s": 1.93
+      },
+      "general": {
+        "status": "completed",
+        "blocked_reason": null,
+        "completed_subgoals": [
+          "Navigate to the directory containing the hosting plans",
+          "Extract the monthly price for NimbusHost",
+          "Extract the monthly price for StackForge"
+        ],
+        "model_calls": 17,
+        "controller_model_calls": 4,
+        "child_model_calls": 13,
+        "subgoal_children": 3,
+        "duration_s": 11.81,
+        "error": null,
+        "planner_schema_valid_count": 4,
+        "planner_schema_total_count": 4
+      },
+      "legacy_success": true,
+      "general_success": true,
+      "meets_success_gate": true,
+      "model_call_overhead_pct": 325.0,
+      "meets_overhead_gate": false
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "legacy": {
+        "status": "completed",
+        "steps": 7,
+        "model_calls": 8,
+        "duration_s": 3.03
+      },
+      "general": {
+        "status": "completed",
+        "blocked_reason": null,
+        "completed_subgoals": [
+          "Navigate to the profile page and extract the reference ID.",
+          "Navigate to the confirmation page and enter the extracted reference ID."
+        ],
+        "model_calls": 16,
+        "controller_model_calls": 3,
+        "child_model_calls": 13,
+        "subgoal_children": 2,
+        "duration_s": 7.86,
+        "error": null,
+        "planner_schema_valid_count": 3,
+        "planner_schema_total_count": 3
+      },
+      "legacy_success": true,
+      "general_success": true,
+      "meets_success_gate": true,
+      "model_call_overhead_pct": 100.0,
+      "meets_overhead_gate": false
+    }
+  ]
+}

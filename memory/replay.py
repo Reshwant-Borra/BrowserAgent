@@ -9,9 +9,16 @@ Event-payload conventions this module understands (see memory/event_store.py Eve
   ACTION_RESULT      {"action_fingerprint", "post_state_hash", "result_data", "error"}
   VERIFICATION_RESULT payload {"action_fingerprint"}; verification_result column holds the checks
   RECOVERY_TRANSITION {"from", "to", "reason"}
-  SUBGOAL_CHANGED    {"subgoal", "plan"}
+  SUBGOAL_CHANGED    {"subgoal", "plan"} — "subgoal": null is a deliberate clear, distinct
+                     from the key being absent (see below)
   TASK_COMPLETED     {"result"}
   TASK_BLOCKED       {"reason"}
+
+WORKSPACE_MUTATED, DELEGATE_STARTED, DELEGATE_RESULT, and COMPLETION_EVALUATED (general-
+controller migration, see agent/controller.py) intentionally have no bespoke handling here —
+they still advance current_step/last_event_id via the loop below, same as CHECKPOINT/
+COMPACTION_* already do, but carry no TaskState field of their own. Their own state lives in
+WorkspaceStore's projection (memory/workspace_store.py) and the event log itself.
 """
 from __future__ import annotations
 
@@ -61,10 +68,18 @@ def replay_task(task_id: str, events: list[Event]) -> TaskState:
             state.recovery_level = ev.payload.get("to", state.recovery_level)
 
         elif ev.type == EventType.SUBGOAL_CHANGED:
-            state.current_subgoal = ev.payload.get("subgoal", state.current_subgoal)
+            # A payload with no "subgoal" key at all means "leave it as-is" (matches the old
+            # default-preserving behavior); a payload with "subgoal": null is a deliberate
+            # clear (e.g. the general controller's plan is exhausted) and must actually move
+            # current_subgoal to None rather than being coerced back to the old value.
+            new_subgoal = ev.payload["subgoal"] if "subgoal" in ev.payload else state.current_subgoal
+            if (state.current_subgoal and state.current_subgoal != new_subgoal
+                    and state.current_subgoal not in state.completed_subgoals):
+                # The subgoal this event supersedes is done (whether by completion or by a
+                # replan moving past it) — record it before overwriting current_subgoal below.
+                state.completed_subgoals = state.completed_subgoals + [state.current_subgoal]
+            state.current_subgoal = new_subgoal
             state.plan = ev.payload.get("plan", state.plan)
-            if state.current_subgoal and state.current_subgoal not in state.completed_subgoals:
-                pass  # only appended to completed_subgoals when the *next* subgoal supersedes it
             state.retry_count = 0
 
         elif ev.type == EventType.TASK_COMPLETED:

@@ -1,0 +1,10 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Confirm</title></head>
+<body>
+  <h1>Confirm Reference ID</h1>
+  <input id="ref-input" type="text" />
+  <button id="confirm-btn" type="button" onclick="if (document.getElementById('ref-input').value === 'REF-3391') { window.location.href = 'receipt.html'; } else { document.getElementById('confirm-result').textContent = 'Rejected'; }">Confirm</button>
+  <p id="confirm-result"></p>
+</body>
+</html>

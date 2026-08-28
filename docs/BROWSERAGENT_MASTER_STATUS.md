@@ -1352,8 +1352,231 @@ above (`349 passed, 1 skipped`) includes these new tests.
 
 **Not built in this pass** (per the doc's explicit Phase 0/1 scope — no `GeneralAgentController`,
 no `ControllerDecision`/`CompletionEvaluation`, no routing changes, no `agent/context_builder.py`
-injection of workspace entities): the workspace exists and is fully rebuildable, but nothing in
-the running system creates a `WorkspacePatch` yet. `router/`, `agent/loop.py`,
-`agent/context_builder.py`, `BatchOrchestrator`, and `WorkflowOrchestrator` are all byte-for-byte
-unchanged. That is Phase 2 (general controller, shadow/fixture mode) and Phase 3 (generic entity
-collection wired into `finish`/`structured_result` ingest) — not requested, not started.
+injection of workspace entities): the workspace exists and is fully rebuildable, but at the time
+this section was written nothing in the running system created a `WorkspacePatch` yet. See
+Section 27 for Phase 2 (general controller, shadow/fixture mode), which is the first thing that
+actually creates one. `router/`, `agent/loop.py`, `agent/context_builder.py`'s existing
+click-level rendering path, `BatchOrchestrator`, and `WorkflowOrchestrator` remain unchanged even
+after Phase 2 — see Section 27 for exactly what did change.
+
+## 27. General Autonomous Agent Migration — Phase 2 (general controller, shadow/fixture mode)
+
+Per `BrowserAgent_General_Autonomous_Agent_Architecture_REVISED.pdf` section 18, on top of
+Section 26's Phase 0/1 work (`main` @ `7a91d27`). Landed at the user's explicit request
+("Implement Phase 2... Do not begin Phase 3"), including an explicit request to verify Section
+26's own Phase 0/1 work was done correctly — two real gaps were found and fixed; see 27.0.
+
+### 27.0 Phase 1 correctness check (requested this pass) — two gaps found and fixed
+
+1. **`cli/trace.py` was never modified in Phase 1**, even though the architecture doc's Phase 1
+   modify-list explicitly names it, and section 20 ("Trace and Observability Additions")
+   explicitly requires "plan/subgoal transitions, workspace mutations (entity IDs/field names,
+   not secret values)..." to render. Before this pass, `SUBGOAL_CHANGED`/`WORKSPACE_MUTATED`
+   events fell all the way through `build_task_trace`'s event loop into `raw_events` only —
+   invisible in the default (non-verbose) render, visible only via `--verbose`'s raw JSON dump.
+   Fixed: `StepTrace` gained `subgoal_change`/`workspace_mutation`/`delegate_started`/
+   `delegate_result`/`completion_evaluation` fields (the latter three needed by this same pass's
+   Phase 2 events), each rendered concisely in `render_task_trace` — entity IDs and fact *keys*
+   only, never attribute/fact/excerpt *values* (`_summarize_workspace_mutation`). New test:
+   `tests/unit/test_trace.py::test_general_controller_events_render_concisely`, which asserts
+   deliberately-planted "SECRET_..." values never appear in the non-verbose render.
+2. **`memory/replay.py`'s `SUBGOAL_CHANGED` handling silently no-op'd `completed_subgoals`** —
+   the `if ... not in state.completed_subgoals: pass` branch (present before this pass) computed
+   a condition and then did nothing with it; `completed_subgoals` was dead state, never actually
+   populated by replay. No existing test asserted on it, so this shipped unnoticed in Phase 1.
+   Fixed to actually append the just-superseded subgoal, and to correctly distinguish a
+   `SUBGOAL_CHANGED` payload with no `"subgoal"` key (preserve current value — old behavior)
+   from one with `"subgoal": null` (a deliberate clear, e.g. "plan exhausted" — must actually
+   move `current_subgoal` to `None`, which Phase 2's `_advance_subgoal` relies on). This was a
+   correctness bug the Phase 2 controller would have hit immediately (its repeated-failure/
+   plan-exhaustion logic reads `completed_subgoals` and depends on `current_subgoal` reaching
+   `None`), so finding it before Phase 2 code ran against it was the direct benefit of the check.
+3. **`agent/context_builder.py`'s `build_workspace_summary` never rendered `WorkspaceView.facts`
+   at all** (only entities/evidence/open_questions/completion_requirements) — found while
+   diagnosing the 27.2 benchmark regression below, not from a pre-existing test gap, since no
+   Phase 1 test exercised the planner/controller prompt path yet (Phase 1 built the store, not
+   a consumer of it). Not a Phase 1 regression exactly — Phase 1 never claimed complete workspace
+   rendering — but genuinely incomplete relative to section 8's "inject...top-k relevant
+   workspace entities/evidence" instruction, which in spirit covers facts too. Fixed as part of
+   27.2's diagnosis: `inference/prompt.py::render_workspace_block` gained a `facts` parameter;
+   `build_workspace_summary` now passes `workspace.facts`, filtered to drop keys starting with
+   `_` (controller-internal bookkeeping — see 27.2's hub-URL fact — never shown to the model).
+
+Everything else in Phase 1 (event-sourcing invariant, rebuild equivalence, heterogeneous entity
+types, `WorkspacePatchError` validation-before-write) re-verified correct on inspection; the full
+suite (Section 27.4) re-confirms it.
+
+### 27.1 What was built
+
+New: `agent/controller_models.py` (`ControllerDecision`, `CompletionEvaluation` — exactly the
+shapes in section 7, including the full `delegate_batch`/`delegate_workflow`/`discover_sources`
+decision literals even though Phase 2 doesn't implement them — see 27.1.3), `agent/planner.py`
+(schema-constrained qwen3:8b calls: `initial_plan`, `replan`, `evaluate_completion`, mirroring
+`router/semantic_planner.py`'s `TypeAdapter(...).json_schema()` + `client.complete(...,
+json_schema=...)` pattern exactly, with its own system prompt distinct from `inference/
+prompt.py`'s click-level `SYSTEM_BLOCK` per section 14's "distinct structured planner/executor
+prompts" decision), `agent/controller.py` (`GeneralAgentController` — the receding-horizon loop
+itself, section 7.1/7.2).
+
+Modified (additive, no behavior change to any existing path): `agent/config.py` (new
+`AgentControlConfig` dataclass, `AppConfig.agent` field, default `control_mode: "legacy"`),
+`config/default.yaml` (matching `agent:` block), `memory/event_store.py` (`DELEGATE_STARTED`,
+`DELEGATE_RESULT`, `COMPLETION_EVALUATED` added to `EventType` — the last of section 16's four
+pre-approved new event types, `WORKSPACE_MUTATED` having landed in Phase 1), `memory/replay.py`
+(bugfix, 27.0.2), `agent/context_builder.py` (`build_workspace_summary` — the "relevant workspace
+slice" section 8 asks for, consumed only by `agent/planner.py`'s controller-level prompts, never
+by `AgentLoop`'s own click-level `build_tiered_context`/`build_prompt`), `inference/prompt.py`
+(`render_workspace_block`), `cli/trace.py` (27.0.1).
+
+**Confirmed inert everywhere else**: `grep`ing the whole tree for `config.agent.` / `control_mode`
+outside `agent/config.py`, `agent/controller.py`, `agent/planner.py`, and the two new
+`benchmarks/general_agent/` scripts returns nothing — `router/`, `ui/`, `agent/loop.py`, `batch/`,
+`workflow/` never read it. The general controller is reachable only by directly constructing
+`GeneralAgentController` (as the tests and live benchmark do) — genuinely "shadow/fixture mode,"
+not routed from anywhere a real user request would reach it.
+
+#### 27.1.1 Task identity and delegation model
+
+One **control task** — the controller's own `task_id`, created directly via `EventStore.
+create_task` (no browser, no `AgentLoop`) — owns plan/subgoal state via the *exact same*
+`task_state`/`TaskStateStore` machinery every other task already uses (Phase 1's "reuse
+`task_state.plan`/`current_subgoal`/`completed_subgoals`" instruction, honored literally: no new
+normalized table for this). Each subgoal spawns its own, completely ordinary child `AgentLoop`
+task (`AgentLoop.create_new`, unmodified) — own `task_id`, own event log/db, `success_criteria=
+[]` (mirrors `batch/orchestrator.py::_success_criteria`'s existing pattern exactly, relying on
+the same "prior verified action or evidence-backed `structured_result`" finish gate already in
+`agent/loop.py`) — sharing only a browser profile directory with its siblings (`{control_task_id}/
+subgoal_browser_profile`, session continuity across subgoals) via `BatchPolicy`'s already-existing
+`SessionMode.SHARED` idiom, never an event log. Delegation start/outcome are themselves
+`DELEGATE_STARTED`/`DELEGATE_RESULT` events *on the control task*, which is what makes both "crash
+between two subgoals" and "crash mid-subgoal, discovered on resume" cleanly resumable from
+persisted state alone — see 27.1.2.
+
+#### 27.1.2 Crash recovery
+
+`_reconcile_dangling_delegate` scans the control task's own events for a `DELEGATE_STARTED` with
+no matching `DELEGATE_RESULT` (mirrors `agent/loop.py`'s own `_reconcile_pending_intent`) and, if
+found, calls `AgentLoop.resume` (never `create_new`) on that exact child before doing anything
+else. If the child had already fully completed before the crash, `AgentLoop.resume(...).run()`
+returns its final state immediately without any model call (`agent/loop.py`'s own `run()` checks
+`state.status in ("completed", "blocked")` first) — reconciliation just ingests the already-done
+result. Proven by `tests/integration/test_general_controller.py::
+test_crash_between_child_completion_and_delegate_result_is_recoverable`: drives a real subgoal to
+real completion (real Playwright, real fixture server), deliberately stops short of recording
+`DELEGATE_RESULT` (the crash), closes the controller, constructs a **fresh**
+`GeneralAgentController.resume(...)` instance (a scripted model client that would raise if
+`.complete()` were ever called stands in for "no live model available on this resumed instance"),
+and asserts exactly one `DELEGATE_STARTED` and one `DELEGATE_RESULT` exist afterward, referencing
+the same `child_task_id` — no duplicate/lost work.
+
+#### 27.1.3 Decisions Phase 2 doesn't implement
+
+`ControllerDecision.decision` includes `delegate_batch`/`delegate_workflow`/`discover_sources`
+because that is the one shared contract section 7 defines for every phase — but Phase 2's own
+planner system prompt explicitly instructs the model to never choose them ("Execution in this
+phase: direct subgoals only... No batch/workflow delegation yet", section 18), and
+`_apply_controller_decision` fails safe with a clear `blocked_reason` naming the unimplemented
+decision if the model ever ignores that instruction, rather than crashing or silently dropping it.
+`tests/integration/test_general_controller.py::test_unsupported_delegate_decision_fails_safe`
+covers this directly, live-benchmark data (27.2) shows the real qwen3:8b planner never actually
+chose one of these three in any of the 22 live planner calls across three scenarios.
+
+#### 27.1.4 The "hub URL" fix (found and fixed mid-Phase-2, not a later phase's problem)
+
+First implementation threaded the *previous* subgoal's ending URL forward as the *next*
+subgoal's starting point (`explicit_target_url`) — correct for a strictly sequential
+fact-passing chain (`sequential_form_fill`'s "read ID on page A, enter it on page B" shape) but
+wrong for a "hub and branch" plan (`compare_and_report`'s directory-page-links-to-independent-
+detail-pages shape): a subgoal like "extract StackForge's price" started on whatever page the
+*previous* subgoal ("extract NimbusHost's price") had ended on — a different site's unrelated
+detail page, no path back to the directory — and repeatedly failed until the replan budget was
+exhausted. Diagnosed directly from the first live run of `benchmarks/general_agent/
+run_phase2_controller.py` (27.2's "before" numbers, superseded below): `compare_and_report`
+regressed *below* the legacy baseline (legacy completed in 4 steps; the general controller
+blocked after exhausting all 6 replans). Fixed: the task's original starting page is persisted
+once as a workspace fact (`_hub_url`, `agent/controller.py::_remember_hub_url`) and every
+subgoal's child always starts there — a safe general default in the absence of resource-aware
+subgoal targeting (`ControllerDecision.resource_refs` / a real `ResourceResolver` integration are
+deliberately out of Phase 2's scope — `router/resources.py` stays "KEEP + EXTEND" per section 15,
+not touched this phase). A child can still navigate multiple hops from the hub within its own
+subgoal run, same as `sequential_form_fill`'s children already did.
+
+### 27.2 Live benchmark: `benchmarks/general_agent/run_phase2_controller.py`
+
+Three **new, "unseen"** three-procedure fixtures (`benchmarks/general_agent/fixtures/
+phase2_unseen/` — not reused from Section 26's seven Phase 0 scenarios, per the PASS gate's
+"unseen local tasks" wording): `multi_step_registration` (read an invite code → verify it on a
+different page → enable a toggle on a third page), `compare_and_report` (hub-and-branch: visit
+two independent detail pages from a directory, compare prices), `sequential_form_fill`
+(cross-page fact-passing → a third page's confirmation number). Each ran twice per scenario: once
+through the plain, unmodified `AgentLoop` (one monolithic task, full goal text up front — the
+exact same shape as Section 26's Phase 0 baseline runner) and once through
+`GeneralAgentController` — both against a **live** `qwen3:8b`/Ollama backend, model-call counts
+captured by wrapping the real `InferenceClient` (`_CountingClient`) rather than adding counters to
+production code. Full results: `benchmarks/general_agent/results/
+phase2_controller_2026-08-28.json`.
+
+| Scenario | Legacy | General | Success gate (`>= legacy`) | Model-call overhead | Overhead gate (`<= 25%`) |
+|---|---|---|---|---|---|
+| multi_step_registration | **failed** (step budget exhausted, 26 calls) | **completed** (25 calls) | MET (general beat legacy) | −3.8% | N/A — legacy itself failed, no baseline to compare overhead against |
+| compare_and_report | completed (4 calls) | completed (17 calls) | MET | +325.0% | NOT MET |
+| sequential_form_fill | completed (8 calls) | completed (16 calls) | MET | +100.0% | NOT MET |
+
+**Success gate: 3/3 MET.** Planner schema validity: **22/22 (100%)** across all live
+`ControllerDecision`/`CompletionEvaluation` calls in this run — no `PlannerOutputError` was ever
+raised against the real model. No hard-coded domain/site-specific conditionals were added
+anywhere (the controller has zero knowledge of "vacuum", "hosting plan", "invite code", etc. —
+every fixture-specific detail lives only in the goal text a caller supplies). Crash/restart:
+covered by 27.1.2, not re-run live here (already proven deterministically).
+
+**Overhead gate: NOT MET** on the two scenarios where it's applicable (`compare_and_report`
++325%, `sequential_form_fill` +100%, both far over the 25% budget). **Diagnosed root cause**
+(the doc's explicit "FAIL interpretation" instruction: "compare one-shot plan, receding-horizon,
+and current ReAct-like behavior before proceeding" — this benchmark *is* that comparison):
+subgoal decomposition has a real per-boundary cost that a single continuous ReAct loop doesn't
+pay — each subgoal's child `AgentLoop` starts completely fresh (new task, fresh observation, no
+memory of the parent's prior steps beyond the workspace summary's evidence excerpts) and re-earns
+its own orientation before acting, several times per task instead of once. On a task simple
+enough that the legacy agent already solves it in 4-8 model calls, that fixed per-subgoal
+re-orientation cost dominates the total; on a task complex enough that the legacy agent fails
+outright (`multi_step_registration`), decomposition's overhead is *negative* — cheaper than a
+ReAct loop that burns its whole step budget failing. This is not attributable to a shallow bug
+(the same live run has 100% planner schema validity and correct hub-URL behavior); it is the
+structural cost of "one child `AgentLoop` per subgoal" as currently implemented. **Not fixed this
+pass** — the fix space (reusing one continuous `AgentLoop`/browser session across subgoal
+boundaries instead of spawning a fresh child each time, or a lighter-weight in-loop subgoal
+transition that doesn't re-pay full task/browser-profile setup) is a real architectural change
+belonging to a scoped follow-up, not something to retrofit under this session's Phase 2 mandate.
+Left here as an explicit, diagnosed, unresolved finding for whoever plans the next pass — per the
+architecture doc's own instruction, this is reported, not silently absorbed into a claimed PASS.
+
+### 27.3 Trace observability
+
+`browser-agent trace --task <control_task_id>` (or `--verbose` for full raw payloads) now renders
+Phase 2's events concisely: `Subgoal: -> 'active subgoal' (plan: [...])`, `Delegate started:
+agent_loop subgoal='...' child_task=<id>`, `Delegate result: child_task=<id> status=completed`,
+`Completion eval: satisfied=True next=finish missing=[]`, plus Phase 1's `Workspace: +entities
+[...], +facts [...], +evidence -> [...]` — entity IDs and fact/field *names* only, never
+attribute/fact/excerpt values (27.0.1).
+
+### 27.4 PASS gate summary
+
+- Full regression suite: **`python -m pytest -q` → 392 passed, 1 skipped** (the skipped test is
+  Section 26's opt-in `RUN_LIVE_BENCHMARKS=1` gate, correctly inert by default) — up from
+  Section 26's 349 passed; the +43 are this pass's `tests/unit/test_controller_models.py` (27),
+  `tests/unit/test_planner.py` (8), `tests/integration/test_general_controller.py` (7), and one
+  new `tests/unit/test_trace.py` case, minus none removed.
+- Unseen-task success: **MET (3/3)**.
+- Planner schema validity: **MET (22/22, 100%)**.
+- No new hard-coded domain workflow files: **MET** (verified by inspection — zero
+  fixture/site-specific strings anywhere in `agent/controller.py`/`agent/planner.py`).
+- Crash/restart restores parent plan/workspace: **MET** (27.1.2).
+- Model-call overhead `<= 25%`: **NOT MET** on the 2/3 scenarios where legacy itself succeeded
+  (27.2) — diagnosed, not silently passed, not fixed this pass.
+
+**Net verdict**: Phase 2 infrastructure is complete, correct, and covered by both deterministic
+(scripted, crash-safe) and live-model tests; it measurably improves task success on multi-step
+goals the legacy agent cannot complete at all, at a real and currently-unresolved model-call-cost
+premium on goals the legacy agent could already solve cheaply. Per the architecture doc's
+Section 18 rule ("Claude Code must implement exactly one phase at a time... A failed phase is
+diagnosed before the next phase begins"), Phase 3 has **not** been started.

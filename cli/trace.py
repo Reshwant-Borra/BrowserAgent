@@ -143,6 +143,13 @@ class StepTrace:
     started_at: Optional[str] = None
     ended_at: Optional[str] = None
     raw_events: list[Event] = field(default_factory=list)
+    # General-controller migration (agent/controller.py, memory/workspace_store.py) — concise,
+    # secret-free summaries only; full payloads remain available via --verbose's raw dump.
+    subgoal_change: Optional[dict] = None
+    workspace_mutation: Optional[dict] = None
+    delegate_started: Optional[dict] = None
+    delegate_result: Optional[dict] = None
+    completion_evaluation: Optional[dict] = None
 
 
 @dataclass
@@ -229,6 +236,25 @@ def build_task_trace(config: AppConfig, task_id: str, label: str) -> Optional[Ta
         elif e.type == EventType.RECOVERY_TRANSITION:
             trace.recovery_transitions += 1
             st.recovery_transitions.append(e.payload)
+        elif e.type == EventType.SUBGOAL_CHANGED:
+            st.subgoal_change = {"subgoal": e.payload.get("subgoal"), "plan": e.payload.get("plan")}
+        elif e.type == EventType.WORKSPACE_MUTATED:
+            st.workspace_mutation = _summarize_workspace_mutation(e.payload)
+        elif e.type == EventType.DELEGATE_STARTED:
+            st.delegate_started = {
+                "substrate": e.payload.get("substrate"), "subgoal": e.payload.get("subgoal"),
+                "child_task_id": e.payload.get("child_task_id"),
+            }
+        elif e.type == EventType.DELEGATE_RESULT:
+            st.delegate_result = {
+                "child_task_id": e.payload.get("child_task_id"), "status": e.payload.get("status"),
+            }
+        elif e.type == EventType.COMPLETION_EVALUATED:
+            st.completion_evaluation = {
+                "satisfied": e.payload.get("satisfied"),
+                "next_recommendation": e.payload.get("next_recommendation"),
+                "missing_requirements": e.payload.get("missing_requirements") or [],
+            }
 
     trace.steps = [steps_by_no[k] for k in sorted(steps_by_no) if k > 0]
 
@@ -251,6 +277,23 @@ def build_task_trace(config: AppConfig, task_id: str, label: str) -> Optional[Ta
         trace.duration_s = (end - start).total_seconds()
 
     return trace
+
+
+def _summarize_workspace_mutation(payload: dict) -> dict:
+    """Entity IDs/field names only, never attribute or evidence values (ARCHITECTURE.md-style
+    "never log chain-of-thought or passwords/cookies" convention, applied here to the
+    architecture doc's section 20 instruction: "workspace mutations (entity IDs/field names,
+    not secret values)")."""
+    return {
+        "added_entity_ids": [e.get("id") for e in payload.get("add_entities") or []],
+        "updated_entity_ids": [e.get("id") for e in payload.get("update_entities") or []],
+        "added_fact_keys": [f.get("key") for f in payload.get("add_facts") or []],
+        "added_evidence_targets": [
+            ev.get("entity_id") or ev.get("fact_key") for ev in payload.get("add_evidence") or []
+        ],
+        "open_questions_added": len(payload.get("open_questions_add") or []),
+        "open_questions_resolved": len(payload.get("open_questions_resolve") or []),
+    }
 
 
 def _percentile(values: list[float], pct: float) -> Optional[float]:
@@ -303,6 +346,35 @@ def render_task_trace(trace: TaskTrace, verbose: bool) -> str:
             lines.append(f"  Verified: {verdict}{reason}")
         for rt in st.recovery_transitions:
             lines.append(f"  Recovery: {rt.get('from')} -> {rt.get('to')} ({rt.get('reason')})")
+        if st.subgoal_change:
+            lines.append(f"  Subgoal:  -> {st.subgoal_change.get('subgoal')!r} "
+                          f"(plan: {st.subgoal_change.get('plan')})")
+        if st.workspace_mutation:
+            wm = st.workspace_mutation
+            parts = []
+            if wm["added_entity_ids"]:
+                parts.append(f"+entities {wm['added_entity_ids']}")
+            if wm["updated_entity_ids"]:
+                parts.append(f"~entities {wm['updated_entity_ids']}")
+            if wm["added_fact_keys"]:
+                parts.append(f"+facts {wm['added_fact_keys']}")
+            if wm["added_evidence_targets"]:
+                parts.append(f"+evidence -> {wm['added_evidence_targets']}")
+            if wm["open_questions_added"] or wm["open_questions_resolved"]:
+                parts.append(f"open_questions +{wm['open_questions_added']}/"
+                              f"-{wm['open_questions_resolved']}")
+            lines.append(f"  Workspace: {', '.join(parts) if parts else '(no-op patch)'}")
+        if st.delegate_started:
+            lines.append(f"  Delegate started: {st.delegate_started['substrate']} "
+                          f"subgoal={st.delegate_started['subgoal']!r} "
+                          f"child_task={st.delegate_started['child_task_id']}")
+        if st.delegate_result:
+            lines.append(f"  Delegate result:  child_task={st.delegate_result['child_task_id']} "
+                          f"status={st.delegate_result['status']}")
+        if st.completion_evaluation:
+            ce = st.completion_evaluation
+            lines.append(f"  Completion eval: satisfied={ce['satisfied']} "
+                          f"next={ce['next_recommendation']} missing={ce['missing_requirements']}")
         if st.started_at and st.ended_at:
             start, end = _parse_ts(st.started_at), _parse_ts(st.ended_at)
             if start and end:

@@ -105,3 +105,54 @@ def test_find_recent_job_returns_newest_by_created_at(tmp_path):
 def test_build_task_trace_returns_none_for_missing_task(tmp_path):
     config = _config(tmp_path)
     assert trace_mod.build_task_trace(config, "does-not-exist", "task") is None
+
+
+def test_general_controller_events_render_concisely(tmp_path):
+    """Phase 1/2 (agent/controller.py, memory/workspace_store.py) event types must show up in
+    the default (non-verbose) trace render — section 20 of BrowserAgent_General_Autonomous_
+    Agent_Architecture_REVISED.pdf: plan/subgoal transitions, workspace mutations (entity
+    IDs/field names only, never values), delegate start/result child IDs, completion
+    evaluations."""
+    config = _config(tmp_path)
+    task_id = "ctrl123"
+    db_path = Path(config.storage.tasks_dir) / task_id / "task.db"
+    es = EventStore(db_path)
+    try:
+        es.create_task(task_id, "goal", [])
+        es.append(task_id, 0, EventType.TASK_CREATED, {"goal": "goal", "success_criteria": []})
+        es.append(task_id, 1, EventType.SUBGOAL_CHANGED, {"subgoal": "find pricing", "plan": ["find pricing"]})
+        es.append(task_id, 2, EventType.DELEGATE_STARTED, {
+            "substrate": "agent_loop", "subgoal": "find pricing", "child_task_id": "child001",
+        })
+        es.append(task_id, 3, EventType.DELEGATE_RESULT, {
+            "child_task_id": "child001", "status": "completed", "result": "SECRET_PRICE_VALUE_42",
+        })
+        es.append(task_id, 4, EventType.WORKSPACE_MUTATED, {
+            "add_entities": [{"id": "ent_1", "entity_type": "candidate",
+                               "attributes": {"price_usd": "SECRET_ATTR_VALUE"}}],
+            "add_facts": [{"key": "budget", "value": "SECRET_FACT_VALUE"}],
+            "add_evidence": [{"entity_id": "ent_1", "excerpt": "SECRET_EXCERPT_TEXT", "source_event_id": 3}],
+            "update_entities": [], "open_questions_add": [], "open_questions_resolve": [],
+        })
+        es.append(task_id, 5, EventType.COMPLETION_EVALUATED, {
+            "satisfied": False, "missing_requirements": ["pricing not confirmed"],
+            "unsupported_claims": [], "next_recommendation": "continue",
+        })
+    finally:
+        es.close()
+
+    trace = trace_mod.build_task_trace(config, task_id, "task")
+    assert trace is not None
+    rendered = trace_mod.render_task_trace(trace, verbose=False)
+
+    assert "find pricing" in rendered
+    assert "agent_loop" in rendered and "child001" in rendered
+    assert "status=completed" in rendered
+    assert "+entities ['ent_1']" in rendered
+    assert "+facts ['budget']" in rendered
+    assert "satisfied=False" in rendered and "pricing not confirmed" in rendered
+    # The doc's explicit instruction: entity IDs/field names only, never the values.
+    assert "SECRET_PRICE_VALUE_42" not in rendered
+    assert "SECRET_ATTR_VALUE" not in rendered
+    assert "SECRET_FACT_VALUE" not in rendered
+    assert "SECRET_EXCERPT_TEXT" not in rendered

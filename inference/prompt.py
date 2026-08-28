@@ -174,6 +174,49 @@ def render_recovery_block(recovery_level: str, recent_failures: list[str]) -> st
     return "\n".join(lines)
 
 
+def render_workspace_block(
+    entities: list[dict],
+    evidence: list[dict],
+    open_questions: list[str],
+    completion_requirements: list[str],
+    facts: Optional[dict] = None,
+) -> str:
+    """The general controller's workspace slice (BrowserAgent_General_Autonomous_Agent_
+    Architecture_REVISED.pdf, section 6) — entities/evidence/open questions/completion
+    requirements, already capped to a bounded top-k by the caller (agent/context_builder.py's
+    build_workspace_summary). Used only in agent/planner.py's structured planning/replanning/
+    completion-evaluation prompts, never in the click-level SYSTEM_BLOCK above — the
+    controller's high-level view of task state is a different contract from the executor's
+    per-step page view."""
+    facts = facts or {}
+    if not entities and not evidence and not open_questions and not completion_requirements and not facts:
+        return "WORKSPACE\n(empty — nothing collected yet)"
+    lines = ["WORKSPACE"]
+    if completion_requirements:
+        lines.append("Completion requirements:")
+        lines.extend(f"- {r}" for r in completion_requirements)
+    if facts:
+        lines.append("Facts gathered so far:")
+        for key, value in facts.items():
+            lines.append(f"- {key} = {value}")
+    if entities:
+        lines.append("Entities collected so far:")
+        for e in entities:
+            attrs = ", ".join(f"{k}={v}" for k, v in (e.get("attributes") or {}).items())
+            lines.append(f"- [{e['id']}] {e.get('entity_type')} \"{e.get('name') or ''}\" "
+                          f"status={e.get('status')} ({attrs})")
+    if evidence:
+        lines.append("Evidence:")
+        for ev in evidence:
+            target = ev.get("entity_id") or ev.get("fact_key") or "(general)"
+            lines.append(f"- {target}: {ev.get('excerpt')} "
+                         f"[source event {ev.get('source_event_id')}, confidence {ev.get('confidence'):.2f}]")
+    if open_questions:
+        lines.append("Open questions:")
+        lines.extend(f"- {q}" for q in open_questions)
+    return "\n".join(lines)
+
+
 REPLAN_SYSTEM_BLOCK = """SYSTEM
 You are updating the plan for a browser task that is stuck. Respond with exactly one JSON
 object: {"subgoal": "<short next subgoal>", "plan": ["<step>", "..."]}. Keep the plan short

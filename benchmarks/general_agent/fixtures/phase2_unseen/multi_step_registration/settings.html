@@ -1,0 +1,10 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Account Settings</title></head>
+<body>
+  <h1>Account Settings</h1>
+  <label><input id="notify-toggle" type="checkbox" /> Enable weekly summary email</label>
+  <button id="save-btn" type="button" onclick="document.getElementById('save-result').textContent = document.getElementById('notify-toggle').checked ? 'Saved: weekly summary enabled' : 'Saved: weekly summary disabled';">Save</button>
+  <p id="save-result"></p>
+</body>
+</html>
