@@ -523,7 +523,16 @@ class AgentLoop:
             return self._complete_after_verified_success(task, state, step_no, decision, new_observation)
 
         noop = detect_noop(pre_hash, post_hash, expected_change=not decision.expected_result.is_empty())
-        stalled_readonly_repeat = decision.action in _STALL_LOOP_ELIGIBLE_ACTIONS and pre_hash == post_hash
+        # Gating on pre_hash == post_hash assumes a stalled read-only repeat leaves the page
+        # byte-for-byte identical. Dynamic pages (rotating carousels, "customers also viewed",
+        # timestamps) reliably violate that: every reload of the *same* URL produces a new
+        # hash even though nothing the agent did changed. That let a real stall (observed live:
+        # 14 consecutive open_url calls to one Amazon URL) slip past this guard because the
+        # hash kept moving. The fingerprint-repetition check below already establishes "the
+        # model chose this exact read-only action N times in a row" — that alone is the stall
+        # signal for these action types; requiring the hash to also match adds a false negative
+        # without preventing any false positive (open_url/extract have no side effects to protect).
+        stalled_readonly_repeat = decision.action in _STALL_LOOP_ELIGIBLE_ACTIONS
         repeated_action_loop = (
             detect_repeated_action(state.recent_actions, fingerprint, self.config.recovery.identical_action_limit)
             or detect_repeated_semantic_action(
@@ -981,7 +990,11 @@ class AgentLoop:
         result_text = decision.params.get("result", "")
         blob = self._finish_evidence_blob(observation)
         matched = [c for c in task.success_criteria if c.lower() in blob]
-        if not task.success_criteria and not any(r.get("verification") == "pass" for r in state.recent_actions):
+        if (
+            not task.success_criteria
+            and not any(r.get("verification") == "pass" for r in state.recent_actions)
+            and not self._has_evidence_backed_structured_result(decision)
+        ):
             self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {
                 "action": ActionType.FINISH.value,
                 "target": None,
@@ -1052,6 +1065,39 @@ class AgentLoop:
         state.status = "completed"
         self.state_store.save(state)
         return state
+
+    def _has_evidence_backed_structured_result(self, decision: ModelDecision) -> bool:
+        """Whether `finish`'s structured_result carries its own completion evidence.
+
+        The fallback terminal-evidence gate above was built for interactive tasks (a click/type
+        that either verifiably passed or didn't). Read-only extraction tasks (research/batch
+        work items always have empty success_criteria — see batch/orchestrator.py's
+        `_success_criteria`) have no such action to point to: the "verified action" *is* the
+        extraction itself. Without this check, a `finish` that already contains real,
+        evidence-backed findings gets discarded whenever the task's first action happened to be
+        something other than a passing open_url (observed live: a page reached via a batch
+        work item's implicit initial navigation started its extraction with a `click`, which
+        timed out, so there was no prior "pass" — the 7 correctly extracted prices on that page
+        were then thrown away and the task forced into a replan/recovery spiral instead of
+        finishing). A finding only counts if it has both a value and non-empty evidence text,
+        the same bar `batch/result_quality.py` applies when consuming it downstream.
+        """
+        structured = decision.params.get("structured_result")
+        if not isinstance(structured, dict):
+            return False
+        findings = structured.get("findings")
+        if isinstance(findings, list):
+            for item in findings:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("evidence") or "").strip() and str(item.get("value") or "").strip():
+                    return True
+        fields = structured.get("fields")
+        if isinstance(fields, dict):
+            for item in fields.values():
+                if isinstance(item, dict) and item.get("status") == "found" and str(item.get("evidence") or "").strip():
+                    return True
+        return False
 
     def _finish_evidence_blob(self, observation: PageObservation) -> str:
         current = self._observation_blob(observation)

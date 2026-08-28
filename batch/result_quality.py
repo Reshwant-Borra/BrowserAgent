@@ -255,6 +255,8 @@ def _normalize_research_field(raw: dict[str, Any], requested: list[str]) -> str 
         return "education_discount"
     if "public_api_docs" in requested and "api" in blob and any(word in blob for word in ("docs", "documentation", "rest")):
         return "public_api_docs"
+    if "item_name" in requested and any(word in blob for word in ("item", "product", "name", "title")):
+        return "item_name"
     return explicit if explicit and explicit in requested else None
 
 

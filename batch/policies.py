@@ -59,6 +59,35 @@ def read_only_allows(decision: ModelDecision, element_name: str | None = None) -
     }
 
 
+def _observations_indicate_auth_required(events: list[Event], last_error: str | None) -> bool:
+    """Mirrors `agent.auth_detect.looks_like_login_page`'s conservative bar: a page merely
+    having a "Sign in" nav link (Amazon, and virtually every e-commerce/major site, always
+    does) is not evidence of an auth wall on its own. The live in-loop check already knows
+    this and requires the keyword in the title or top-of-page heading text, not just anywhere
+    on the page. This post-hoc classifier used to scan the entire JSON-dumped event blob
+    instead — every OBSERVATION's full 30-element `element_names` list included — so any
+    batch work item that simply ran out of steps on a page with persistent nav chrome
+    mentioning "sign in" got mislabeled AUTH_REQUIRED regardless of the real cause (observed
+    live: an Amazon best-sellers page whose failure was actually a `finish` completion-gate
+    bug looping through recovery, correctly reaching MAX_STEPS, but reported to the user as a
+    login wall that never existed). Restricting the keyword scan to title + the first 5
+    visible-text lines — the same fields and limit `looks_like_login_page` uses — keeps this
+    check aligned with the one already proven safe for live decisions. `last_error` (e.g. a
+    runtime-policy block's explicit "login required" blocked_reason) is a deliberate, already-
+    classified signal rather than incidental page chrome, so it's still checked in full.
+    """
+    if last_error and blob_indicates_auth_required(last_error):
+        return True
+    for event in events:
+        if event.type != EventType.OBSERVATION:
+            continue
+        title = str(event.payload.get("title") or "")
+        heading_lines = list(event.payload.get("visible_text") or [])[:5]
+        if blob_indicates_auth_required(title) or any(blob_indicates_auth_required(line) for line in heading_lines):
+            return True
+    return False
+
+
 def classify_child_failure(events: list[Event], status: str, last_error: str | None = None) -> FailureCategory:
     # Authoritative, structural signal first: agent/loop.py's _block_by_runtime_policy
     # already records the exact failure_category (SCOPE_BLOCKED/READ_ONLY_BLOCKED) on the
@@ -79,7 +108,7 @@ def classify_child_failure(events: list[Event], status: str, last_error: str | N
     blob = "\n".join([json.dumps(e.payload).lower() for e in events] + [(last_error or "").lower()])
     if "captcha" in blob or "bot challenge" in blob:
         return FailureCategory.CAPTCHA_OR_BOT_CHALLENGE
-    if blob_indicates_auth_required(blob):
+    if _observations_indicate_auth_required(events, last_error):
         return FailureCategory.AUTH_REQUIRED
     if "unsupported" in blob or "malformed target" in blob or "malformed url" in blob:
         return FailureCategory.UNSUPPORTED_PAGE

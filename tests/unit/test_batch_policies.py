@@ -53,6 +53,31 @@ def test_read_only_blocked_not_misclassified_as_auth_required():
     assert category == FailureCategory.READ_ONLY_BLOCKED
 
 
+def test_step_budget_exhaustion_on_page_with_signin_nav_link_not_misclassified_as_auth_required():
+    """Regression for the real Amazon "find the 3 best vacuum cleaners" run
+    (runtime/tasks/bf2ea8beb1c0, batch ae5045ccc976, work item 1): the child task ran out of
+    its step budget (status stays "running", no TASK_BLOCKED event at all — there was no auth
+    wall, just a completion-gate bug forcing a replan/recovery spiral) but the batch orchestrator
+    reported failure_category=AUTH_REQUIRED anyway. The old blob-wide scan matched "sign in"
+    inside an OBSERVATION's `element_names` (Amazon's persistent "Hello, sign in Account &
+    Lists" nav item, present on literally every Amazon page) even though it never appeared in
+    the title or the top-of-page heading text. With no TASK_BLOCKED/explicit failure_category
+    and no auth-indicating last_error, this must fall through to MAX_STEPS."""
+    events = [
+        _event(EventType.OBSERVATION, {
+            "url": "https://www.amazon.com/Best-Sellers-Vacuum-Cleaners-Floor-Care/zgbs/home-garden/510106",
+            "title": "Amazon Best Sellers: Best Vacuum Cleaners & Floor Care",
+            "page_hash": "h1",
+            "element_names": ["main content", "Search, alt, forward slash", "Cart, shift, alt, c",
+                               "Hello, sign in Account & Lists", "Returns & Orders"],
+            "visible_text": ["Skip to", "Main content", "Keyboard shortcuts", "Search alt + /",
+                              "Cart shift + alt + C", "Delivering to Tampa 33647 Update location"],
+        }, step=1),
+    ]
+    category = classify_child_failure(events, "running")
+    assert category == FailureCategory.MAX_STEPS
+
+
 def test_genuine_login_wall_still_classified_as_auth_required():
     """A real login wall (agent/loop.py's live looks_like_login_page short-circuit) never
     sets an explicit failure_category on its TASK_BLOCKED event — the heuristic fallback

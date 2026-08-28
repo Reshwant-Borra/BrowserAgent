@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Dynamic Listing</title></head>
+<body>
+  <h1>Top Sellers</h1>
+  <p id="build-filename">Build filename: report-v3.zip</p>
+  <p id="recommendation">Loading recommendation...</p>
+  <script>
+    // Simulates a real dynamic listing page (e.g. Amazon's rotating "customers also
+    // viewed" carousel) rendering different content into the DOM on every load of the
+    // *same* URL, even though nothing the agent did caused it. This is what defeats a
+    // page-hash-based "did anything change" check for a stalled read-only repeat.
+    document.getElementById("recommendation").textContent =
+      "Recommended: item #" + Math.floor(Math.random() * 1000000);
+  </script>
+</body>
+</html>

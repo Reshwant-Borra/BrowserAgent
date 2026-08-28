@@ -101,6 +101,33 @@ async def test_repeated_readonly_action_with_no_state_change_triggers_recovery_e
     assert any(t.payload["reason"] == "loop_detected" for t in transitions)
 
 
+async def test_repeated_readonly_action_with_changing_hash_still_triggers_recovery_escalation(
+    make_agent_loop, fixture_site_url,
+):
+    """Root cause reconstructed from a real Amazon "find the 3 best vacuum cleaners" run
+    (runtime/tasks/bf2ea8beb1c0): the page above's fix (test_repeated_readonly_action_with_
+    no_state_change_triggers_recovery_escalation) only covers a page whose content never
+    changes. Amazon's best-sellers page re-renders different carousel/ad content on every
+    load of the *identical* URL, so pre_hash != post_hash on every single open_url — the old
+    `stalled_readonly_repeat = action in ELIGIBLE and pre_hash == post_hash` gate never fired,
+    and the live task spent 14 consecutive steps re-opening the same URL before exhausting its
+    step budget. dynamic_listing.html reproduces that: it renders a new random value into the
+    DOM on every load via client-side JS, so its hash changes each time even though the agent
+    is making zero real progress."""
+    url = fixture_site_url + "/dynamic_listing.html"
+    loop = make_agent_loop("Find the build filename on this ever-changing page", [], [
+        decision("open_url", params={"url": url}),
+        decision("open_url", params={"url": url}),
+        decision("open_url", params={"url": url}),
+        decision("finish", params={"result": "report-v3.zip"}),
+    ])
+    state = await loop.run(max_steps=10)
+    assert state.status == "completed"
+    events = read_events(loop)
+    transitions = [e for e in events if e.type == EventType.RECOVERY_TRANSITION]
+    assert any(t.payload["reason"] == "loop_detected" for t in transitions)
+
+
 async def test_repeated_wait_with_no_state_change_does_not_trigger_loop_escalation(
     make_agent_loop, fixture_site_url,
 ):
@@ -121,6 +148,64 @@ async def test_repeated_wait_with_no_state_change_does_not_trigger_loop_escalati
     events = read_events(loop)
     transitions = [e for e in events if e.type == EventType.RECOVERY_TRANSITION]
     assert not any(t.payload["reason"] == "loop_detected" for t in transitions)
+
+
+async def test_finish_with_evidence_backed_findings_completes_with_no_prior_verified_action(
+    make_agent_loop_at_url, fixture_site_url,
+):
+    """Root cause reconstructed from a real Amazon "find the 3 best vacuum cleaners" run
+    (runtime/tasks/bf2ea8beb1c0): a batch work item's child task starts already on its target
+    page (see make_agent_loop_at_url), so its first model decision need not be a navigating
+    open_url. When that first decision was instead `finish` with a `structured_result`
+    containing real, evidence-backed findings, `_handle_finish`'s fallback gate — "no
+    success_criteria (always true for batch/research children) and no prior action verified
+    pass" — rejected it outright without ever looking at the structured_result, discarding 7
+    correctly extracted prices and forcing the task into a replan/recovery spiral that never
+    recovered (it degraded into 14 consecutive same-URL open_url calls before exhausting its
+    step budget). The fix: evidence-backed structured_result counts as completion evidence in
+    its own right, same as a passing action would."""
+    url = fixture_site_url + "/workflow_multi_fact_a.html"
+    loop = make_agent_loop_at_url("Find the build filename on this page", [], [
+        decision("finish", params={
+            "result": "found the build filename",
+            "structured_result": {"findings": [{
+                "field": "item_name", "value": "report-v3.zip",
+                "source_url": url, "evidence": "Build filename: report-v3.zip",
+            }]},
+        }),
+    ], explicit_target_url=url)
+    state = await loop.run(max_steps=10)
+    assert state.status == "completed"
+    events = read_events(loop)
+    assert not any(
+        e.type == EventType.MODEL_DECISION and e.payload.get("error") == "model_completion_error"
+        for e in events
+    )
+
+
+async def test_finish_with_empty_structured_result_and_no_prior_action_is_still_rejected(
+    make_agent_loop_at_url, fixture_site_url,
+):
+    """Negative control for the fix above: a `finish` with no success_criteria, no prior
+    verified action, and no evidence-backed structured_result must still be rejected — the
+    evidence bypass only accepts genuine findings, not an empty/absent structured_result."""
+    url = fixture_site_url + "/workflow_multi_fact_a.html"
+    loop = make_agent_loop_at_url("Find the build filename on this page", [], [
+        decision("finish", params={"result": "I looked but found nothing"}),
+        decision("extract", params={}),
+        decision("finish", params={"result": "done", "structured_result": {"findings": [
+            {"field": "item_name", "value": "report-v3.zip", "source_url": url,
+             "evidence": "Build filename: report-v3.zip"},
+        ]}}),
+    ], explicit_target_url=url)
+    state = await loop.run(max_steps=10)
+    events = read_events(loop)
+    decision_errors = [
+        e for e in events
+        if e.type == EventType.MODEL_DECISION and e.payload.get("error") == "model_completion_error"
+    ]
+    assert decision_errors, "the unevidenced finish should have been rejected at least once"
+    assert state.status == "completed"
 
 
 async def test_consequential_action_is_not_auto_retried_after_failure(make_agent_loop, fixture_site_url):

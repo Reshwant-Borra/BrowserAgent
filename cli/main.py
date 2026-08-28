@@ -355,14 +355,29 @@ def _contract_from_name(name: str) -> ResultContract:
             },
         )
     if name == "research":
+        # Deliberately goal-agnostic: this contract backs every router-classified "research"
+        # job (see ui/jobs.py's _research_contract), from company/pricing lookups to "find the
+        # N best <items>" comparison asks. It used to hardcode a fixed fact checklist
+        # (pricing/education_discount/public_api_docs) left over from one benchmark fixture
+        # (tests/fixtures/multisite/generate_multisite.py's RESEARCH_VARIANTS) and applied it
+        # to every research job regardless of what was actually asked — observed live on a
+        # "find the 3 best vacuum cleaners" job, whose subgoal plan ended up asking the model
+        # to "check for education discount information" and "check for public API
+        # documentation availability", wasted steps on those irrelevant checks, and never had
+        # a field to hold a product's identity in the first place. `item_name` gives any
+        # extracted fact an entity to attach to — required for comparing multiple candidates,
+        # not just classifying one page as relevant/irrelevant.
         return ResultContract(
             name="research",
-            description="Classify relevance and extract requested facts with source and evidence.",
-            required_fields=["pricing", "education_discount", "public_api_docs", "source_url", "evidence"],
+            description=(
+                "Classify relevance and extract requested facts with source and evidence. "
+                "When the goal asks for multiple candidates (e.g. \"the N best X\"), identify "
+                "every distinct candidate item found on the page, not just one example."
+            ),
+            required_fields=["item_name", "value", "source_url", "evidence"],
             field_definitions={
-                "pricing": "pricing, plan, cost, seat, or monthly price information",
-                "education_discount": "education, school, student, teacher, or academic discount information",
-                "public_api_docs": "public API, REST API, developer documentation, or API docs availability",
+                "item_name": "the specific product, entity, or item name a fact is about",
+                "value": "the requested fact about that item (price, rating, or other distinguishing attribute)",
             },
         )
     return ResultContract(name=name)
@@ -451,6 +466,45 @@ async def cmd_batch_export(args: argparse.Namespace) -> None:
         print(f"Exported {args.batch_id} to {args.output}")
     finally:
         store.close()
+
+
+async def cmd_trace(args: argparse.Namespace) -> None:
+    from cli import trace as trace_mod
+
+    config = load_config(args.config)
+
+    if args.task:
+        task_trace = trace_mod.build_task_trace(config, args.task, label="task")
+        if task_trace is None:
+            print(f"No such task: {args.task}")
+            sys.exit(1)
+        print(trace_mod.render_task_trace(task_trace, verbose=args.verbose))
+        return
+
+    job = trace_mod.find_recent_job(config) if args.recent else trace_mod.find_job(config, args.job)
+    if job is None:
+        target = "any UI job" if args.recent else f"job {args.job}"
+        print(f"No such job: {target}")
+        sys.exit(1)
+
+    print(trace_mod.render_job_header(job))
+    print()
+
+    refs = trace_mod.resolve_child_tasks(config, job)
+    if not refs:
+        print("(no underlying AgentLoop task found for this job)")
+        return
+
+    for ref in refs:
+        task_trace = trace_mod.build_task_trace(config, ref.task_id, ref.label)
+        if task_trace is None:
+            print(f"--- {ref.label} (task {ref.task_id}) ---")
+            print(f"Status: {ref.status}"
+                  + (f"  Failure: {ref.failure_category}" if ref.failure_category else ""))
+            print("(no persisted task.db events found for this task)")
+            print()
+            continue
+        print(trace_mod.render_task_trace(task_trace, verbose=args.verbose))
 
 
 def _format_batch_progress(progress: dict) -> str:
@@ -568,6 +622,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_batch_export.add_argument("batch_id")
     p_batch_export.add_argument("--output", required=True)
     p_batch_export.set_defaults(func=cmd_batch_export)
+
+    p_trace = sub.add_parser(
+        "trace",
+        help="reconstruct a human-readable timeline for a job from persisted data only "
+             "(never runs or replays anything)",
+    )
+    trace_target = p_trace.add_mutually_exclusive_group(required=True)
+    trace_target.add_argument("--recent", action="store_true", help="most recently created UI job")
+    trace_target.add_argument("--job", help="UI job id (runtime/ui/jobs.db)")
+    trace_target.add_argument("--task", help="a single AgentLoop task id (runtime/tasks/<id>)")
+    p_trace.add_argument("--verbose", action="store_true", help="include raw event payloads per step")
+    p_trace.set_defaults(func=cmd_trace)
 
     return parser
 

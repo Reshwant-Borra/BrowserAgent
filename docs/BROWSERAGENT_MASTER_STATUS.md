@@ -1123,3 +1123,105 @@ sufficient to build/run the complete, current BrowserAgent — no production fun
 should ever again be left stranded only on a side branch. Anyone continuing development on
 this repository should pull `main`, make their change, commit, and push to `main`, the same
 way this consolidation pass itself was performed.
+
+## 30. Real Amazon "3 best vacuum cleaners" run — forensic investigation and fixes (2026-08-28)
+
+A real UI job (job/batch `ae5045ccc976`, prompt "Go to amazon and find the 3 best vacuum
+cleaners", created 2026-08-28T02:36:51Z) surfaced a long-running, page-reloading run that
+never returned three compared products. This section reconstructs that run entirely from
+persisted data (`runtime/ui/jobs.db`, `runtime/batches/ae5045ccc976/batch.db`,
+`runtime/tasks/{bf2ea8beb1c0,ce17b20f3e2f,a1d6f7eea75d}/task.db`) — no live Amazon access was
+used to diagnose or fix this.
+
+**What actually happened.** The router classified this as a `research` job (not a single-site
+task), which triggered a DuckDuckGo-backed discovery step that found 3 candidate URLs — two
+real Amazon pages (a best-sellers category page, a search-results page) and one third-party
+article (architecturaldigest.com) — and ran each as a batch work item. Persisted timestamps
+show the whole job took **2m34s** (`02:36:51` → `02:39:25`), not the ~10 minutes it felt like
+live; work items ran sequentially, and each of the two Amazon items independently spent ~55–80s
+stuck in the pattern below before exhausting its step budget. The article item succeeded but
+produced only one orphaned pricing fact, no compared products.
+
+**Root causes** (all reproduced with regression tests; none are Amazon-specific):
+
+1. **Contaminated research contract** (`cli/main.py:_contract_from_name`). Every `research`-kind
+   job — regardless of what was asked — got a hardcoded fact checklist
+   (`pricing`/`education_discount`/`public_api_docs`) left over from an unrelated benchmark
+   fixture (`tests/fixtures/multisite/generate_multisite.py`'s `RESEARCH_VARIANTS`). The
+   vacuum-cleaner task's own subgoal plan literally read "Check for education discount
+   information" / "Check for public API documentation availability". The contract also had no
+   field for an item's identity, so even a successful extraction couldn't attach a fact to a
+   named product. Fixed: the default contract is now goal-agnostic (`item_name`/`value`), with
+   the description explicitly asking for every distinct candidate when the goal implies several.
+
+2. **Evidence-blind `finish` gate** (`agent/loop.py:_handle_finish`) — the primary driver of the
+   failure. Every batch/research child task has empty `success_criteria` (`batch/orchestrator.py`
+   `_success_criteria` always returns `[]`), so completion depended entirely on whether some
+   *other*, non-extraction action had already passed verification — an accident of whether the
+   task's first action happened to be a passing `open_url`. The failing work item's first action
+   was a `click` (already on the target page, no navigation needed), which timed out; when the
+   model then called `finish` with 7 correctly extracted prices and evidence, the gate discarded
+   it (`"finish requested with no explicit criteria and no verified task evidence"`) without ever
+   looking at `structured_result`, and forced a replan. Fixed: a `finish` whose
+   `structured_result` carries at least one evidence-and-value-backed finding now counts as valid
+   completion evidence in its own right.
+
+3. **Stall detector defeated by dynamic pages** (`agent/loop.py`, `stalled_readonly_repeat`).
+   After the rejection above forced recovery, the model — cued by the recovery level literally
+   being named `REFRESH_STATE` — settled into repeatedly calling `open_url` on the identical
+   URL: 14 consecutive times over ~33s in the reconstructed trace. The existing stall guard
+   required `pre_hash == post_hash` to treat a repeated read-only action as a stall, but
+   Amazon re-renders different carousel/ad content on every load of the same URL, so the hash
+   never matched twice in a row — this is the exact "page appeared to refresh/reload repeatedly"
+   the user observed. Fixed: for the narrow class of inherently-idempotent read-only actions
+   (`open_url`, `extract`), a repeated identical action now counts as stalled regardless of
+   whether the returned hash happened to differ, since re-opening the same URL cannot itself be
+   progress.
+
+4. **Failure mislabeled `AUTH_REQUIRED`** (`batch/policies.py:classify_child_failure`). The
+   post-hoc classifier scanned the full JSON dump of every event (including 30-element
+   `element_names` lists and raw Playwright error text) for bare auth keywords, so Amazon's
+   persistent "Hello, sign in Account & Lists" nav item — present on literally every Amazon
+   page — made a step-budget exhaustion (root causes 2–3) get reported to the user as a login
+   wall that never existed. The codebase already had a conservative, title/heading-only check
+   (`agent/auth_detect.looks_like_login_page`) built for exactly this false-positive risk, but
+   the batch-level classifier didn't use it. Fixed: the auth-keyword scan is now restricted to
+   each `OBSERVATION`'s title and first 5 visible-text lines (mirroring the live check), plus
+   any explicit `last_error`/`blocked_reason` text, dropping the noisy full-event blob scan.
+
+**Trace command.** `browser-agent trace` (`cli/trace.py`) reconstructs the human-readable
+timeline above from persisted data only — it never runs, resumes, or replays a task.
+- `browser-agent trace --recent` — most recent UI job (`runtime/ui/jobs.db`), auto-follows
+  `task_id`/`batch_id`/`workflow_id` to every underlying `AgentLoop` task.
+- `browser-agent trace --job <job_id>` — a specific UI job.
+- `browser-agent trace --task <task_id>` — a single `AgentLoop` task directly.
+- `--verbose` adds raw (redacted) event payloads per step.
+Running it against the real job above (`browser-agent trace --job ae5045ccc976`) reproduces
+the exact click-timeout → finish-rejection → 14x same-URL `open_url` → step-budget-exhaustion
+sequence described here, step by step, with per-step model/action latency.
+
+**Local validation.** `tests/fixtures/simple_site/dynamic_listing.html` simulates Amazon's
+per-load DOM churn (renders a new random value into the DOM via client-side JS on every load
+of the same URL) without touching the live site. New regression tests using it and the
+evidence-backed-`finish` scenario:
+- `tests/integration/test_phase2_verification_recovery.py::test_repeated_readonly_action_with_changing_hash_still_triggers_recovery_escalation`
+- `tests/integration/test_phase2_verification_recovery.py::test_finish_with_evidence_backed_findings_completes_with_no_prior_verified_action`
+- `tests/integration/test_phase2_verification_recovery.py::test_finish_with_empty_structured_result_and_no_prior_action_is_still_rejected` (negative control)
+- `tests/unit/test_batch_policies.py::test_step_budget_exhaustion_on_page_with_signin_nav_link_not_misclassified_as_auth_required`
+- `tests/unit/test_trace.py` (3 tests covering the trace reconstruction itself)
+
+Each was confirmed to fail against the pre-fix code (verified via `git stash` on the relevant
+files) and pass with the fix. Full suite after all fixes: **`python -m pytest tests/unit
+tests/integration -q` → 324 passed, 0 failures** (Chrome/CDP/Ollama were never started for this
+investigation, per task constraints — no live-browser tests were added or re-run beyond the
+existing local-fixture-server integration suite).
+
+**Remaining limitation, not fixed here**: there is still no generic multi-candidate
+accumulation/ranking stage — the `item_name`/`value` contract fix (root cause 1) gives an
+extracted fact somewhere to attach an entity name, but nothing yet groups facts by entity
+across work items, ranks them, or enforces "exactly N" in the synthesis step
+(`batch/orchestrator.py:synthesize`, `batch/result_quality.py`). A "find the top N X" job today
+still depends on each individual page happening to be summarized well by one page-level
+`finish` call, same as before this pass. Building a real collect → compare → select-top-N
+capability (Section 10-style) is a larger, separate change and was deliberately left out of
+this pass since the evidence here only justified the four fixes above.
