@@ -388,14 +388,23 @@ def probe_ui_owner(host: str, port: int) -> tuple[bool, bool]:
 
 def stop_pid(pid: int, force: bool = False) -> bool:
     """Stops exactly one PID we ourselves recorded — never a process-name sweep (that's what
-    broke unrelated Python processes before). Returns True if a stop was issued."""
+    broke unrelated Python processes before). Returns True if a stop was issued.
+
+    On Windows, a plain `taskkill /PID` only works by posting WM_CLOSE to a window the target
+    process owns. BrowserAgent's own UI server runs with no console/window (started detached,
+    hidden), so a graceful taskkill always fails there with "can only be terminated forcefully"
+    — confirmed live on this machine. Falling back to `/F` on that specific failure means Stop
+    still actually stops the process instead of silently no-op'ing and leaving the port held.
+    """
     if not process_alive(pid):
         return False
     if sys.platform == "win32":
         args = ["taskkill", "/PID", str(pid)]
         if force:
             args.append("/F")
-        subprocess.run(args, capture_output=True, timeout=10)
+        result = subprocess.run(args, capture_output=True, timeout=10)
+        if result.returncode != 0 and not force:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=10)
         return True
     import signal
 

@@ -98,6 +98,19 @@ async def _wait_for(store: UIJobStore, job_id: str, statuses: set[str], timeout:
     raise AssertionError(f"job {job_id} did not reach {statuses} within {timeout}s (last: {store.get(job_id)})")
 
 
+async def _wait_task_done(runner: JobRunner, job_id: str, timeout: float = 10.0) -> None:
+    """`_run_single` persists status="stopped" to the store and only then runs its `finally:
+    await loop.aclose()` (real Playwright browser teardown) before the driving task actually
+    finishes. A test that asserts on the store status and returns immediately after can leave
+    that browser-close still running in the background once the test's event loop is torn
+    down — bleeding a real Chromium process into whatever test runs next. Tests that stop a
+    job with a real (launch-mode) browser attached should await this first."""
+    task = runner._tasks.get(job_id)
+    if task is None:
+        return
+    await asyncio.wait_for(task, timeout=timeout)
+
+
 async def test_single_site_job_completes(tmp_config, tmp_path, fixture_site_url, monkeypatch):
     _patch_model(monkeypatch, FakeUIClient(finish_result="the page is a fixture index"))
     store = UIJobStore(tmp_path / "ui_jobs.db")
@@ -176,6 +189,7 @@ async def test_stop_mid_job_leaves_state_clean(tmp_config, tmp_path, fixture_sit
 
     job = await _wait_for(store, job_id, {"stopped", "completed", "failed"}, timeout=10.0)
     assert job["status"] == "stopped"
+    await _wait_task_done(runner, job_id)  # let real browser teardown finish before the next test
 
 
 async def test_approval_flow_approve(tmp_config, tmp_path, fixture_site_url, monkeypatch):
@@ -249,6 +263,141 @@ async def test_manual_login_wait_and_continue(tmp_config, tmp_path, fixture_site
     assert runner.login_continue(job_id)
     job = await _wait_for(store, job_id, {"completed", "failed"}, timeout=10.0)
     assert job["status"] == "completed"
+
+
+async def test_stop_waiting_for_input_clears_state_and_unblocks_new_job(tmp_config, tmp_path, fixture_site_url, monkeypatch):
+    """Section 2-3, 7-8: the exact reported bug. A job stuck in `waiting_for_input` must
+    become `stopped`, release its clarification state, and never leak into the next job."""
+    from router.policy import NeedsInput
+
+    async def fake_route(text, client, config):
+        return NeedsInput(question="Which pages do you mean?", plan=None)
+
+    monkeypatch.setattr("ui.jobs.route", fake_route)
+    store = UIJobStore(tmp_path / "ui_jobs.db")
+    runner = JobRunner(tmp_config, store, tmp_path / "runtime")
+
+    job_a = runner.submit("do something ambiguous")
+    job = await _wait_for(store, job_a, {"waiting_for_input"})
+    assert job["pending_clarification"]["question"] == "Which pages do you mean?"
+
+    assert runner.stop(job_a) is True
+    job = await _wait_for(store, job_a, {"stopped"})
+    assert job["pending_clarification"] is None  # cleared, not just superseded by status
+
+    # A stale Continue against the now-stopped job must be rejected, not revive it.
+    assert runner.clarify(job_a, "https://example.com") is False
+    job = store.get(job_a)
+    assert job["status"] == "stopped"
+
+    # An unrelated new job must not see any trace of job A's clarification.
+    monkeypatch.undo()
+    _patch_model(monkeypatch, FakeUIClient(finish_result="unrelated result"))
+    job_b = runner.submit(f"Open {fixture_site_url}/index.html and summarize it.")
+    assert job_b != job_a
+    job = await _wait_for(store, job_b, {"completed", "failed"})
+    assert job["status"] == "completed"
+    assert job.get("pending_clarification") is None
+    assert "unrelated result" in job["final_result"]["summary"]
+
+
+async def test_stop_waiting_for_login_does_not_resume(tmp_config, tmp_path, fixture_site_url, monkeypatch):
+    """Section 4: Stop during a manual-login wait must cancel the job, not resume it, and must
+    never touch the persistent browser/session — this test only asserts the job side since
+    JobRunner never closes the CDP-attached browser itself either way (see loop.aclose())."""
+    script = [
+        {"action": "open_url", "target": None, "params": {"url": f"{fixture_site_url}/workflow_login_required.html"},
+         "expected_result": {"url_contains": "127.0.0.1"}, "confidence": 0.9},
+    ]
+    _patch_model(monkeypatch, FakeUIClient(script=script))
+    store = UIJobStore(tmp_path / "ui_jobs.db")
+    runner = JobRunner(tmp_config, store, tmp_path / "runtime")
+    job_id = runner.submit(f"Open {fixture_site_url}/index.html then go sign in.")
+
+    job = await _wait_for(store, job_id, {"waiting_for_login"}, timeout=10.0)
+    assert "login" in job["activity"].lower()
+
+    assert runner.stop(job_id) is True
+    job = await _wait_for(store, job_id, {"stopped"}, timeout=5.0)
+    assert job["status"] == "stopped"
+    await _wait_task_done(runner, job_id)
+
+
+async def test_stop_waiting_for_approval_denies_and_marks_stopped(tmp_config, tmp_path, fixture_site_url, monkeypatch):
+    """Section 5: Stop during an approval wait must not execute the consequential action, and
+    the job must land on `stopped` (not the misleading `running`/"Denied, continuing...")."""
+    approval_config = dataclasses.replace(
+        tmp_config, browser=dataclasses.replace(tmp_config.browser, interactive_approval=True)
+    )
+    script = [
+        {"action": "open_url", "target": None, "params": {"url": f"{fixture_site_url}/wizard_confirm.html"},
+         "expected_result": {"url_contains": "wizard_confirm"}, "confidence": 0.9},
+        {"action": "click", "target": 1, "params": {}, "expected_result": {"page_contains": "Submitted"}, "confidence": 0.9},
+    ]
+    _patch_model(monkeypatch, FakeUIClient(script=script))
+    store = UIJobStore(tmp_path / "ui_jobs.db")
+    runner = JobRunner(approval_config, store, tmp_path / "runtime")
+    job_id = runner.submit(f"Open {fixture_site_url}/wizard_confirm.html and submit the application.")
+
+    await _wait_for(store, job_id, {"waiting_for_approval"})
+    assert runner.stop(job_id) is True
+    job = await _wait_for(store, job_id, {"stopped", "failed"}, timeout=10.0)
+    assert job["status"] == "stopped"
+    assert job["pending_approval"] is None
+    await _wait_task_done(runner, job_id)
+
+
+async def test_stop_is_idempotent_on_terminal_jobs(tmp_config, tmp_path, fixture_site_url, monkeypatch):
+    """Section 13/15: stopping an already-terminal job is a harmless no-op, never a corruption
+    or an unhandled error, for every terminal status."""
+    _patch_model(monkeypatch, FakeUIClient(finish_result="ok"))
+    store = UIJobStore(tmp_path / "ui_jobs.db")
+    runner = JobRunner(tmp_config, store, tmp_path / "runtime")
+
+    job_id = runner.submit(f"Open {fixture_site_url}/index.html and summarize it.")
+    job = await _wait_for(store, job_id, {"completed", "failed"})
+    assert job["status"] == "completed"
+
+    assert runner.stop(job_id) is True
+    assert store.get(job_id)["status"] == "completed"  # unchanged, not clobbered back to "stopped"
+
+    store.update(job_id, status="failed", error="synthetic")
+    assert runner.stop(job_id) is True
+    assert store.get(job_id)["status"] == "failed"
+
+    store.update(job_id, status="stopped")
+    assert runner.stop(job_id) is True
+    assert store.get(job_id)["status"] == "stopped"
+
+
+async def test_stop_unknown_job_returns_false(tmp_config, tmp_path):
+    store = UIJobStore(tmp_path / "ui_jobs.db")
+    runner = JobRunner(tmp_config, store, tmp_path / "runtime")
+    assert runner.stop("does-not-exist") is False
+
+
+async def test_orphaned_waiting_job_stoppable_after_restart(tmp_config, tmp_path):
+    """Section 11: simulates a UI server restart. `_control` is in-memory only and starts
+    empty in a fresh JobRunner, but a `waiting_for_input` row persisted by a previous process
+    must still be stoppable — this is the actual root cause of the reported bug: the old
+    `stop()` returned False whenever `_control` had no entry for the job, so a restarted
+    server could never cancel a job it didn't personally start."""
+    store = UIJobStore(tmp_path / "ui_jobs.db")
+    job_id = store.create("do something ambiguous")
+    store.update(job_id, status="waiting_for_input", pending_clarification={"question": "Which pages?"})
+
+    runner = JobRunner(tmp_config, store, tmp_path / "runtime")  # fresh process, no _control entry
+    assert job_id not in runner._control
+    assert runner.stop(job_id) is True
+
+    job = store.get(job_id)
+    assert job["status"] == "stopped"
+    assert job["pending_clarification"] is None
+
+    # A stopped job must stay stopped across a further restart (new store handle), not
+    # resurrect as waiting — no in-memory state should be required to keep it terminal.
+    store2 = UIJobStore(tmp_path / "ui_jobs.db")
+    assert store2.get(job_id)["status"] == "stopped"
 
 
 def test_classify_risk_flags_submit_button_consequential():

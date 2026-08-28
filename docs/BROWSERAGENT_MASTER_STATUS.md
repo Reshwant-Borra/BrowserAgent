@@ -770,3 +770,94 @@ already running on CDP 9222 from an earlier session, port 8765 free):
 (`cli/launcher.py`'s `sys.platform == "win32"` branches for detached-process creation and
 `taskkill`); the POSIX fallback paths (`os.kill`, plain `SIGTERM`) are written but only
 unit-tested with mocks, not run on real macOS hardware.
+
+## 26. UI Job Stop Was Unstoppable From `waiting_for_input` After a Restart — Evidence Log
+
+**Reported bug**: a job in `waiting_for_input` (the semantic planner returned `NeedsInput`)
+showed the clarification card and a Stop button, but clicking Stop did nothing — the job
+stayed `waiting_for_input` forever, and the UI's own "reconnect to whatever's still active on
+page load" logic (`ui/static/index.html`'s `init()`) kept the Run button permanently disabled.
+
+**Root cause**: `JobRunner.stop()` (`ui/jobs.py`) only ever mutated an in-memory `_JobControl`
+object (`self._control[job_id]`). That object lives only as long as the Python process that
+created it — it is never persisted. `UIJobStore` (`runtime/ui/jobs.db`) is the durable record
+(this is exactly what makes "survive a page refresh" work at all), but a `waiting_for_input`/
+`waiting_for_login`/`waiting_for_approval` row left behind by a *previous* UI server process
+(a restart — increasingly common now that `browser-agent start`/`stop` make restarting the UI
+routine, see Section 25) has no corresponding `_control` entry in a freshly started process.
+`stop()` returned `False` for that case, the HTTP layer turned that into a 404, the frontend
+never surfaces fetch errors on the Stop button, and the persisted non-terminal job simply sat
+there — permanently blocking Run. A live-session stop (same process, control object present)
+already worked correctly at the status level, but left `pending_clarification`/
+`pending_approval` stale in the store, and a Stop during `waiting_for_approval` briefly wrote
+a misleading `status="running", activity="Denied, continuing..."` before the loop's own next
+iteration corrected it to `stopped`.
+
+**Fix** (`ui/jobs.py`): `JobRunner.stop()` now falls back to a direct, idempotent store
+transition (`status="stopped"`, both pending-* fields cleared) whenever there is no live
+`_JobControl` for the job_id, as long as the persisted row exists and isn't already terminal
+(`TERMINAL_JOB_STATUSES = {"completed", "failed", "stopped"}`) — stopping an already-terminal
+or nonexistent job is always a harmless no-op, never a 500. The `waiting_for_input` and
+`waiting_for_approval` live-session paths now also clear `pending_clarification`/
+`pending_approval` on stop, and the approval callback reports `status="stopped"` directly
+(instead of a transient "running"/"Denied, continuing...") when the denial was actually
+caused by Stop. `ui/app.py`'s `/stop` route docstring/message updated to reflect the
+now-genuinely-idempotent contract (404 only for a job_id that was never created at all).
+
+**Also found and fixed while validating live** (`cli/launcher.py`, from Section 25's work):
+`stop_pid()`'s plain `taskkill /PID <pid>` cannot close BrowserAgent's own UI server at all on
+Windows, because that process has no window to receive `WM_CLOSE` — `taskkill` returned
+"can only be terminated forcefully" every time, confirmed live (`browser-agent stop` reported
+success while the process and port 8765 kept right on running). Fixed by falling back to
+`taskkill /PID <pid> /F` whenever the graceful attempt's exit code is nonzero. This was
+blocking real validation of today's fix (the UI process couldn't actually be restarted to
+pick up new code) and is now covered by
+`test_stop_pid_falls_back_to_force_when_graceful_taskkill_fails`.
+
+**Regression tests**: `tests/integration/test_ui_jobs.py` — `waiting_for_input`/
+`waiting_for_login`/`waiting_for_approval` → stop (each landing on `stopped`, pending-*
+cleared), stop is idempotent on every terminal status, stop on an unknown job_id returns
+`False`, an orphaned `waiting_for_input` row survives a simulated restart and is still
+stoppable, and a follow-up job never inherits a stopped job's clarification state.
+`tests/integration/test_ui_app.py` adds the HTTP-level idempotency check (terminal + orphaned
+jobs both `POST .../stop` → `200 {"ok": true}`, never a 404/500). `tests/unit/test_launcher.py`
+adds the `taskkill` force-fallback regression. Full suite: 256/256 unit, 48/48
+non-model integration, all passing (0 regressions); the two new browser-touching stop tests
+also needed an explicit wait for the driving task's real Playwright teardown to finish before
+returning — without it, `test_stop_mid_job_leaves_state_clean`'s browser-close bled into and
+hung the next real-browser test in the same session (a pre-existing test-hygiene gap, not
+present before an in-progress browser-close could overlap a fresh one from the next test).
+
+**Real UI validation, live** (real Ollama/Qwen3-8B, real persistent CDP Chrome, real UI server
+restarted mid-session to pick up the fix):
+1. Submitted "Find the project code on the page where it's listed, then put that same code
+   into the configuration page and verify it." with no matching pages open → `waiting_for_input`
+   with the expected clarification question, confirmed via `GET /api/jobs/{id}`.
+2. `POST /api/jobs/{id}/stop` → `{"ok": true}`; immediate re-`GET` showed
+   `status: "stopped"`, `pending_clarification: null`.
+3. A stale `POST .../clarify` against that same (now-stopped) job → `409 job is not waiting
+   for input`, both before and after a full UI server restart.
+4. Submitted an unrelated job ("Go on Amazon and find the 3 best vacuum cleaners. Do not
+   purchase anything.") → different job_id, started and routed (`research`) with
+   `pending_clarification: null` — no trace of the first job's clarification text. Stopped it
+   mid-run (`running` → `stopped`) once isolation was confirmed, without letting it place any
+   order.
+5. Killed the UI server process entirely and started a fresh one (`browser-agent stop` /
+   `start --no-open`, which now actually terminates the process thanks to the `taskkill /F`
+   fallback above). The earlier stopped job stayed `stopped` — `pending_clarification` still
+   `null` — with no in-memory state at all behind it, and Run worked immediately: a brand
+   new job submitted post-restart completed normally.
+
+**Separate anomaly observed, not fixed here (out of scope)**: a *third*, exploratory
+validation job ("Open https://example.com and tell me what it is.") submitted right after the
+Amazon research job was stopped came back summarizing a goodhousekeeping.com vacuum-review
+page instead of example.com. The event log shows the very first OBSERVATION in that task was
+already on the stale goodhousekeeping.com tab left open by the previous (stopped) research
+job — the persistent CDP-attached Chrome's tab reuse across single-site jobs, not a job-store
+or clarification-state leak (the UI-level state itself — job id, `pending_clarification`,
+`router_decision` — was all correctly isolated per the Section 16 validation above). This is
+an AgentLoop/model-behavior question (should a fresh single-site task force-navigate its
+target rather than trusting the model to read the URL out of its own objective text when a
+stale tab is already showing content?), explicitly out of this task's scope
+("do not change AgentLoop... unless required for stop-state integration") and left for a
+future pass.

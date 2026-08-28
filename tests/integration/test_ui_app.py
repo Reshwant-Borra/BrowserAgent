@@ -109,6 +109,35 @@ def test_stop_unknown_job_404s(tmp_config, monkeypatch):
     assert resp.status_code == 404
 
 
+def test_stop_is_idempotent_over_http_on_terminal_and_orphaned_jobs(tmp_config, monkeypatch):
+    """Section 13: stop must never 500, and must return a harmless {"ok": true} both for an
+    already-terminal job and for a persisted waiting_for_input job with no live driving
+    process behind it (the server-restart case — Section 11)."""
+    client = _sync_client(tmp_config, monkeypatch)
+    app = client.app
+    store = app.state.store
+
+    completed_id = store.create("already done")
+    store.update(completed_id, status="completed")
+    resp = client.post(f"/api/jobs/{completed_id}/stop")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    assert store.get(completed_id)["status"] == "completed"
+
+    orphaned_id = store.create("orphaned after restart")
+    store.update(orphaned_id, status="waiting_for_input", pending_clarification={"question": "Which pages?"})
+    resp = client.post(f"/api/jobs/{orphaned_id}/stop")
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+    job = store.get(orphaned_id)
+    assert job["status"] == "stopped"
+    assert job["pending_clarification"] is None
+
+    # idempotent: stopping it again is still a harmless 200, not a 404/500.
+    resp = client.post(f"/api/jobs/{orphaned_id}/stop")
+    assert resp.status_code == 200
+
+
 def test_login_continue_without_pending_login_409s(tmp_config, monkeypatch):
     client = _sync_client(tmp_config, monkeypatch)
     resp = client.post("/api/jobs/nonexistent-job/login-continue")

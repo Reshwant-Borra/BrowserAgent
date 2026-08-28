@@ -318,6 +318,30 @@ def test_stop_pid_targets_only_the_given_pid(monkeypatch):
     assert "/IM" not in captured["args"]
 
 
+def test_stop_pid_falls_back_to_force_when_graceful_taskkill_fails(monkeypatch):
+    """Regression: a plain `taskkill /PID` cannot close a windowless background process (e.g.
+    BrowserAgent's own detached UI server) on Windows — confirmed live, it returns
+    "can only be terminated forcefully". Without a fallback, Stop silently no-ops and the
+    process (and the port it holds) never actually goes away."""
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+
+        class R:
+            returncode = 0 if "/F" in args else 1
+
+        return R()
+
+    monkeypatch.setattr(launcher, "process_alive", lambda pid: True)
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+    did_stop = launcher.stop_pid(4321)
+
+    assert did_stop is True
+    assert calls == [["taskkill", "/PID", "4321"], ["taskkill", "/PID", "4321", "/F"]]
+
+
 def test_stop_pid_is_noop_when_process_already_dead(monkeypatch):
     monkeypatch.setattr(launcher, "process_alive", lambda pid: False)
     called = []
