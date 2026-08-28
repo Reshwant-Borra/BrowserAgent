@@ -770,3 +770,198 @@ already running on CDP 9222 from an earlier session, port 8765 free):
 (`cli/launcher.py`'s `sys.platform == "win32"` branches for detached-process creation and
 `taskkill`); the POSIX fallback paths (`os.kill`, plain `SIGTERM`) are written but only
 unit-tested with mocks, not run on real macOS hardware.
+
+## 26. UI Job Stop Was Unstoppable From `waiting_for_input` After a Restart — Evidence Log
+
+**Reported bug**: a job in `waiting_for_input` (the semantic planner returned `NeedsInput`)
+showed the clarification card and a Stop button, but clicking Stop did nothing — the job
+stayed `waiting_for_input` forever, and the UI's own "reconnect to whatever's still active on
+page load" logic (`ui/static/index.html`'s `init()`) kept the Run button permanently disabled.
+
+**Root cause**: `JobRunner.stop()` (`ui/jobs.py`) only ever mutated an in-memory `_JobControl`
+object (`self._control[job_id]`). That object lives only as long as the Python process that
+created it — it is never persisted. `UIJobStore` (`runtime/ui/jobs.db`) is the durable record
+(this is exactly what makes "survive a page refresh" work at all), but a `waiting_for_input`/
+`waiting_for_login`/`waiting_for_approval` row left behind by a *previous* UI server process
+(a restart — increasingly common now that `browser-agent start`/`stop` make restarting the UI
+routine, see Section 25) has no corresponding `_control` entry in a freshly started process.
+`stop()` returned `False` for that case, the HTTP layer turned that into a 404, the frontend
+never surfaces fetch errors on the Stop button, and the persisted non-terminal job simply sat
+there — permanently blocking Run. A live-session stop (same process, control object present)
+already worked correctly at the status level, but left `pending_clarification`/
+`pending_approval` stale in the store, and a Stop during `waiting_for_approval` briefly wrote
+a misleading `status="running", activity="Denied, continuing..."` before the loop's own next
+iteration corrected it to `stopped`.
+
+**Fix** (`ui/jobs.py`): `JobRunner.stop()` now falls back to a direct, idempotent store
+transition (`status="stopped"`, both pending-* fields cleared) whenever there is no live
+`_JobControl` for the job_id, as long as the persisted row exists and isn't already terminal
+(`TERMINAL_JOB_STATUSES = {"completed", "failed", "stopped"}`) — stopping an already-terminal
+or nonexistent job is always a harmless no-op, never a 500. The `waiting_for_input` and
+`waiting_for_approval` live-session paths now also clear `pending_clarification`/
+`pending_approval` on stop, and the approval callback reports `status="stopped"` directly
+(instead of a transient "running"/"Denied, continuing...") when the denial was actually
+caused by Stop. `ui/app.py`'s `/stop` route docstring/message updated to reflect the
+now-genuinely-idempotent contract (404 only for a job_id that was never created at all).
+
+**Also found and fixed while validating live** (`cli/launcher.py`, from Section 25's work):
+`stop_pid()`'s plain `taskkill /PID <pid>` cannot close BrowserAgent's own UI server at all on
+Windows, because that process has no window to receive `WM_CLOSE` — `taskkill` returned
+"can only be terminated forcefully" every time, confirmed live (`browser-agent stop` reported
+success while the process and port 8765 kept right on running). Fixed by falling back to
+`taskkill /PID <pid> /F` whenever the graceful attempt's exit code is nonzero. This was
+blocking real validation of today's fix (the UI process couldn't actually be restarted to
+pick up new code) and is now covered by
+`test_stop_pid_falls_back_to_force_when_graceful_taskkill_fails`.
+
+**Regression tests**: `tests/integration/test_ui_jobs.py` — `waiting_for_input`/
+`waiting_for_login`/`waiting_for_approval` → stop (each landing on `stopped`, pending-*
+cleared), stop is idempotent on every terminal status, stop on an unknown job_id returns
+`False`, an orphaned `waiting_for_input` row survives a simulated restart and is still
+stoppable, and a follow-up job never inherits a stopped job's clarification state.
+`tests/integration/test_ui_app.py` adds the HTTP-level idempotency check (terminal + orphaned
+jobs both `POST .../stop` → `200 {"ok": true}`, never a 404/500). `tests/unit/test_launcher.py`
+adds the `taskkill` force-fallback regression. Full suite: 256/256 unit, 48/48
+non-model integration, all passing (0 regressions); the two new browser-touching stop tests
+also needed an explicit wait for the driving task's real Playwright teardown to finish before
+returning — without it, `test_stop_mid_job_leaves_state_clean`'s browser-close bled into and
+hung the next real-browser test in the same session (a pre-existing test-hygiene gap, not
+present before an in-progress browser-close could overlap a fresh one from the next test).
+
+**Real UI validation, live** (real Ollama/Qwen3-8B, real persistent CDP Chrome, real UI server
+restarted mid-session to pick up the fix):
+1. Submitted "Find the project code on the page where it's listed, then put that same code
+   into the configuration page and verify it." with no matching pages open → `waiting_for_input`
+   with the expected clarification question, confirmed via `GET /api/jobs/{id}`.
+2. `POST /api/jobs/{id}/stop` → `{"ok": true}`; immediate re-`GET` showed
+   `status: "stopped"`, `pending_clarification: null`.
+3. A stale `POST .../clarify` against that same (now-stopped) job → `409 job is not waiting
+   for input`, both before and after a full UI server restart.
+4. Submitted an unrelated job ("Go on Amazon and find the 3 best vacuum cleaners. Do not
+   purchase anything.") → different job_id, started and routed (`research`) with
+   `pending_clarification: null` — no trace of the first job's clarification text. Stopped it
+   mid-run (`running` → `stopped`) once isolation was confirmed, without letting it place any
+   order.
+5. Killed the UI server process entirely and started a fresh one (`browser-agent stop` /
+   `start --no-open`, which now actually terminates the process thanks to the `taskkill /F`
+   fallback above). The earlier stopped job stayed `stopped` — `pending_clarification` still
+   `null` — with no in-memory state at all behind it, and Run worked immediately: a brand
+   new job submitted post-restart completed normally.
+
+**Separate anomaly observed, not fixed here (out of scope)**: a *third*, exploratory
+validation job ("Open https://example.com and tell me what it is.") submitted right after the
+Amazon research job was stopped came back summarizing a goodhousekeeping.com vacuum-review
+page instead of example.com. The event log shows the very first OBSERVATION in that task was
+already on the stale goodhousekeeping.com tab left open by the previous (stopped) research
+job — the persistent CDP-attached Chrome's tab reuse across single-site jobs, not a job-store
+or clarification-state leak (the UI-level state itself — job id, `pending_clarification`,
+`router_decision` — was all correctly isolated per the Section 16 validation above). This is
+an AgentLoop/model-behavior question (should a fresh single-site task force-navigate its
+target rather than trusting the model to read the URL out of its own objective text when a
+stale tab is already showing content?), explicitly out of this task's scope
+("do not change AgentLoop... unless required for stop-state integration") and left for a
+future pass.
+
+## 27. Fresh Single-Site Task Reusing a Stale CDP Tab — Root Cause and Fix
+
+Follow-up to Section 26's "separate anomaly observed, not fixed here" note — this is that fix.
+
+**Reported bug**: a brand-new single-site task ("Open https://example.com...") started right
+after a previous task's job ended, with a persistent CDP-attached Chrome that still had an
+unrelated tab open (e.g. goodhousekeeping.com left over from that previous task). BrowserAgent
+attached to and answered from the stale goodhousekeeping.com tab instead of navigating to
+example.com — silently, with no error, no scope block, nothing in the job's own status to
+suggest anything was wrong.
+
+**Root cause**: `PlaywrightBackend._start_cdp_attach()`'s page-selection policy had exactly one
+non-default path — `preferred_tab_url`, set only for a semantic *open-tab* work item
+(`BatchRuntimePolicy.is_open_tab`, Section 24's open-tab sweep fix). Every other caller,
+including a plain single-site task with a perfectly well-known explicit target URL, fell
+through to `_select_page()`'s "most recently active tab" heuristic — a heuristic that has no
+notion of *any* task having a specific target at all. `router/policy.py`'s
+`_translate_single()` already resolves a single-site task's explicit URL into
+`RouterDecision.targets[0]`, but `ui/jobs.py`'s `_run_single()` never passed it anywhere near
+`AgentLoop`/`PlaywrightBackend` — it was computed, stored in the job's persisted
+`router_decision` for the UI to display, and then dropped on the floor as far as tab selection
+was concerned. `cli/main.py`'s `cmd_run` had the same gap for its own raw `--goal` text (no
+router pass at all). The batch/workflow orchestrators were *not* affected the same way for
+their own `is_open_tab=False` targets, since even before this fix they always constructed a
+`BatchRuntimePolicy` with the item's `target_url` — but that value only ever reached
+`preferred_tab_url` when `is_open_tab` was true, so a non-open-tab batch/workflow item's
+initial attach page was subject to the exact same "most recently active tab" heuristic before
+its own `open_url` step (if the model ever issued one) corrected it — same class of bug,
+smaller blast radius because `pre_action_violation`/`post_navigation_violation`'s scope
+policy would at least block a *cross-origin* stale tab rather than silently answering from it.
+
+**Fresh-task page-selection rule** (`browser/playwright_backend.py`,
+`_start_cdp_attach`/`explicit_target_url`): a page-selection *target* is now one of three
+kinds, decided once per `AgentLoop`/`PlaywrightBackend` instance:
+- **Open-tab-semantic** (`preferred_tab_url`, unchanged): exact URL match only; if the tab
+  isn't found (closed between resolution and attach), falls back to the "most recently active
+  tab" heuristic — a normal, recoverable case, not a hard failure.
+- **Explicit target** (new: `explicit_target_url`): a fresh single-site task's resolved URL
+  (`ui/jobs.py`), a raw-goal CLI run's extracted URL (`cli/main.py`), a non-open-tab
+  batch/workflow item's `target_url` (`agent/loop.py`, derived from `runtime_policy.target_url`
+  when `is_open_tab` is false), or a resumed job's last-known `current_url`
+  (`AgentLoop.resume`). Exact URL match reuses an existing tab already sitting on that page;
+  otherwise a fresh blank page is created — **never** the "most recently active tab" heuristic,
+  since an unmatched explicit target has no legitimate fallback tab, only a wrong one. The
+  model's own `open_url` step then navigates the blank page to the target, exactly as if no
+  tab existed at all.
+- **No known target** (a genuine current-page task, e.g. "tell me what this page is about"
+  with no URL in the prompt — `router/policy.py`'s `_translate_single()` returns
+  `targets=[]`): the original "most recently active tab" heuristic, unchanged — this is the
+  one case where reusing whatever's already open is the *correct*, intended behavior.
+
+**Fix** (`browser/playwright_backend.py`, `agent/loop.py`, `ui/jobs.py`, `cli/main.py`): added
+`PlaywrightBackend.explicit_target_url` and the `_select_page_by_url()` helper implementing
+the rule above; `AgentLoop.__init__`/`create_new` gained an `explicit_target_url` parameter
+(and derive one from `runtime_policy.target_url` for non-open-tab batch/workflow items, same
+as the existing `preferred_tab_url` derivation for open-tab ones); `AgentLoop.resume` now
+seeds `explicit_target_url` from the task's last-recorded `current_url` when nothing more
+specific already set it; `ui/jobs.py`'s `_run_single` passes `decision.targets[0]` through;
+`cli/main.py`'s `cmd_run` extracts a URL from the raw `--goal` text with `router/extract.py`'s
+existing `extract_urls()` and passes it the same way. No change to `_select_page()` itself, to
+scope-block enforcement, or to the open-tab-semantic path — this is additive, not a redesign.
+
+**Real CDP smoke test** (headless Chromium simulating the user's persistent browser, real
+network navigation, no local inference server available in this sandbox so the model decision
+content was stood in with the same `FakeUIClient` shape `tests/integration/test_ui_jobs.py`
+already uses — tab selection itself is real, unfaked code):
+1. Left a real `https://www.goodhousekeeping.com/` tab open via CDP (remote-debugging-port),
+   simulating the reported "previous task left this tab open" state.
+2. Submitted "Open https://example.com and tell me what this page is about." through the real
+   `JobRunner` → `AgentLoop` → `PlaywrightBackend` stack in `cdp_attach` mode.
+3. Re-ran the identical scenario against the pre-fix code (`git stash` of just the fix files)
+   to confirm it reproduces: the job attached directly to the stale goodhousekeeping.com tab
+   (`observed urls: ['https://www.goodhousekeeping.com/', ...] x5`, never navigated) and
+   errored out on an unrelated assertion in the harness rather than ever reaching example.com —
+   causal confirmation this is the real mechanism, not a coincidental pass/fail.
+4. With the fix restored: `observed urls: ['about:blank', 'https://example.com/',
+   'https://example.com/']`, job `status: "completed"`, `final_result.summary` about
+   example.com, and the goodhousekeeping.com tab still open and completely untouched
+   (`stale tab is still open, untouched: https://www.goodhousekeeping.com/`) — no leakage,
+   the correct existing-tabs-left-alone contract from Sections 8-11 held throughout.
+
+**Regression tests**:
+- `tests/unit/test_playwright_backend_tab_selection.py` — `_select_page_by_url` finds an exact
+  match even when a stale tab is more "recently active", and returns `None` (never a stale
+  fallback) when nothing matches.
+- `tests/unit/test_agent_loop_tab_wiring.py` — `explicit_target_url` reaches
+  `PlaywrightBackend` from `AgentLoop.create_new`'s own parameter, from a non-open-tab
+  `BatchRuntimePolicy.target_url`, and from `AgentLoop.resume`'s last-known `current_url`; a
+  genuine current-page task leaves both `preferred_tab_url`/`explicit_target_url` unset.
+- `tests/integration/test_cdp_attach.py` — real-Chromium-backed: explicit target reuses a
+  matching existing tab even when a stale tab is more recently active; explicit target with no
+  matching tab never reuses the stale one (lands on a fresh blank page instead); reconnect
+  (disconnect/reattach) with the same `explicit_target_url` finds the same tab again; a
+  current-page task (no `explicit_target_url`) still reuses the most-recently-active tab,
+  unchanged.
+- `tests/integration/test_ui_jobs.py` — full `JobRunner`-level, real headless Chromium in
+  `cdp_attach` mode: a fresh explicit-URL job never observes a stale tab left open at job
+  start, and a brand-new job started after a previous job completed/stopped does not inherit
+  that previous job's tab.
+
+Full suite after the fix: 263/263 unit, 54/54 integration, all passing (0 regressions),
+plus the real CDP smoke test above (pass) and its pre-fix reproduction (fails exactly as
+reported, confirming root cause).

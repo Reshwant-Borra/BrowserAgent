@@ -48,7 +48,8 @@ class PlaywrightBackend:
     def __init__(self, profile_dir: Path, headless: bool, action_timeout_ms: int,
                  max_page_chars: int, max_visible_text_items: int,
                  mode: str = "launch", cdp_endpoint: str = "http://127.0.0.1:9222",
-                 preferred_tab_url: Optional[str] = None):
+                 preferred_tab_url: Optional[str] = None,
+                 explicit_target_url: Optional[str] = None):
         self.profile_dir = profile_dir
         self.headless = headless
         self.action_timeout_ms = action_timeout_ms
@@ -63,6 +64,17 @@ class PlaywrightBackend:
         # inspect, so without this a child can attach to whatever a sibling child's own
         # navigation left behind and then get SCOPE_BLOCKED trying to reach its own target.
         self.preferred_tab_url = preferred_tab_url
+        # Set whenever the task/job already knows the concrete page it's going to operate on
+        # (a fresh single-site task's resolved URL, a batch/workflow item's plain — not
+        # open-tab — target, or a resumed job's last-known current_url) but that page is *not*
+        # necessarily an existing tab. Unlike preferred_tab_url, an unmatched explicit_target_url
+        # must NOT fall through to the "most recently active tab" heuristic below — that
+        # heuristic is what let a brand-new "Open https://example.com" task silently attach to
+        # and answer from an unrelated stale tab (e.g. goodhousekeeping.com) a previous task
+        # left open. Left unset only for tasks with no known target of their own (a plain
+        # "tell me what this page is about" current-page task), where reusing the currently
+        # attached/most-recently-active tab is the intended behavior.
+        self.explicit_target_url = explicit_target_url
         self._pw = None
         self._browser: Optional[Browser] = None  # only set in cdp_attach mode
         self.context = None
@@ -103,15 +115,42 @@ class PlaywrightBackend:
                 "See docs/USING_BROWSERAGENT.md for the exact command for your machine."
             ) from exc
 
-        page = self._select_preferred_page(self._browser) or self._select_page(self._browser)
+        if self.preferred_tab_url:
+            # Open-tab-semantic target: exact match only, but a miss (tab closed between
+            # resolution and this child starting) is a normal, recoverable case — fall through
+            # to the default "most recently active" heuristic exactly as before.
+            page = self._select_preferred_page(self._browser) or self._select_page(self._browser)
+        elif self.explicit_target_url:
+            # A known plain-URL target (a fresh single-site task's resolved URL, a non-open-tab
+            # batch/workflow item, or a resumed job's last-known page): reuse a tab already
+            # sitting on that exact URL if one exists, otherwise leave `page` unset so a fresh
+            # blank page gets created below — never the "most recently active tab" heuristic,
+            # which has no idea this task has a target at all and would just hand the model
+            # whatever unrelated page a previous task left open (the stale-tab bug this guards
+            # against). The model's own open_url step then navigates the blank page there.
+            page = self._select_page_by_url(self._browser, self.explicit_target_url)
+        else:
+            # No known target at all (a current-page task) -> the existing "most recently
+            # active tab" heuristic is exactly the intended behavior: act on whatever the user
+            # already has open.
+            page = self._select_page(self._browser)
         if page is None:
-            # No usable page anywhere on the attached browser (Section 11): create exactly
-            # one page in an existing context rather than launching a separate browser.
+            # No usable page anywhere on the attached browser (Section 11), or an explicit
+            # target with no matching tab: create exactly one page in an existing context
+            # rather than launching a separate browser.
             context = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
             page = await context.new_page()
         self.page = page
         self.context = self.page.context
         self.page.set_default_timeout(self.action_timeout_ms)
+
+    def _select_page_by_url(self, browser: Browser, url: str) -> Optional[Page]:
+        target_key = _normalize_url_for_match(url)
+        all_pages = [p for ctx in browser.contexts for p in ctx.pages]
+        for page in all_pages:
+            if _normalize_url_for_match(page.url) == target_key:
+                return page
+        return None
 
     def _select_preferred_page(self, browser: Browser) -> Optional[Page]:
         """Attach to the exact existing tab a semantic open-tab resolution picked out
@@ -123,12 +162,7 @@ class PlaywrightBackend:
         rather than a hard failure."""
         if not self.preferred_tab_url:
             return None
-        target_key = _normalize_url_for_match(self.preferred_tab_url)
-        all_pages = [p for ctx in browser.contexts for p in ctx.pages]
-        for page in all_pages:
-            if _normalize_url_for_match(page.url) == target_key:
-                return page
-        return None
+        return self._select_page_by_url(browser, self.preferred_tab_url)
 
     def _select_page(self, browser: Browser) -> Page:
         """Page-selection policy for attaching to a browser that may already have tabs open

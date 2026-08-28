@@ -35,6 +35,11 @@ RESEARCH_MAX_SOURCES_DEFAULT = 20
 # turning into the "continuous free-form planning loop" Section 12 explicitly forbids.
 MAX_CLARIFICATION_ROUNDS = 3
 
+# A job in any of these statuses is done; `stop()` on one of them is always a harmless
+# no-op rather than an error, and a job outside this set is always what "non-terminal"
+# means for Stop/Run-button purposes.
+TERMINAL_JOB_STATUSES = {"completed", "failed", "stopped"}
+
 
 def _assignment_contract() -> ResultContract:
     from cli.main import _contract_from_name
@@ -94,15 +99,37 @@ class JobRunner:
         return True
 
     def stop(self, job_id: str) -> bool:
+        """Idempotent and safe to call on a job this process has no live `_JobControl` for.
+
+        That "no control" case is not rare: it's exactly what a persisted `waiting_for_input`/
+        `waiting_for_login`/`waiting_for_approval` job looks like after the UI server has been
+        restarted (`_control` is in-memory only; `UIJobStore` is the durable record — Section
+        59/11). Before this fix, `stop()` returned False here, the HTTP layer turned that into
+        a 404, the frontend silently ignored it, and the persisted non-terminal job sat there
+        forever — which is also exactly what the frontend's own "reconnect to whatever's still
+        active on page load" logic (ui/static/index.html's `init()`) picks up, permanently
+        disabling Run. Falling back to a direct, idempotent store transition here closes that
+        hole without needing the original driving process to still exist.
+        """
         control = self._control.get(job_id)
-        if control is None:
+        if control is not None:
+            control.stop_event.set()
+            control.login_event.set()  # unblock a login wait so the driver can observe stop
+            if control.approval_future is not None and not control.approval_future.done():
+                control.approval_future.set_result(False)
+            if control.clarification_future is not None and not control.clarification_future.done():
+                control.clarification_future.set_result(None)
+            return True
+
+        job = self.store.get(job_id)
+        if job is None:
             return False
-        control.stop_event.set()
-        control.login_event.set()  # unblock a login wait so the driver can observe stop
-        if control.approval_future is not None and not control.approval_future.done():
-            control.approval_future.set_result(False)
-        if control.clarification_future is not None and not control.clarification_future.done():
-            control.clarification_future.set_result(None)
+        if job["status"] in TERMINAL_JOB_STATUSES:
+            return True  # already done: stopping again is a harmless no-op, not an error
+        self.store.update(
+            job_id, status="stopped", activity="Stopped",
+            pending_approval=None, pending_clarification=None,
+        )
         return True
 
     # ---- driver --------------------------------------------------------
@@ -171,7 +198,8 @@ class JobRunner:
             answer = await self._wait_clarification_or_stop(control, future)
             control.clarification_future = None
             if control.stop_event.is_set() or answer is None:
-                self.store.update(job_id, status="stopped", activity="Stopped while waiting for input")
+                self.store.update(job_id, status="stopped", activity="Stopped while waiting for input",
+                                   pending_clarification=None)
                 return None
             self.store.update(job_id, status="running", pending_clarification=None,
                                activity="Got it, continuing...")
@@ -194,8 +222,15 @@ class JobRunner:
     # ---- single-site -----------------------------------------------------
 
     async def _run_single(self, job_id: str, decision: RouterDecision, control: _JobControl) -> None:
+        # decision.targets holds the resolved explicit URL for a single-site task with a known
+        # target (empty for a current-page task — see router/policy.py's _translate_single).
+        # Passing it through as explicit_target_url is what stops a fresh task like "Open
+        # https://example.com" from silently attaching to and answering from an unrelated
+        # stale tab a previous job left open in cdp_attach mode (PlaywrightBackend picks a
+        # matching existing tab, or a fresh blank one — never the "most recently active" tab).
         loop = AgentLoop.create_new(
             self.config, decision.objective, [],
+            explicit_target_url=decision.targets[0] if decision.targets else None,
             approval_callback=self._make_approval_callback(job_id, control),
         )
         self.store.update(job_id, task_id=loop.task_id, activity="Starting browser...")
@@ -283,8 +318,16 @@ class JobRunner:
             )
             approved = await future
             control.approval_future = None
-            self.store.update(job_id, status="running", pending_approval=None,
-                               activity="Approved, continuing..." if approved else "Denied, continuing...")
+            if control.stop_event.is_set():
+                # A denial caused by Stop (not a real user Deny) — Section 5: no consequential
+                # action executes either way, but the job's own status must land on "stopped"
+                # rather than the misleading "running" a plain Deny would report, since nothing
+                # is continuing.
+                self.store.update(job_id, status="stopped", activity="Stopped while waiting for approval",
+                                   pending_approval=None)
+            else:
+                self.store.update(job_id, status="running", pending_approval=None,
+                                   activity="Approved, continuing..." if approved else "Denied, continuing...")
             return approved
         return _approve
 
