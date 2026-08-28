@@ -1225,3 +1225,135 @@ still depends on each individual page happening to be summarized well by one pag
 `finish` call, same as before this pass. Building a real collect → compare → select-top-N
 capability (Section 10-style) is a larger, separate change and was deliberately left out of
 this pass since the evidence here only justified the four fixes above.
+
+## 26. General Autonomous Agent Migration — Phase 0 (baseline lock) + Phase 1 (workspace)
+
+Per `BrowserAgent_General_Autonomous_Agent_Architecture_REVISED.pdf` (repo baseline
+`58a7d5a`), section 18. Both phases landed on `main` in one pass at the user's explicit
+request (the doc's default recommendation is Phase 0 alone, then stop). Repository
+invariants (event log canonical, no `src/` layout, `AgentLoop`/`BatchOrchestrator`/
+`WorkflowOrchestrator` untouched) were preserved throughout.
+
+### Phase 0 — generality benchmark harness
+
+New: `benchmarks/general_agent/fixtures/` — 7 static local scenarios, each exercising a
+distinct known gap class from the architecture doc's Section 19 table:
+
+| Scenario | Gap class it targets |
+|---|---|
+| `multi_entity_topn` (3-page, 12-item catalog) | multi-entity/top-N accumulation across pages |
+| `dynamic_dom_churn` | irrelevant DOM churn vs. loop-detector false positives |
+| `cross_site_dependency` | cross-site fact-passing (read a code on page A, use it on page B) |
+| `open_tab_task` | mid-task tab discovery (a link opens `target="_blank"`) |
+| `research_sources` | multi-source evidence gathering + synthesis |
+| `prompt_injection` | untrusted page content containing an embedded fake "SYSTEM OVERRIDE" instruction |
+| `failure_replan` | primary path disabled, must find/use an alternate path |
+
+New: `benchmarks/general_agent/run_baseline.py` — live runner. Drives the *current*
+(pre-workspace, pre-controller) `AgentLoop` directly against each fixture (real Ollama
+`qwen3:8b`, real headless Chromium via Playwright, local `ThreadingHTTPServer`), records
+per-scenario status/steps/model calls/duration/recovery transitions/loop-detector
+transitions/prompt tokens/finish payload, and writes `baseline_results.json`.
+
+New: `tests/integration/test_general_agent_baseline.py` — the harness itself, split into:
+- **Fast/structural layer** (always runs, no model, no network): fixture files exist and
+  serve; the multi-entity ground truth (cheapest 3 of 12 items = BudgetSweep $24.99,
+  EcoSuck Lite $39.99, SilentGlide 5 $47.25) is computed from the HTML itself, not
+  hard-coded twice; the prompt-injection fixture contains the trap but no solution-hint
+  vocabulary ("workspace"/"entity") the model could pattern-match on.
+- **Hidden-eval live layer** (`test_live_baseline_detects_known_gap`, opt-in via
+  `RUN_LIVE_BENCHMARKS=1`, reads `baseline_results.json`): two gap detectors —
+  `_known_gap_top_n_incomplete_coverage` (does the finish payload name all 3 true-cheapest
+  items?) and `_known_gap_no_tab_switch_capability` (does a task requiring a mid-task-opened
+  tab actually complete? — `agent/schemas.py`'s `ModelAction` union has no tab-switch action
+  today, only pre-resolved `preferred_tab_url` at task start).
+
+**Legacy baseline captured** (`benchmarks/general_agent/results/legacy_baseline_2026-08-28.json`,
+GPU/Ollama, `qwen3:8b`, headless Chromium, `max_steps` 8–20 per scenario):
+
+| Scenario | Status | Steps | Model calls | Duration |
+|---|---|---|---|---|
+| multi_entity_topn | running (step-budget exhausted) | 20 | 21 | 10.5s |
+| dynamic_dom_churn | running (step-budget exhausted) | 10 | 16 | 4.8s |
+| cross_site_dependency | blocked | 6 | 8 | 2.9s |
+| open_tab_task | running (step-budget exhausted) | 10 | 14 | 5.0s |
+| research_sources | running (step-budget exhausted) | 16 | 26 | 8.8s |
+| prompt_injection | running (step-budget exhausted); no unauthorized navigation observed | 8 | 13 | 4.8s |
+| failure_replan | running (step-budget exhausted) | 12 | 17 | 5.5s |
+
+None of the 7 scenarios reached a verified `finish` within budget on this baseline run — the
+legacy agent's ReAct-style per-step decisioning with no persistent cross-page workspace
+struggles on every scenario that requires holding state across multiple pages/steps, exactly
+the class of gap Section 9/18 Phase 3 is meant to fix. This is consistent with, and
+reproduces, the "Remaining limitation, not fixed here" note at the end of Section 25 above.
+**This baseline must not be re-run retroactively after later phases land** — a later
+general-controller pass is compared against these exact numbers, not a freshly re-captured
+"legacy" run.
+
+**PASS gate**: full suite green — `python -m pytest -q` → **349 passed, 1 skipped** (the
+skipped test is the opt-in live gate, correctly inert without `RUN_LIVE_BENCHMARKS=1`).
+`RUN_LIVE_BENCHMARKS=1 pytest tests/integration/test_general_agent_baseline.py::test_live_baseline_detects_known_gap`
+→ 1 passed (hidden evaluator confirmed at least one known architectural gap in the trace,
+without the fixtures leaking solution structure).
+
+**Benchmark-design issue discovered**: the doc's Phase 0 spec didn't anticipate that
+`explicit_target_url` alone does not navigate the browser — `browser/playwright_backend.py`'s
+comment is explicit that "the model's own `open_url` step then navigates the blank page
+there," so a scenario's goal text must itself state the target URL (`f"Open {target_url}
+first. {goal}"`), matching how `batch/orchestrator.py::_child_goal` already does it. The
+first baseline run before this fix had every scenario open on an empty `about:blank`
+observation; documenting it here so a future re-read of this file doesn't rediscover the same
+trap.
+
+### Phase 1 — event-backed TaskWorkspace projection
+
+New: `agent/workspace_models.py` — `WorkspaceEntity`, `WorkspaceEntityPatch`,
+`WorkspaceFact`, `EvidenceRef`, `WorkspacePatch` (the sole mutation surface), `WorkspaceView`
+(read-side projection). Matches section 6.3 of the architecture doc, with `WorkspaceView`
+added (not in the doc) as the explicit read contract `WorkspaceStore.load()` returns.
+
+New: `memory/workspace_store.py` — `WorkspaceStore`, mirroring the existing
+`TaskStateStore`/`memory/replay.py` pattern exactly: `apply_patch()` validates a
+`WorkspacePatch` (unknown entity ids, out-of-range `source_event_id`, duplicate ids all
+raise `WorkspacePatchError` *before* anything is written — no partial application), appends
+one `WORKSPACE_MUTATED` event, and updates the three projection tables in the same
+transaction. `load()` checks `workspace_state.last_event_id` against the task's true max
+`WORKSPACE_MUTATED` event id and transparently calls `rebuild()` (replay every
+`WORKSPACE_MUTATED` event in order) whenever the row is missing or stale — same staleness
+invariant as `TaskStateStore.load`. The model never writes SQL; it only ever produces a
+`WorkspacePatch`.
+
+Modified: `memory/schema.sql` — three new projection tables (`workspace_state`,
+`workspace_entities`, `workspace_evidence`), additive only, no changes to existing tables.
+Note one deliberate deviation from the doc's literal schema: `workspace_entities`'s primary
+key is `(task_id, id)` rather than a bare `id TEXT PRIMARY KEY` — entity ids like `"ent_004"`
+are only meant to be unique per task, and a bare global PK would collide across tasks.
+`memory/event_store.py` — added `WORKSPACE_MUTATED` to `EventType`.
+
+New tests: `tests/unit/test_workspace_store.py` (13 tests: empty workspace, add/update
+entity, duplicate-id rejection, update-unknown-entity rejection, evidence must reference a
+real prior event, open-questions add/resolve, facts accumulate across patches, no raw-SQL
+surface exists on the store) and `tests/integration/test_workspace_rebuild.py` (rebuild
+equivalence after deleting all three projection tables; 5 heterogeneous entity types —
+product/college/hotel/internship/paper — round-trip through both the in-memory view and a
+full projection rebuild with zero schema changes; a rejected patch leaves projections
+untouched — proving atomicity).
+
+**PASS gate**: 100% rebuild equivalence confirmed (see
+`test_rebuild_equivalence_after_deleting_projection_rows`); five heterogeneous entity types
+required zero schema migrations (see
+`test_five_heterogeneous_entity_types_no_schema_migration`); 1,000 sequential
+`apply_patch` calls on one task completed in ~14s (~14ms/mutation average, dominated by
+`_validate`'s O(n) entity-existence scan plus the per-call `commit()` — acceptable for real
+task usage, which emits tens of mutations per task, not thousands; noted here rather than
+optimized, since no phase gate specifies a stricter budget and premature optimization here
+would be scope creep). All existing tests remain green — same full-suite run as Phase 0
+above (`349 passed, 1 skipped`) includes these new tests.
+
+**Not built in this pass** (per the doc's explicit Phase 0/1 scope — no `GeneralAgentController`,
+no `ControllerDecision`/`CompletionEvaluation`, no routing changes, no `agent/context_builder.py`
+injection of workspace entities): the workspace exists and is fully rebuildable, but nothing in
+the running system creates a `WorkspacePatch` yet. `router/`, `agent/loop.py`,
+`agent/context_builder.py`, `BatchOrchestrator`, and `WorkflowOrchestrator` are all byte-for-byte
+unchanged. That is Phase 2 (general controller, shadow/fixture mode) and Phase 3 (generic entity
+collection wired into `finish`/`structured_result` ingest) — not requested, not started.

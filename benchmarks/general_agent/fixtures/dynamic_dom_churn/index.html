@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Dashboard</title></head>
+<body>
+  <h1>Live Dashboard</h1>
+  <div id="ticker">Loading...</div>
+  <button id="continue-btn" onclick="window.location.href='done.html'">Continue</button>
+  <script>
+    // Simulates a dynamic-page pathology: irrelevant DOM churn (a live-updating counter with
+    // rotating element ids/classes) that must not confuse action targeting or trigger the
+    // agent's loop detector into treating the page as stuck.
+    let n = 0;
+    function tick() {
+      n += 1;
+      const el = document.getElementById('ticker') || document.querySelector('[data-ticker]');
+      if (el) {
+        el.id = n % 2 === 0 ? 'ticker' : 'ticker-alt';
+        el.setAttribute('data-ticker', '1');
+        el.textContent = 'Updated ' + n + ' times';
+      }
+    }
+    setInterval(tick, 400);
+  </script>
+</body>
+</html>

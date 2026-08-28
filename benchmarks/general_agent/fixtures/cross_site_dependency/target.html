@@ -1,0 +1,13 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Configuration</title></head>
+<body>
+  <h1>Enter Configuration Code</h1>
+  <form onsubmit="return false;">
+    <label for="code-input">Access code</label>
+    <input id="code-input" type="text" name="code" />
+    <button id="submit-btn" type="button" onclick="document.getElementById('result').textContent = document.getElementById('code-input').value === 'QX-7741' ? 'Verified' : 'Rejected';">Submit</button>
+  </form>
+  <p id="result"></p>
+</body>
+</html>

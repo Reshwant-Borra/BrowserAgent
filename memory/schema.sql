@@ -103,3 +103,53 @@ ON active_task_facts(task_id, kind, key, value, source_event_id);
 
 CREATE INDEX IF NOT EXISTS idx_active_task_facts_task
 ON active_task_facts(task_id, status, source_event_id);
+
+-- Phase 1 (general-controller migration): TaskWorkspace projection tables. Like task_state,
+-- these are derived/rebuildable views over the `events` table (source event: WORKSPACE_MUTATED
+-- payload = a validated WorkspacePatch). Never written to directly by the model — only by
+-- deterministic code in memory/workspace_store.py after validating a WorkspacePatch and
+-- appending the corresponding event. See BrowserAgent_General_Autonomous_Agent_Architecture
+-- REVISED.pdf, section 6.
+
+CREATE TABLE IF NOT EXISTS workspace_state (
+    task_id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1,
+    data TEXT NOT NULL,              -- JSON object: open_questions, completion_requirements, etc.
+    last_event_id INTEGER,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE TABLE IF NOT EXISTS workspace_entities (
+    id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    name TEXT,
+    attributes TEXT NOT NULL,        -- JSON object
+    status TEXT NOT NULL DEFAULT 'active',
+    source_event_id INTEGER NOT NULL,
+    updated_event_id INTEGER NOT NULL,
+    PRIMARY KEY (task_id, id),
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_entities_task
+ON workspace_entities(task_id, entity_type, status);
+
+CREATE TABLE IF NOT EXISTS workspace_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    entity_id TEXT,
+    fact_key TEXT,
+    field_key TEXT,
+    source_event_id INTEGER NOT NULL,
+    source_url TEXT,
+    excerpt TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 1.0,
+    verification_status TEXT NOT NULL DEFAULT 'observed',
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_evidence_task
+ON workspace_evidence(task_id, source_event_id);
