@@ -1,0 +1,1396 @@
+{
+  "trials_per_scenario": 5,
+  "strategies": [
+    "delegated",
+    "continuous"
+  ],
+  "scenario_summaries": [
+    {
+      "scenario": "multi_step_registration",
+      "trial_count": 5,
+      "legacy": {
+        "success_rate": 0.2,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            25,
+            26,
+            26,
+            27,
+            8
+          ],
+          "median": 26,
+          "min": 8,
+          "max": 27,
+          "p25": 25,
+          "p75": 26
+        },
+        "actions": {
+          "n": 5,
+          "values": [
+            25,
+            25,
+            25,
+            25,
+            7
+          ],
+          "median": 25,
+          "min": 7,
+          "max": 25,
+          "p25": 25,
+          "p75": 25
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            16.27,
+            10.47,
+            10.38,
+            11.51,
+            3.04
+          ],
+          "median": 10.47,
+          "min": 3.04,
+          "max": 16.27,
+          "p25": 10.38,
+          "p75": 11.51
+        }
+      },
+      "delegated": {
+        "success_rate": 0.8,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            23,
+            42,
+            25,
+            46,
+            193
+          ],
+          "median": 42,
+          "min": 23,
+          "max": 193,
+          "p25": 25,
+          "p75": 46
+        },
+        "subgoal_children_or_steps": {
+          "n": 5,
+          "values": [
+            2,
+            5,
+            2,
+            5,
+            16
+          ],
+          "median": 5,
+          "min": 2,
+          "max": 16,
+          "p25": 2,
+          "p75": 5
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            9.85,
+            22.07,
+            10.35,
+            23.21,
+            96.44
+          ],
+          "median": 22.07,
+          "min": 9.85,
+          "max": 96.44,
+          "p25": 10.35,
+          "p75": 23.21
+        },
+        "model_call_overhead_pct": {
+          "n": 5,
+          "values": [
+            -8.0,
+            61.5,
+            -3.8,
+            70.4,
+            2312.5
+          ],
+          "median": 61.5,
+          "min": -8.0,
+          "max": 2312.5,
+          "p25": -3.8,
+          "p75": 70.4
+        },
+        "meets_success_gate": true,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "success_rate": 1.0,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            24,
+            23,
+            30,
+            26,
+            24
+          ],
+          "median": 24,
+          "min": 23,
+          "max": 30,
+          "p25": 24,
+          "p75": 26
+        },
+        "subgoal_children_or_steps": {
+          "n": 5,
+          "values": [
+            2,
+            3,
+            4,
+            3,
+            2
+          ],
+          "median": 3,
+          "min": 2,
+          "max": 4,
+          "p25": 2,
+          "p75": 3
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            12.28,
+            13.61,
+            19.26,
+            14.61,
+            13.82
+          ],
+          "median": 13.82,
+          "min": 12.28,
+          "max": 19.26,
+          "p25": 13.61,
+          "p75": 14.61
+        },
+        "model_call_overhead_pct": {
+          "n": 5,
+          "values": [
+            -4.0,
+            -11.5,
+            15.4,
+            -3.7,
+            200.0
+          ],
+          "median": -3.7,
+          "min": -11.5,
+          "max": 200.0,
+          "p25": -4.0,
+          "p75": 15.4
+        },
+        "meets_success_gate": true,
+        "meets_overhead_gate": true
+      }
+    },
+    {
+      "scenario": "compare_and_report",
+      "trial_count": 5,
+      "legacy": {
+        "success_rate": 0.8,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            4,
+            4,
+            4,
+            20,
+            4
+          ],
+          "median": 4,
+          "min": 4,
+          "max": 20,
+          "p25": 4,
+          "p75": 4
+        },
+        "actions": {
+          "n": 5,
+          "values": [
+            4,
+            4,
+            4,
+            20,
+            4
+          ],
+          "median": 4,
+          "min": 4,
+          "max": 20,
+          "p25": 4,
+          "p75": 4
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            2.0,
+            1.8,
+            1.82,
+            8.67,
+            2.0
+          ],
+          "median": 2.0,
+          "min": 1.8,
+          "max": 8.67,
+          "p25": 1.82,
+          "p75": 2.0
+        }
+      },
+      "delegated": {
+        "success_rate": 0.8,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            158,
+            35,
+            53,
+            17,
+            27
+          ],
+          "median": 35,
+          "min": 17,
+          "max": 158,
+          "p25": 27,
+          "p75": 53
+        },
+        "subgoal_children_or_steps": {
+          "n": 5,
+          "values": [
+            16,
+            4,
+            6,
+            3,
+            4
+          ],
+          "median": 4,
+          "min": 3,
+          "max": 16,
+          "p25": 4,
+          "p75": 6
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            82.25,
+            22.46,
+            31.48,
+            11.65,
+            16.45
+          ],
+          "median": 22.46,
+          "min": 11.65,
+          "max": 82.25,
+          "p25": 16.45,
+          "p75": 31.48
+        },
+        "model_call_overhead_pct": {
+          "n": 5,
+          "values": [
+            3850.0,
+            775.0,
+            1225.0,
+            -15.0,
+            575.0
+          ],
+          "median": 775.0,
+          "min": -15.0,
+          "max": 3850.0,
+          "p25": 575.0,
+          "p75": 1225.0
+        },
+        "meets_success_gate": true,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "success_rate": 1.0,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            16,
+            16,
+            11,
+            14,
+            12
+          ],
+          "median": 14,
+          "min": 11,
+          "max": 16,
+          "p25": 12,
+          "p75": 16
+        },
+        "subgoal_children_or_steps": {
+          "n": 5,
+          "values": [
+            2,
+            2,
+            1,
+            1,
+            1
+          ],
+          "median": 1,
+          "min": 1,
+          "max": 2,
+          "p25": 1,
+          "p75": 2
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            10.17,
+            10.12,
+            8.16,
+            8.02,
+            7.99
+          ],
+          "median": 8.16,
+          "min": 7.99,
+          "max": 10.17,
+          "p25": 8.02,
+          "p75": 10.12
+        },
+        "model_call_overhead_pct": {
+          "n": 5,
+          "values": [
+            300.0,
+            300.0,
+            175.0,
+            -30.0,
+            200.0
+          ],
+          "median": 200.0,
+          "min": -30.0,
+          "max": 300.0,
+          "p25": 175.0,
+          "p75": 300.0
+        },
+        "meets_success_gate": true,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "trial_count": 5,
+      "legacy": {
+        "success_rate": 1.0,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            7,
+            7,
+            7,
+            7,
+            7
+          ],
+          "median": 7,
+          "min": 7,
+          "max": 7,
+          "p25": 7,
+          "p75": 7
+        },
+        "actions": {
+          "n": 5,
+          "values": [
+            6,
+            6,
+            6,
+            6,
+            6
+          ],
+          "median": 6,
+          "min": 6,
+          "max": 6,
+          "p25": 6,
+          "p75": 6
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            2.94,
+            2.76,
+            2.82,
+            2.83,
+            2.84
+          ],
+          "median": 2.83,
+          "min": 2.76,
+          "max": 2.94,
+          "p25": 2.82,
+          "p75": 2.84
+        }
+      },
+      "delegated": {
+        "success_rate": 0.4,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            26,
+            105,
+            102,
+            102,
+            16
+          ],
+          "median": 102,
+          "min": 16,
+          "max": 105,
+          "p25": 26,
+          "p75": 102
+        },
+        "subgoal_children_or_steps": {
+          "n": 5,
+          "values": [
+            3,
+            15,
+            15,
+            15,
+            2
+          ],
+          "median": 15,
+          "min": 2,
+          "max": 15,
+          "p25": 3,
+          "p75": 15
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            11.49,
+            49.32,
+            48.22,
+            47.1,
+            7.5
+          ],
+          "median": 47.1,
+          "min": 7.5,
+          "max": 49.32,
+          "p25": 11.49,
+          "p75": 48.22
+        },
+        "model_call_overhead_pct": {
+          "n": 5,
+          "values": [
+            271.4,
+            1400.0,
+            1357.1,
+            1357.1,
+            128.6
+          ],
+          "median": 1357.1,
+          "min": 128.6,
+          "max": 1400.0,
+          "p25": 271.4,
+          "p75": 1357.1
+        },
+        "meets_success_gate": false,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "success_rate": 0.8,
+        "model_calls": {
+          "n": 5,
+          "values": [
+            34,
+            52,
+            50,
+            46,
+            37
+          ],
+          "median": 46,
+          "min": 34,
+          "max": 52,
+          "p25": 37,
+          "p75": 50
+        },
+        "subgoal_children_or_steps": {
+          "n": 5,
+          "values": [
+            2,
+            2,
+            2,
+            2,
+            2
+          ],
+          "median": 2,
+          "min": 2,
+          "max": 2,
+          "p25": 2,
+          "p75": 2
+        },
+        "duration_s": {
+          "n": 5,
+          "values": [
+            13.84,
+            18.6,
+            17.53,
+            22.73,
+            14.25
+          ],
+          "median": 17.53,
+          "min": 13.84,
+          "max": 22.73,
+          "p25": 14.25,
+          "p75": 18.6
+        },
+        "model_call_overhead_pct": {
+          "n": 5,
+          "values": [
+            385.7,
+            642.9,
+            614.3,
+            557.1,
+            428.6
+          ],
+          "median": 557.1,
+          "min": 385.7,
+          "max": 642.9,
+          "p25": 428.6,
+          "p75": 614.3
+        },
+        "meets_success_gate": false,
+        "meets_overhead_gate": false
+      }
+    }
+  ],
+  "raw_trials": [
+    {
+      "scenario": "multi_step_registration",
+      "trial": 0,
+      "legacy": {
+        "status": "running",
+        "steps": 25,
+        "model_calls": 25,
+        "duration_s": 16.27
+      },
+      "legacy_success": false,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Navigate to the verification page and enter the invite code exactly"
+          ],
+          "model_calls": 23,
+          "controller_model_calls": 3,
+          "child_model_calls": 20,
+          "subgoal_children": 2,
+          "duration_s": 9.85,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -8.0,
+        "meets_overhead_gate": null
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify invite code on the verification page",
+            "Click the 'Verify' button on the verification page"
+          ],
+          "model_calls": 24,
+          "controller_model_calls": 2,
+          "child_model_calls": 22,
+          "subgoal_children": 2,
+          "duration_s": 12.28,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -4.0,
+        "meets_overhead_gate": null
+      }
+    },
+    {
+      "scenario": "multi_step_registration",
+      "trial": 1,
+      "legacy": {
+        "status": "running",
+        "steps": 25,
+        "model_calls": 26,
+        "duration_s": 10.47
+      },
+      "legacy_success": false,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify the invite code on the verification page",
+            "Navigate to the account settings page",
+            "Enable the weekly summary email toggle"
+          ],
+          "model_calls": 42,
+          "controller_model_calls": 5,
+          "child_model_calls": 37,
+          "subgoal_children": 5,
+          "duration_s": 22.07,
+          "error": null,
+          "planner_schema_valid_count": 5,
+          "planner_schema_total_count": 5
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 61.5,
+        "meets_overhead_gate": null
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify the invite code on the verification page",
+            "Navigate to account settings page and enable weekly summary email",
+            "Verify invite code on the verification page"
+          ],
+          "model_calls": 23,
+          "controller_model_calls": 3,
+          "child_model_calls": 20,
+          "subgoal_children": 3,
+          "duration_s": 13.61,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -11.5,
+        "meets_overhead_gate": null
+      }
+    },
+    {
+      "scenario": "multi_step_registration",
+      "trial": 2,
+      "legacy": {
+        "status": "running",
+        "steps": 25,
+        "model_calls": 26,
+        "duration_s": 10.38
+      },
+      "legacy_success": false,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Navigate to the verification page and enter the invite code exactly"
+          ],
+          "model_calls": 25,
+          "controller_model_calls": 3,
+          "child_model_calls": 22,
+          "subgoal_children": 2,
+          "duration_s": 10.35,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -3.8,
+        "meets_overhead_gate": null
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify the invite code on the verification page",
+            "Click the 'Enable weekly summary email' toggle on the account settings page"
+          ],
+          "model_calls": 30,
+          "controller_model_calls": 5,
+          "child_model_calls": 25,
+          "subgoal_children": 4,
+          "duration_s": 19.26,
+          "error": null,
+          "planner_schema_valid_count": 5,
+          "planner_schema_total_count": 5
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 15.4,
+        "meets_overhead_gate": null
+      }
+    },
+    {
+      "scenario": "multi_step_registration",
+      "trial": 3,
+      "legacy": {
+        "status": "running",
+        "steps": 25,
+        "model_calls": 27,
+        "duration_s": 11.51
+      },
+      "legacy_success": false,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify the invite code on the verification page",
+            "Navigate to the account settings page",
+            "Enable the weekly summary email toggle"
+          ],
+          "model_calls": 46,
+          "controller_model_calls": 5,
+          "child_model_calls": 41,
+          "subgoal_children": 5,
+          "duration_s": 23.21,
+          "error": null,
+          "planner_schema_valid_count": 5,
+          "planner_schema_total_count": 5
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 70.4,
+        "meets_overhead_gate": null
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify invite code on the verification page",
+            "Click the verification page's confirm button to proceed"
+          ],
+          "model_calls": 26,
+          "controller_model_calls": 3,
+          "child_model_calls": 23,
+          "subgoal_children": 3,
+          "duration_s": 14.61,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -3.7,
+        "meets_overhead_gate": null
+      }
+    },
+    {
+      "scenario": "multi_step_registration",
+      "trial": 4,
+      "legacy": {
+        "status": "completed",
+        "steps": 7,
+        "model_calls": 8,
+        "duration_s": 3.04
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "blocked",
+          "blocked_reason": "replan budget exhausted (6/6): repeated_failure: subgoal 'Enable the weekly summary email toggle' failed 2 consecutive time(s)",
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify the invite code on the verification page",
+            "Navigate to the account settings page"
+          ],
+          "model_calls": 193,
+          "controller_model_calls": 9,
+          "child_model_calls": 184,
+          "subgoal_children": 16,
+          "duration_s": 96.44,
+          "error": null,
+          "planner_schema_valid_count": 9,
+          "planner_schema_total_count": 9
+        },
+        "general_success": false,
+        "meets_success_gate": false,
+        "model_call_overhead_pct": 2312.5,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Read the invite code from the signup page",
+            "Verify the invite code on the verification page",
+            "Click the 'Enable weekly summary email' toggle on the account settings page"
+          ],
+          "model_calls": 24,
+          "controller_model_calls": 3,
+          "child_model_calls": 21,
+          "subgoal_children": 2,
+          "duration_s": 13.82,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 200.0,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "compare_and_report",
+      "trial": 0,
+      "legacy": {
+        "status": "completed",
+        "steps": 4,
+        "model_calls": 4,
+        "duration_s": 2.0
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "blocked",
+          "blocked_reason": "replan budget exhausted (6/6): repeated_failure: subgoal 'Extract the monthly price for StackForge from the directory page' failed 2 consecutive time(s)",
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans",
+            "Find the directory listing for the hosting plans",
+            "Extract the monthly price for NimbusHost from the directory page"
+          ],
+          "model_calls": 158,
+          "controller_model_calls": 9,
+          "child_model_calls": 149,
+          "subgoal_children": 16,
+          "duration_s": 82.25,
+          "error": null,
+          "planner_schema_valid_count": 9,
+          "planner_schema_total_count": 9
+        },
+        "general_success": false,
+        "meets_success_gate": false,
+        "model_call_overhead_pct": 3850.0,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans.",
+            "Extract monthly prices for NimbusHost and StackForge",
+            "Compare the monthly prices of NimbusHost and StackForge"
+          ],
+          "model_calls": 16,
+          "controller_model_calls": 2,
+          "child_model_calls": 14,
+          "subgoal_children": 2,
+          "duration_s": 10.17,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 300.0,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "compare_and_report",
+      "trial": 1,
+      "legacy": {
+        "status": "completed",
+        "steps": 4,
+        "model_calls": 4,
+        "duration_s": 1.8
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans.",
+            "Find and note the monthly price for NimbusHost's hosting plan.",
+            "Find and note the monthly price for StackForge's hosting plan."
+          ],
+          "model_calls": 35,
+          "controller_model_calls": 4,
+          "child_model_calls": 31,
+          "subgoal_children": 4,
+          "duration_s": 22.46,
+          "error": null,
+          "planner_schema_valid_count": 4,
+          "planner_schema_total_count": 4
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 775.0,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans.",
+            "Extract monthly prices for NimbusHost and StackForge",
+            "Compare the monthly prices of NimbusHost and StackForge"
+          ],
+          "model_calls": 16,
+          "controller_model_calls": 2,
+          "child_model_calls": 14,
+          "subgoal_children": 2,
+          "duration_s": 10.12,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 300.0,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "compare_and_report",
+      "trial": 2,
+      "legacy": {
+        "status": "completed",
+        "steps": 4,
+        "model_calls": 4,
+        "duration_s": 1.82
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans.",
+            "Find and note the monthly price for NimbusHost's hosting plan.",
+            "Find and note the monthly price for StackForge's hosting plan."
+          ],
+          "model_calls": 53,
+          "controller_model_calls": 5,
+          "child_model_calls": 48,
+          "subgoal_children": 6,
+          "duration_s": 31.48,
+          "error": null,
+          "planner_schema_valid_count": 5,
+          "planner_schema_total_count": 5
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 1225.0,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans",
+            "Navigate to the first hosting plan page (NimbusHost) and extract the monthly price."
+          ],
+          "model_calls": 11,
+          "controller_model_calls": 2,
+          "child_model_calls": 9,
+          "subgoal_children": 1,
+          "duration_s": 8.16,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 175.0,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "compare_and_report",
+      "trial": 3,
+      "legacy": {
+        "status": "running",
+        "steps": 20,
+        "model_calls": 20,
+        "duration_s": 8.67
+      },
+      "legacy_success": false,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans",
+            "Identify the page for NimbusHost and extract its monthly price",
+            "Identify the page for StackForge and extract its monthly price"
+          ],
+          "model_calls": 17,
+          "controller_model_calls": 4,
+          "child_model_calls": 13,
+          "subgoal_children": 3,
+          "duration_s": 11.65,
+          "error": null,
+          "planner_schema_valid_count": 4,
+          "planner_schema_total_count": 4
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -15.0,
+        "meets_overhead_gate": null
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans",
+            "Navigate to the NimbusHost plan page and extract the monthly price."
+          ],
+          "model_calls": 14,
+          "controller_model_calls": 2,
+          "child_model_calls": 12,
+          "subgoal_children": 1,
+          "duration_s": 8.02,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": -30.0,
+        "meets_overhead_gate": null
+      }
+    },
+    {
+      "scenario": "compare_and_report",
+      "trial": 4,
+      "legacy": {
+        "status": "completed",
+        "steps": 4,
+        "model_calls": 4,
+        "duration_s": 2.0
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans.",
+            "Locate and extract the monthly price for NimbusHost.",
+            "Locate and extract the monthly price for StackForge."
+          ],
+          "model_calls": 27,
+          "controller_model_calls": 4,
+          "child_model_calls": 23,
+          "subgoal_children": 4,
+          "duration_s": 16.45,
+          "error": null,
+          "planner_schema_valid_count": 4,
+          "planner_schema_total_count": 4
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 575.0,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the directory containing the hosting plans",
+            "Navigate to the NimbusHost plan page and extract the monthly price."
+          ],
+          "model_calls": 12,
+          "controller_model_calls": 2,
+          "child_model_calls": 10,
+          "subgoal_children": 1,
+          "duration_s": 7.99,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 200.0,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "trial": 0,
+      "legacy": {
+        "status": "completed",
+        "steps": 6,
+        "model_calls": 7,
+        "duration_s": 2.94
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID.",
+            "Navigate to the confirmation page and enter the extracted reference ID."
+          ],
+          "model_calls": 26,
+          "controller_model_calls": 3,
+          "child_model_calls": 23,
+          "subgoal_children": 3,
+          "duration_s": 11.49,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 271.4,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID.",
+            "Confirm the reference ID on the confirmation page"
+          ],
+          "model_calls": 34,
+          "controller_model_calls": 2,
+          "child_model_calls": 32,
+          "subgoal_children": 2,
+          "duration_s": 13.84,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 385.7,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "trial": 1,
+      "legacy": {
+        "status": "completed",
+        "steps": 6,
+        "model_calls": 7,
+        "duration_s": 2.76
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "blocked",
+          "blocked_reason": "replan budget exhausted (6/6): repeated_failure: subgoal 'Navigate to the confirmation page and enter the extracted reference ID.' failed 2 consecutive time(s)",
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID."
+          ],
+          "model_calls": 105,
+          "controller_model_calls": 8,
+          "child_model_calls": 97,
+          "subgoal_children": 15,
+          "duration_s": 49.32,
+          "error": null,
+          "planner_schema_valid_count": 8,
+          "planner_schema_total_count": 8
+        },
+        "general_success": false,
+        "meets_success_gate": false,
+        "model_call_overhead_pct": 1400.0,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID.",
+            "Confirm the reference ID on the confirmation page"
+          ],
+          "model_calls": 52,
+          "controller_model_calls": 2,
+          "child_model_calls": 50,
+          "subgoal_children": 2,
+          "duration_s": 18.6,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 642.9,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "trial": 2,
+      "legacy": {
+        "status": "completed",
+        "steps": 6,
+        "model_calls": 7,
+        "duration_s": 2.82
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "blocked",
+          "blocked_reason": "replan budget exhausted (6/6): repeated_failure: subgoal 'Navigate to the confirmation page and enter the extracted reference ID.' failed 2 consecutive time(s)",
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID."
+          ],
+          "model_calls": 102,
+          "controller_model_calls": 8,
+          "child_model_calls": 94,
+          "subgoal_children": 15,
+          "duration_s": 48.22,
+          "error": null,
+          "planner_schema_valid_count": 8,
+          "planner_schema_total_count": 8
+        },
+        "general_success": false,
+        "meets_success_gate": false,
+        "model_call_overhead_pct": 1357.1,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID.",
+            "Confirm the reference ID on the confirmation page"
+          ],
+          "model_calls": 50,
+          "controller_model_calls": 2,
+          "child_model_calls": 48,
+          "subgoal_children": 2,
+          "duration_s": 17.53,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 614.3,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "trial": 3,
+      "legacy": {
+        "status": "completed",
+        "steps": 6,
+        "model_calls": 7,
+        "duration_s": 2.83
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "blocked",
+          "blocked_reason": "replan budget exhausted (6/6): repeated_failure: subgoal 'Navigate to the confirmation page and enter the extracted reference ID.' failed 2 consecutive time(s)",
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID."
+          ],
+          "model_calls": 102,
+          "controller_model_calls": 8,
+          "child_model_calls": 94,
+          "subgoal_children": 15,
+          "duration_s": 47.1,
+          "error": null,
+          "planner_schema_valid_count": 8,
+          "planner_schema_total_count": 8
+        },
+        "general_success": false,
+        "meets_success_gate": false,
+        "model_call_overhead_pct": 1357.1,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "blocked",
+          "blocked_reason": "replan budget exhausted (6/6): desynced_subgoal: model called finish for 'Navigate to confirmation page and enter the reference ID', which this controller's own current plan does not recognize",
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID."
+          ],
+          "model_calls": 46,
+          "controller_model_calls": 7,
+          "child_model_calls": 39,
+          "subgoal_children": 2,
+          "duration_s": 22.73,
+          "error": null,
+          "planner_schema_valid_count": 7,
+          "planner_schema_total_count": 7
+        },
+        "general_success": false,
+        "meets_success_gate": false,
+        "model_call_overhead_pct": 557.1,
+        "meets_overhead_gate": false
+      }
+    },
+    {
+      "scenario": "sequential_form_fill",
+      "trial": 4,
+      "legacy": {
+        "status": "completed",
+        "steps": 6,
+        "model_calls": 7,
+        "duration_s": 2.84
+      },
+      "legacy_success": true,
+      "delegated": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID.",
+            "Navigate to the confirmation page and enter the extracted reference ID."
+          ],
+          "model_calls": 16,
+          "controller_model_calls": 3,
+          "child_model_calls": 13,
+          "subgoal_children": 2,
+          "duration_s": 7.5,
+          "error": null,
+          "planner_schema_valid_count": 3,
+          "planner_schema_total_count": 3
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 128.6,
+        "meets_overhead_gate": false
+      },
+      "continuous": {
+        "general": {
+          "status": "completed",
+          "blocked_reason": null,
+          "completed_subgoals": [
+            "Navigate to the profile page and extract the reference ID.",
+            "Enter the reference ID on the confirmation page and confirm"
+          ],
+          "model_calls": 37,
+          "controller_model_calls": 2,
+          "child_model_calls": 35,
+          "subgoal_children": 2,
+          "duration_s": 14.25,
+          "error": null,
+          "planner_schema_valid_count": 2,
+          "planner_schema_total_count": 2
+        },
+        "general_success": true,
+        "meets_success_gate": true,
+        "model_call_overhead_pct": 428.6,
+        "meets_overhead_gate": false
+      }
+    }
+  ]
+}

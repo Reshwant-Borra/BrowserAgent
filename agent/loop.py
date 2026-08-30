@@ -205,19 +205,29 @@ class AgentLoop:
     async def run(self, max_steps: int = 200) -> TaskState:
         await self.start_browser()
         try:
-            state = self.state_store.load(self.task_id)
-            state = await self._reconcile_pending_intent(state)
-            if state.status in ("completed", "blocked"):
-                return state
-
-            for _ in range(max_steps):
-                state = self.state_store.load(self.task_id)
-                if state.status != "running":
-                    break
-                state = await self.step(state)
-            return state
+            return await self.run_steps(max_steps)
         finally:
             await self.aclose()
+
+    async def run_steps(self, max_steps: int = 200) -> TaskState:
+        """The step-loop body of `run()`, extracted so a caller that wants to keep one browser
+        session open across multiple calls (agent/controller.py's continuous strategy, which
+        needs to regain control after every single step to enforce a per-subgoal local-attempt
+        limit — see GeneralAgentController._drive_continuous_session) can drive it directly
+        without paying `start_browser()`/`aclose()`'s cost on every call. Never opens or closes
+        the browser itself — the caller (`run()` above, or a continuous-strategy driver) owns
+        that. Behavior for `run()` itself is unchanged; this is a pure extraction."""
+        state = self.state_store.load(self.task_id)
+        state = await self._reconcile_pending_intent(state)
+        if state.status in ("completed", "blocked"):
+            return state
+
+        for _ in range(max_steps):
+            state = self.state_store.load(self.task_id)
+            if state.status != "running":
+                break
+            state = await self.step(state)
+        return state
 
     async def _reconcile_pending_intent(self, state: TaskState) -> TaskState:
         """Resume-time atomicity check: an ACTION_INTENT with no matching ACTION_RESULT

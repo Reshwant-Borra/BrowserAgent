@@ -45,19 +45,28 @@ from memory.models import TaskRecord, TaskState
 from memory.task_state import TaskStateStore
 from memory.workspace_store import WorkspaceStore
 
-# Blocked reasons agent/loop.py's own step()/recovery ladder can produce that reflect a
+# Blocked reasons agent/loop.py's own step()/recovery ladder — or this controller's own
+# per-subgoal local-attempt limit (_subgoal_local_attempts) — can produce that reflect a
 # capability/reliability limit rather than a safety gate — eligible for the continuous
-# strategy's controller-level replan-and-retry below (agent/loop.py::_advance_recovery's
-# RecoveryLevel.USER_REQUIRED, and the idempotency guard that refuses to blindly re-attempt a
-# CONSEQUENTIAL action fingerprint that already failed once). A controller replan produces a
-# genuinely different subgoal/approach, not a repeat of the same fingerprinted action — the
-# fingerprint-based guard itself stays fully intact regardless of how many times the
-# controller replans, so retrying *via a replan* here never bypasses it. This also brings the
-# continuous strategy's retry semantics in line with the delegated strategy's existing
-# max_subgoal_attempts, which already retries a fresh child (any blocked reason included) up
-# to that budget before ever calling _replan_or_block — unlike delegated mode's fresh-child-
-# per-attempt state, the continuous strategy shares one TaskState/recent_actions history
-# across attempts, so it must explicitly re-open this door rather than getting it "for free."
+# strategy's controller-level replan-and-retry below:
+#   - "repeated failures exhausted automatic recovery": agent/loop.py::_advance_recovery's
+#     RecoveryLevel.USER_REQUIRED.
+#   - "refusing to auto-retry a consequential action...": the idempotency guard that refuses
+#     to blindly re-attempt a CONSEQUENTIAL action fingerprint that already failed once.
+#   - "subgoal local attempts exhausted": this controller's own _subgoal_local_attempts limit
+#     — agent/loop.py's own internal low-level replan rescued the same subgoal
+#     max_subgoal_attempts times with no forward progress (the diagnosed root cause of the 0/5
+#     multi_step_registration failure — see docs/BROWSERAGENT_MASTER_STATUS.md's Phase 2
+#     corrective-pass section).
+# A controller replan produces a genuinely different subgoal/approach, not a repeat of the
+# same fingerprinted action — the fingerprint-based guard itself stays fully intact regardless
+# of how many times the controller replans, so retrying *via a replan* here never bypasses it.
+# This also brings the continuous strategy's retry semantics in line with the delegated
+# strategy's existing max_subgoal_attempts, which already retries a fresh, hub-grounded child
+# (any blocked reason included) up to that budget before ever calling _replan_or_block —
+# unlike delegated mode's fresh-child-per-attempt state, the continuous strategy shares one
+# TaskState/recent_actions history across attempts, so it must explicitly re-open this door
+# rather than getting it "for free."
 #
 # Every other blocked reason (login_required, a declined consequential action, a runtime-
 # policy/scope violation) is a deliberate stop that must never be silently retried past — see
@@ -65,6 +74,7 @@ from memory.workspace_store import WorkspaceStore
 _REPLAN_ELIGIBLE_BLOCK_PREFIXES = (
     "repeated failures exhausted automatic recovery",
     "refusing to auto-retry a consequential action that previously failed",
+    "subgoal local attempts exhausted",
 )
 
 
@@ -229,7 +239,7 @@ class GeneralAgentController:
             active = decision.active_subgoal or (plan[0] if plan else None)
             if not plan or active is None:
                 return self._block("planner returned an empty plan with nothing to do")
-            self._append(EventType.SUBGOAL_CHANGED, {"subgoal": active, "plan": plan})
+            self._append(EventType.SUBGOAL_CHANGED, {"subgoal": active, "plan": plan, "source": "controller"})
             return self._reset_recovery_for_new_subgoal()
         if decision.decision == "finish":
             return self._finish(CompletionEvaluation(
@@ -374,7 +384,7 @@ class GeneralAgentController:
         plan = state.plan
         idx = plan.index(state.current_subgoal) if state.current_subgoal in plan else -1
         next_subgoal = plan[idx + 1] if 0 <= idx < len(plan) - 1 else None
-        self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan})
+        self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan, "source": "controller"})
         return self.state_store.load(self.control_task_id)
 
     # ---- continuous strategy (Phase 2 corrective pass) -------------------------------
@@ -433,7 +443,7 @@ class GeneralAgentController:
 
             remaining_subgoals = max(1, len(state.plan) - len(state.completed_subgoals))
             step_budget = cfg.max_steps_per_subgoal * (remaining_subgoals + 1)
-            state = await loop.run(max_steps=step_budget)
+            state = await self._drive_continuous_session(loop, step_budget)
 
             if state.status == "blocked" and _is_replan_eligible_block(state.blocked_reason):
                 state = await self._replan_or_block(
@@ -446,6 +456,78 @@ class GeneralAgentController:
             return state
 
         return self.state_store.load(self.control_task_id)
+
+    async def _drive_continuous_session(self, loop: AgentLoop, step_budget: int) -> TaskState:
+        """Runs `loop` one step at a time (agent/loop.py::AgentLoop.run_steps(1) repeatedly)
+        instead of one big `loop.run(max_steps=step_budget)` call, so this controller regains
+        control after every single action — needed to enforce `_subgoal_local_attempts`'
+        per-subgoal limit below at the point it actually needs to fire, not only at the coarse
+        "the whole session ended" boundary a single big `run()` call would offer. Starts/closes
+        the browser exactly once, same as one `loop.run()` call would."""
+        cfg = self.config.agent
+        await loop.start_browser()
+        try:
+            for _ in range(step_budget):
+                state = await loop.run_steps(1)
+                if state.status != "running":
+                    return state
+                if state.current_subgoal is not None and self._subgoal_local_attempts() >= cfg.max_subgoal_attempts:
+                    # agent/loop.py's own internal low-level replan (build_replan_prompt, fired
+                    # when the action-level recovery ladder reaches REPLAN_REQUIRED) has already
+                    # rescued the active subgoal `max_subgoal_attempts` times with no forward
+                    # progress recorded against it (docs/BROWSERAGENT_MASTER_STATUS.md's Phase 2
+                    # corrective-pass section: this was the diagnosed root cause of the 0/5
+                    # multi_step_registration failure — that internal replan mechanism has no
+                    # bound of its own, and continuous mode's much larger multi-subgoal step
+                    # budget gave it far more room to cycle than any single-subgoal task ever
+                    # would). Block with a reason _is_replan_eligible_block recognizes, so the
+                    # outer loop in _run_continuous re-grounds via a real controller-level
+                    # replan and a fresh, hub-grounded browser session next — never silently
+                    # keep burning the shared step budget on a subgoal that keeps needing
+                    # rescuing without ever actually finishing.
+                    return self._block(
+                        f"subgoal local attempts exhausted: {state.current_subgoal!r} needed "
+                        f"agent/loop.py's own internal replan {cfg.max_subgoal_attempts} "
+                        "time(s) with no forward progress"
+                    )
+            return self.state_store.load(self.control_task_id)
+        finally:
+            await loop.aclose()
+
+    def _subgoal_local_attempts(self) -> int:
+        """How many times agent/loop.py's own internal low-level replan has already rescued
+        the active subgoal since this controller itself last set it. The continuous strategy's
+        per-subgoal analogue of the delegated strategy's `_attempts_for_current_subgoal` (which
+        counts fresh-child `DELEGATE_STARTED` attempts instead, since delegated mode has no
+        shared low-level recovery ladder to reuse: retry_count/recovery_level restart at
+        NORMAL/0 for every fresh child task already).
+
+        Deliberately NOT keyed by subgoal *text* equality: `agent/loop.py::_replan()` produces
+        a freshly model-worded subgoal string every time it fires (its own prompt asks for one
+        in free text), so consecutive low-level replans essentially never share an identical
+        subgoal string — a text-matched counter would (and, in an earlier version of this fix,
+        did) never accumulate past 1, since "attempt #2" always lands on a *different* string
+        than "attempt #1". Instead, every SUBGOAL_CHANGED this controller itself appends (see
+        `_apply_controller_decision`/`_advance_subgoal`/the finish intercept's advance branch)
+        is additively tagged `"source": "controller"` — a harmless extra payload key
+        memory/replay.py already ignores — so this counts RECOVERY_TRANSITION events with
+        `reason == "replanned"` (the one place in the codebase agent/loop.py::_replan() appends
+        one) after the most recent *controller-tagged* SUBGOAL_CHANGED, regardless of how many
+        different-text subgoals agent/loop.py's own mechanism produced in between. Recomputed
+        fresh from the event log every call — no in-memory counter, so a crash mid-subgoal and
+        a resumed `_run_continuous` reconstruct the exact same count from persisted events
+        alone (item 7)."""
+        events = self.event_store.all_events(self.control_task_id)
+        last_controller_change_id = 0
+        for e in events:
+            if e.type == EventType.SUBGOAL_CHANGED and e.payload.get("source") == "controller":
+                last_controller_change_id = e.id
+        return sum(
+            1 for e in events
+            if e.type == EventType.RECOVERY_TRANSITION
+            and e.id > last_controller_change_id
+            and e.payload.get("reason") == "replanned"
+        )
 
     def _make_continuous_finish_intercept(
         self, task: TaskRecord,
@@ -482,7 +564,7 @@ class GeneralAgentController:
             # makes memory/replay.py fold `subgoal` into completed_subgoals. A direct _finish()
             # without this step would silently drop the final subgoal from completed_subgoals.
             next_subgoal = plan[idx + 1] if not is_last else None
-            self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan})
+            self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan, "source": "controller"})
             state = self._reset_recovery_for_new_subgoal()
             if next_subgoal is not None:
                 return state
@@ -643,8 +725,17 @@ class GeneralAgentController:
         )
 
     def _count_replan_events(self) -> int:
+        # Controller-tagged only (see `_subgoal_local_attempts`'s docstring): in the continuous
+        # strategy, agent/loop.py's own internal low-level replan also appends untagged
+        # SUBGOAL_CHANGED events onto this same shared event log — those are not a controller-
+        # level replan and must never count against max_replans' budget, or the controller
+        # would exhaust its own replan budget purely from the executor's low-level recovery
+        # ladder doing its own, unrelated thing.
         events = self.event_store.all_events(self.control_task_id)
-        subgoal_changes = sum(1 for e in events if e.type == EventType.SUBGOAL_CHANGED)
+        subgoal_changes = sum(
+            1 for e in events
+            if e.type == EventType.SUBGOAL_CHANGED and e.payload.get("source") == "controller"
+        )
         return max(0, subgoal_changes - 1)
 
     def _append(self, event_type: EventType, payload: dict) -> int:

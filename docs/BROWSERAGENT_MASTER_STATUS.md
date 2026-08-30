@@ -1982,3 +1982,180 @@ everywhere outside directly-constructed-controller callers, identical to how the
 strategy itself has shipped since Section 27), with the one diagnosed, reproducible, scoped gap
 (31.10's missing subgoal-attempt counter) documented as the concrete next step for whoever picks
 this up. **Phase 3 has still not been started.**
+
+## 32. Phase 2 Corrective Pass #2 — Subgoal-Scoped Local-Attempt Limit (fixes 31.10's gap; PASS)
+
+Landed at the user's explicit request to fix *only* the diagnosed subgoal-scoped retry/attempt-
+state gap from Section 31.10 and rerun the exact same live A/B validation. **Verdict: PASS.**
+Pushed to `origin/main`.
+
+### 32.1 Where retry state was task-global when it needed subgoal-local semantics
+
+Inspected `agent/loop.py` directly (not assumed): `state.retry_count` (`memory/replay.py`
+line 65: `state.retry_count = 0 if passed else state.retry_count + 1`) is a single, whole-task
+counter with no notion of "which subgoal" a failure belongs to — harmless for every existing
+caller (single-site/batch/workflow/research, and the delegated strategy) because each of those
+gets a **fresh** `TaskState` per task/child, so `retry_count` starts at 0 for each one anyway.
+The continuous strategy shares one `TaskState`/event log across every subgoal by design, so
+this was never actually the bug (retry_count already correctly resets on any passing
+verification, and `agent/loop.py::_replan()` already explicitly resets it to 0 too).
+
+The real gap, found by tracing the exact multi_step_registration failure's event log (5/5
+failing trials from Section 31.10's benchmark, all `status: "running"`, never blocked, with
+`completed_subgoals` full of near-duplicate rephrasings like "Verify invite code on the
+verification page" / "Verify the invite code on the verification page"): `agent/loop.py`'s own
+**internal** low-level replan (`_replan()`, fired when the action-level recovery ladder reaches
+`REPLAN_REQUIRED`, pre-existing and unmodified by Section 31) has **no bound of its own** — it
+resets `recovery_level`/`retry_count` back to `NORMAL`/0 every single time it fires, forever,
+for every caller, always. This was never a practical problem before the continuous strategy
+existed: every other caller's `step()`-loop budget is small enough (a single subgoal/task) that
+even 2-3 internal replan cycles exhausts the budget long before it matters. The continuous
+strategy's `step_budget` spans an entire multi-subgoal plan (`max_steps_per_subgoal *
+(remaining_subgoals + 1)`), which gave this pre-existing, task-agnostic mechanism far more room
+to cycle unboundedly than it had ever been exercised under before — exactly the "task-global
+recovery state, no subgoal-local limit" gap the corrective task asked to find.
+
+### 32.2 Design: minimal subgoal-scoped state, derived from existing events
+
+No new executor, no new task mode, one continuous `AgentLoop` — unchanged from Section 31.
+Two changes, both additive:
+
+1. **`agent/loop.py::run()` split into `run()` + a new public `run_steps(max_steps)`** — a pure
+   extraction (verified behavior-identical by the full pre-existing test suite staying green
+   unmodified): `run_steps` is the exact step-loop body `run()` always had, just callable
+   without `start_browser()`/`aclose()` wrapping it every time. This lets a caller keep one
+   browser session open across multiple `run_steps()` calls — needed so the controller can
+   regain control after *every single action* instead of only after an entire `loop.run()`
+   call ends.
+2. **`agent/controller.py::_drive_continuous_session`** replaces the old single big
+   `loop.run(max_steps=step_budget)` call with a loop of `loop.run_steps(1)` calls, checking a
+   new `_subgoal_local_attempts()` count after every one.
+
+`_subgoal_local_attempts()` is the actual fix, and it is *not* keyed by subgoal text — an
+earlier version of this exact fix was tried first and found broken by a new unit test before
+ever reaching the live benchmark (`test_subgoal_local_attempts_counts_by_controller_tag_not_
+subgoal_text`): `agent/loop.py::_replan()`'s own prompt (`build_replan_prompt`) asks the model
+for a freshly-worded subgoal string in free text every time it fires, so two consecutive
+internal replans essentially never produce the same string — a text-matched counter (mirroring
+delegated mode's `_attempts_for_current_subgoal`, which works because delegated mode has no
+shared low-level ladder to reuse) would never accumulate past 1, since "attempt #2" always
+lands on a different string than "attempt #1". **Fix**: every SUBGOAL_CHANGED event *this
+controller itself* appends (`_apply_controller_decision`, `_advance_subgoal`, the finish
+intercept's advance branch) now additively tags its payload with `"source": "controller"` — a
+harmless extra key `memory/replay.py` already ignores, no new event type (item 4's own ask).
+`_subgoal_local_attempts()` counts `RECOVERY_TRANSITION` events with `reason == "replanned"`
+(the one place in the codebase `_replan()` appends one) after the most recent
+*controller-tagged* SUBGOAL_CHANGED — correctly counting internal replan cycles regardless of
+how many different-text subgoal strings they produce in between. Recomputed fresh from
+`event_store.all_events(...)` on every call — no in-memory counter anywhere (item 7: a crash
+mid-subgoal and a resumed `_run_continuous` reconstruct the identical count from persisted
+events alone, automatically, with no special-cased resume logic needed).
+
+A second, related bug in the same area was also found and fixed: `_count_replan_events()`
+(seeds `self._replans_used`, the `max_replans` budget counter) previously counted *every*
+`SUBGOAL_CHANGED` event on the task — correct for delegated mode (children have separate event
+logs, so nothing but the controller ever writes one there) but wrong for continuous mode, where
+`agent/loop.py`'s own internal replans now also write untagged `SUBGOAL_CHANGED` events onto
+the *same* shared log, silently consuming the controller's own replan budget for something it
+never did. Fixed the same way: only count `source == "controller"` events.
+
+On `SUBGOAL_CHANGED` (item 5): resetting is implicit and correct by construction, not an
+explicit "clear this counter" step — `_subgoal_local_attempts()`'s count is scoped to "since
+the most recent controller-tagged event," so a genuine controller-level advance/replan
+automatically zeroes it, while `completed_subgoals`, workspace facts/entities, and the full
+event history (including the exact previously-failed subgoal text — "failed-strategy evidence"
+item 5 asks to preserve, still fully inspectable in the event log for any future replan's
+`reason_hint` context) are never touched. `RECOVERY_TRANSITION`/`retry_count`/`recovery_level`
+reset via the existing, unmodified `_reset_recovery_for_new_subgoal()` exactly as before —
+nothing task-level (crash/resume state, `completed_subgoals`, workspace) is ever erased.
+
+On retry within the same subgoal (item 6): `agent/loop.py`'s own existing recovery ladder
+(retry → refresh_state → deep_recovery → replan_required) is completely unchanged and still
+enforces `max_action_retries` exactly as it always has — this fix does not touch that ladder at
+all, it only bounds how many times the ladder is allowed to *reset back to the top* for the
+same underlying subgoal before the controller intervenes. Once `_subgoal_local_attempts() >=
+max_subgoal_attempts` (the same config field, and the same value, delegated mode already uses),
+`_drive_continuous_session` blocks with a new, precisely-named reason ("subgoal local attempts
+exhausted: ...") that `_is_replan_eligible_block` recognizes (a third prefix alongside the two
+from Section 31.3.2) — the existing outer-loop-restart machinery in `_run_continuous` then
+performs a real controller-level replan (bounded by `max_replans`, a live schema-constrained
+call) and rebuilds a fresh, hub-grounded `AgentLoop`/browser session, exactly mirroring
+delegated mode's own fresh-child-per-attempt reset.
+
+### 32.3 Regression tests reproducing the pre-fix failure
+
+`tests/integration/test_general_controller_continuous.py`, 3 new tests:
+
+- `test_subgoal_local_attempts_counts_by_controller_tag_not_subgoal_text`: direct proof the
+  counter survives two interleaved *different-text* untagged SUBGOAL_CHANGED events (0 → 1 →
+  2), and that a genuine controller-tagged SUBGOAL_CHANGED resets it back to 0 — the exact
+  defect an earlier, text-matched version of this fix had.
+- `test_continuous_blocks_when_local_attempts_already_exhausted_at_session_start`: end-to-end
+  proof `_drive_continuous_session` enforces the limit via pre-seeded events.
+- `test_continuous_reproduces_and_bounds_repeated_internal_replans`: **live reproduction, no
+  synthetic events** — scripts the model to always assert an `expected_result` that can never
+  be satisfied, forcing genuine repeated verification failures through the real recovery ladder
+  up to `REPLAN_REQUIRED`, letting `agent/loop.py`'s own real `_replan()` fire (feeding it
+  freshly-worded subgoal text each time, exactly like a real `qwen3:8b` would); asserts the
+  controller now blocks with "subgoal local attempts exhausted" once `max_subgoal_attempts`
+  real internal replans have fired, rather than the pre-fix behavior (`status: "running"`,
+  never blocked, step budget silently exhausted).
+
+### 32.4 Full suite + live A/B rerun
+
+Full regression: **383 passed, 1 skipped** (up from Section 31's 380 — the +3 are this pass's
+new tests), zero regressions, including every existing delegated-mode and Section 31
+continuous-strategy test unmodified.
+
+Same exact 5-trial-per-scenario live `qwen3:8b` A/B matrix as Section 31.10
+(`benchmarks/general_agent/results/phase2_corrective2_repeated_2026-08-30.json`):
+
+| Scenario | Legacy success (median calls) | Delegated success / median calls | Continuous success / median calls |
+|---|---|---|---|
+| multi_step_registration | 1/5 (26) | 4/5 (80%) / 42 | **5/5 (100%)** / 24 |
+| compare_and_report | 4/5 (4) | 4/5 (80%) / 35 | **5/5 (100%)** / 14 |
+| sequential_form_fill | 5/5 (7) | 2/5 (40%) / 102 | **4/5 (80%)** / 46 |
+| **aggregate (15 trials/strategy)** | 10/15 (67%) | 10/15 (67%) | **14/15 (93%)** |
+
+`multi_step_registration`'s previous 0/5 is now **5/5** — the diagnosed root cause (32.1) is
+confirmed fixed, not just plausible: the live reproduction test (32.3) demonstrates the exact
+mechanism directly, and the benchmark confirms it end to end. Continuous now beats or ties
+delegated's success rate on every scenario (never regresses) and uses materially fewer median
+calls on **every** scenario, including the one it previously lost on (43% fewer on
+`multi_step_registration`, 60% fewer on `compare_and_report`, 55% fewer on
+`sequential_form_fill`).
+
+### 32.5 PASS gate (item 10)
+
+1. Continuous success `>= delegated` on **all** tested scenarios: **MET** (80%→100%,
+   80%→100%, 40%→80%).
+2. No scenario at 0/5: **MET** (worst case is 4/5).
+3. Median model calls materially lower on at least the scenarios continuous previously won:
+   **MET**, and now also on the scenario it previously lost (multi_step_registration).
+4. No safety/verification/crash-resume regression: **MET** — `agent/loop.py`'s action/
+   verification/recovery/safety pipeline is untouched by this pass (only `run()` was split,
+   behavior-identically, into `run()` + `run_steps()`); Section 31.9's safety test and Section
+   31.8's crash/resume tests both still pass unmodified.
+5. No domain-specific code added: **MET** — verified by inspection, same as Section 31.11.
+
+### 32.6 Git
+
+Committed and **pushed to `origin/main`** per item 12 (PASS). Diff: `agent/loop.py` (the
+`run()`/`run_steps()` split), `agent/controller.py` (`_drive_continuous_session`,
+`_subgoal_local_attempts`, the `source: "controller"` tag, `_count_replan_events`'s fix),
+`tests/integration/test_general_controller_continuous.py` (+3 tests), this documentation
+section, and the new results file. No other module touched.
+
+### 32.7 Final Phase 2 verdict: **PASS**
+
+The continuous strategy (`GeneralAgentController.run(strategy="continuous")`) is now
+correctness-verified (full suite green, safety/crash-resume unregressed, no domain-specific
+code) and empirically superior to the delegated strategy on every live-benchmarked scenario,
+both in task success and in model-call cost. `strategy` still defaults to `"delegated"` on
+`GeneralAgentController.run()` (existing tests in `test_general_controller.py` construct
+per-subgoal child factories that assume the delegated strategy's one-child-per-subgoal shape,
+and flipping the default would silently break that contract for no requirement asked in this
+pass) and `config.agent.control_mode` still defaults `"legacy"` everywhere outside a
+directly-constructed controller — the shadow/fixture-mode discipline established in Section 27
+is unchanged: nothing in `router/`, `ui/`, `batch/`, or `workflow/` reaches either strategy of
+`GeneralAgentController` yet. **Phase 3 has still not been started.**

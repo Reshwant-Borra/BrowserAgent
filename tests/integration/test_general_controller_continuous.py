@@ -12,6 +12,7 @@ benchmarks/general_agent/run_phase2_controller.py's repeated-trial harness.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -313,5 +314,176 @@ async def test_continuous_recovery_reset_does_not_erase_completed_subgoals_or_wo
 
         workspace = controller.workspace_store.load(controller.control_task_id)
         assert "subgoal_result::a" in workspace.facts
+    finally:
+        controller.close()
+
+
+# ---- subgoal-scoped local-attempt limit (Phase 2 corrective pass #2) ------------------------
+#
+# Reproduces the diagnosed root cause of the 0/5 multi_step_registration failure: agent/
+# loop.py's own internal low-level replan (build_replan_prompt, fired when the action-level
+# recovery ladder reaches REPLAN_REQUIRED) has no bound of its own and produces a freshly
+# model-worded subgoal string every time it fires — a text-matched attempt counter (an earlier
+# version of this fix) could never see two consecutive firings as "the same subgoal being
+# retried," since attempt #2 always lands on a different string than attempt #1. Continuous
+# mode's much larger multi-subgoal step budget gave that pre-existing, task-agnostic mechanism
+# far more room to cycle unboundedly than any single-subgoal task ever exercised it before.
+
+def _find_target(prompt: str, name: str) -> int:
+    match = re.search(rf'\[(\d+)\] \w+ "{re.escape(name)}"', prompt)
+    assert match, f"element {name!r} not found in prompt: {prompt[-500:]!r}"
+    return int(match.group(1))
+
+
+async def test_subgoal_local_attempts_counts_by_controller_tag_not_subgoal_text(tmp_config):
+    """Direct unit-level proof that the counter survives agent/loop.py's own internal replan
+    renaming current_subgoal to a different string every time it fires — the exact defect an
+    earlier, text-matched version of this fix had. Two "replanned" transitions interleaved
+    with two *different-text* untagged (loop-internal) SUBGOAL_CHANGED events, after one
+    controller-tagged SUBGOAL_CHANGED, must still count as 2, not 0 or 1."""
+    config = _config(tmp_config)
+    controller = GeneralAgentController.create_new(config, "goal", [])
+    try:
+        cid = controller.control_task_id
+        controller.event_store.append(cid, 1, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "read the invite code", "plan": ["read the invite code"], "source": "controller",
+        })
+        assert controller._subgoal_local_attempts() == 0
+
+        # agent/loop.py::_replan()'s own atomic pair: a freshly-worded, untagged SUBGOAL_CHANGED
+        # followed by a "replanned" RECOVERY_TRANSITION — fired twice, with different text both
+        # times, exactly like a real qwen3:8b replan call would produce.
+        controller.event_store.append(cid, 2, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "retry reading the invite code (attempt 1)", "plan": ["retry reading the invite code (attempt 1)"],
+        })
+        controller.event_store.append(cid, 2, EventType.RECOVERY_TRANSITION, {
+            "from": "replan_required", "to": "normal", "reason": "replanned",
+        })
+        assert controller._subgoal_local_attempts() == 1
+
+        controller.event_store.append(cid, 3, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "let's try the invite code page again (attempt 2)",
+            "plan": ["let's try the invite code page again (attempt 2)"],
+        })
+        controller.event_store.append(cid, 3, EventType.RECOVERY_TRANSITION, {
+            "from": "replan_required", "to": "normal", "reason": "replanned",
+        })
+        assert controller._subgoal_local_attempts() == 2
+
+        # A genuine controller-level replan (tagged) resets the count back to 0, even though
+        # completed_subgoals/workspace facts/history remain untouched (item 5/13).
+        controller.event_store.append(cid, 4, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "a genuinely different subgoal", "plan": ["a genuinely different subgoal"],
+            "source": "controller",
+        })
+        assert controller._subgoal_local_attempts() == 0
+    finally:
+        controller.close()
+
+
+async def test_continuous_blocks_when_local_attempts_already_exhausted_at_session_start(tmp_config, fixture_site_url):
+    """End-to-end proof that _drive_continuous_session enforces the limit the moment it
+    checks, using pre-seeded events to simulate "agent/loop.py's own replan already rescued
+    this subgoal max_subgoal_attempts times" without needing to actually drive a real failing
+    browser interaction for this particular assertion (that is covered by the live-ladder test
+    below). With max_replans=0, the resulting block must name the exhausted-local-attempts
+    reason and never silently keep running."""
+    config = _config(tmp_config, max_subgoal_attempts=2, max_steps_per_subgoal=5, max_replans=0)
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "start_subgoal", "reason_code": "initial_plan",
+             "active_subgoal": "an impossible subgoal", "plan": ["an impossible subgoal"],
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+        ],
+    })
+    url = f"{fixture_site_url}/noop.html"
+    controller = GeneralAgentController.create_new(
+        config, "an impossible subgoal", [], llama_client=planner_client,
+        child_llama_client_factory=lambda: ScriptedLlamaClient([decision("wait", params={"ms": 1}) for _ in range(10)]),
+    )
+    try:
+        cid = controller.control_task_id
+        task = controller.state_store.get_task_record(cid)
+        state = await controller._initial_plan(task)
+        assert state.current_subgoal == "an impossible subgoal"
+
+        # Simulate two prior loop-internal replan firings against this exact controller-set
+        # subgoal (different text each time — see the unit test above for why that matters).
+        controller.event_store.append(cid, 2, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "retry (1)", "plan": ["retry (1)"],
+        })
+        controller.event_store.append(cid, 2, EventType.RECOVERY_TRANSITION, {
+            "from": "replan_required", "to": "normal", "reason": "replanned",
+        })
+        controller.event_store.append(cid, 3, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "retry (2)", "plan": ["retry (2)"],
+        })
+        controller.event_store.append(cid, 3, EventType.RECOVERY_TRANSITION, {
+            "from": "replan_required", "to": "normal", "reason": "replanned",
+        })
+        assert controller._subgoal_local_attempts() == 2
+
+        loop = AgentLoop(
+            config, cid, explicit_target_url=url, event_store=controller.event_store,
+            state_store=controller.state_store,
+        )
+        loop.llama = ScriptedLlamaClient([decision("open_url", params={"url": url})])
+        loop.finish_intercept = controller._make_continuous_finish_intercept(task)
+        result = await controller._drive_continuous_session(loop, step_budget=5)
+
+        assert result.status == "blocked"
+        assert "subgoal local attempts exhausted" in (result.blocked_reason or "")
+    finally:
+        controller.close()
+
+
+async def test_continuous_reproduces_and_bounds_repeated_internal_replans(tmp_config, fixture_site_url):
+    """Live reproduction (no synthetic events) of the exact multi_step_registration failure
+    mode: a subgoal whose actions always fail verification drives the REAL recovery ladder to
+    REPLAN_REQUIRED, agent/loop.py's own _replan() fires with a freshly-worded subgoal, the
+    same failure repeats, _replan() fires again — and this controller must now block once
+    max_subgoal_attempts local rescues have happened, rather than burning the rest of its step
+    budget cycling forever (the observed pre-fix behavior: `status: "running"`, never blocked
+    or completed, with completed_subgoals full of near-duplicate rephrasings)."""
+    config = _config(tmp_config, max_subgoal_attempts=2, max_steps_per_subgoal=60, max_replans=0)
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "start_subgoal", "reason_code": "initial_plan",
+             "active_subgoal": "click the do-nothing button until it works", "plan": ["click the do-nothing button until it works"],
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+        ],
+    })
+    url = f"{fixture_site_url}/noop.html"
+
+    replan_calls = {"n": 0}
+
+    def script_entry(prompt: str) -> str:
+        if "updating the plan for a browser task that is stuck" in prompt:
+            replan_calls["n"] += 1
+            worded = f"try a different way to trigger the do-nothing button (attempt {replan_calls['n']})"
+            return json.dumps({"subgoal": worded, "plan": [worded]})
+        if "Do Nothing" not in prompt:
+            return decision("open_url", params={"url": url})
+        target = _find_target(prompt, "Do Nothing")
+        # An expected_result that can never be satisfied forces a genuine, deterministic
+        # verification failure every single time, regardless of the button's real (no-op)
+        # effect — driving the real recovery ladder up to REPLAN_REQUIRED repeatedly.
+        return decision("click", target=target, expected_result={"url_contains": "this-can-never-match-xyz"})
+
+    child_client = ScriptedLlamaClient([script_entry for _ in range(300)])
+    controller = GeneralAgentController.create_new(
+        config, "click the do-nothing button until it works", [], llama_client=planner_client,
+        child_llama_client_factory=lambda: child_client,
+    )
+    try:
+        state = await controller.run(explicit_target_url=url, strategy="continuous")
+
+        assert state.status == "blocked"
+        assert "subgoal local attempts exhausted" in (state.blocked_reason or "")
+        assert replan_calls["n"] >= config.agent.max_subgoal_attempts
+
+        events = controller.event_store.all_events(controller.control_task_id)
+        replanned = [e for e in events if e.type == EventType.RECOVERY_TRANSITION and e.payload.get("reason") == "replanned"]
+        assert len(replanned) >= config.agent.max_subgoal_attempts
     finally:
         controller.close()
