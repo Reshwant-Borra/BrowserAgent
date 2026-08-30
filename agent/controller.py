@@ -28,7 +28,7 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Awaitable, Callable, Optional
 
 from agent.config import AppConfig
 from agent.context_builder import build_workspace_summary
@@ -36,12 +36,40 @@ from agent.controller_models import CompletionEvaluation, ControllerDecision
 from agent.loop import AgentLoop
 from agent.planner import PlannerOutputError
 from agent import planner as planner_mod
+from agent.schemas import ModelDecision, RecoveryLevel
 from agent.workspace_models import EvidenceRef, WorkspaceFact, WorkspacePatch, WorkspaceView
+from browser.page_model import PageObservation
 from inference.llama_client import InferenceClient, create_inference_client
 from memory.event_store import EventStore, EventType
 from memory.models import TaskRecord, TaskState
 from memory.task_state import TaskStateStore
 from memory.workspace_store import WorkspaceStore
+
+# Blocked reasons agent/loop.py's own step()/recovery ladder can produce that reflect a
+# capability/reliability limit rather than a safety gate — eligible for the continuous
+# strategy's controller-level replan-and-retry below (agent/loop.py::_advance_recovery's
+# RecoveryLevel.USER_REQUIRED, and the idempotency guard that refuses to blindly re-attempt a
+# CONSEQUENTIAL action fingerprint that already failed once). A controller replan produces a
+# genuinely different subgoal/approach, not a repeat of the same fingerprinted action — the
+# fingerprint-based guard itself stays fully intact regardless of how many times the
+# controller replans, so retrying *via a replan* here never bypasses it. This also brings the
+# continuous strategy's retry semantics in line with the delegated strategy's existing
+# max_subgoal_attempts, which already retries a fresh child (any blocked reason included) up
+# to that budget before ever calling _replan_or_block — unlike delegated mode's fresh-child-
+# per-attempt state, the continuous strategy shares one TaskState/recent_actions history
+# across attempts, so it must explicitly re-open this door rather than getting it "for free."
+#
+# Every other blocked reason (login_required, a declined consequential action, a runtime-
+# policy/scope violation) is a deliberate stop that must never be silently retried past — see
+# docs/BROWSERAGENT_MASTER_STATUS.md's Phase 2 corrective-pass section, item 12.
+_REPLAN_ELIGIBLE_BLOCK_PREFIXES = (
+    "repeated failures exhausted automatic recovery",
+    "refusing to auto-retry a consequential action that previously failed",
+)
+
+
+def _is_replan_eligible_block(blocked_reason: Optional[str]) -> bool:
+    return bool(blocked_reason) and any(blocked_reason.startswith(p) for p in _REPLAN_ELIGIBLE_BLOCK_PREFIXES)
 
 
 _HUB_URL_FACT_KEY = "_hub_url"
@@ -100,10 +128,24 @@ class GeneralAgentController:
 
     # ---- entry point ----------------------------------------------------------------
 
-    async def run(self, explicit_target_url: Optional[str] = None) -> TaskState:
-        """Receding-horizon control loop (section 7.1/7.2): plan once, execute the active
-        subgoal via AgentLoop, ingest its result into the workspace, advance or replan at
-        boundaries, evaluate completion, repeat until finished/blocked/iteration budget."""
+    async def run(self, explicit_target_url: Optional[str] = None, strategy: str = "delegated") -> TaskState:
+        """Receding-horizon control loop (section 7.1/7.2).
+
+        `strategy="delegated"` (default, unchanged from Phase 2's original landing): every
+        subgoal spawns its own fresh child AgentLoop task (own task_id/event log), ingesting
+        that child's result into the workspace before advancing or replanning. This is what
+        every existing test/caller uses and its behavior is completely unchanged below.
+
+        `strategy="continuous"` (Phase 2 corrective-pass candidate — see docs/BROWSERAGENT_
+        MASTER_STATUS.md): the diagnosed subgoal-boundary cost (each child re-earning its own
+        orientation from a fresh task/browser relaunch, plus a completion-evaluation model
+        call after every intermediate subgoal) is paid once per *subgoal*, not once per task.
+        This strategy instead runs ONE continuous AgentLoop task across every subgoal —
+        `_run_continuous` below — reusing agent/loop.py's own step()/verifier/event-sourcing
+        machinery unmodified except for one additive `finish_intercept` hook.
+        """
+        if strategy == "continuous":
+            return await self._run_continuous(explicit_target_url)
         cfg = self.config.agent
         task = self.state_store.get_task_record(self.control_task_id)
         if task is None:
@@ -188,7 +230,7 @@ class GeneralAgentController:
             if not plan or active is None:
                 return self._block("planner returned an empty plan with nothing to do")
             self._append(EventType.SUBGOAL_CHANGED, {"subgoal": active, "plan": plan})
-            return self.state_store.load(self.control_task_id)
+            return self._reset_recovery_for_new_subgoal()
         if decision.decision == "finish":
             return self._finish(CompletionEvaluation(
                 satisfied=True, next_recommendation="finish",
@@ -334,6 +376,205 @@ class GeneralAgentController:
         next_subgoal = plan[idx + 1] if 0 <= idx < len(plan) - 1 else None
         self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan})
         return self.state_store.load(self.control_task_id)
+
+    # ---- continuous strategy (Phase 2 corrective pass) -------------------------------
+    #
+    # One AgentLoop task/event-log/browser session for the whole run instead of one per
+    # subgoal. agent/loop.py's step() is completely unmodified except for the additive
+    # `finish_intercept` hook it now offers a `finish` decision to before its own terminal
+    # `_handle_finish` runs (see agent/loop.py's docstring on that param). Every action
+    # decision, verification, safety gate (classify_risk/approval/runtime_policy), and
+    # recovery escalation still goes through exactly the same code as every other AgentLoop
+    # task — this section only ever touches the `finish` branch, never the action pipeline.
+
+    async def _run_continuous(self, explicit_target_url: Optional[str] = None) -> TaskState:
+        cfg = self.config.agent
+        task = self.state_store.get_task_record(self.control_task_id)
+        if task is None:
+            raise ValueError(f"no such control task: {self.control_task_id}")
+
+        await self._remember_hub_url(explicit_target_url)
+        hub_url = self.workspace_store.load(self.control_task_id).facts.get(_HUB_URL_FACT_KEY)
+        self._replans_used = self._count_replan_events()
+
+        state = self.state_store.load(self.control_task_id)
+        if not state.plan and state.status == "running" and state.current_subgoal is None:
+            state = await self._initial_plan(task)
+
+        # Bounded restart count for "loop.run() itself blocked because its own low-level
+        # recovery ladder ran out of retries" — mirrors max_subgoal_attempts/max_replans'
+        # existing budgets rather than inventing a new one; each restart still only happens
+        # via _replan_or_block, so it shares max_replans' single budget below.
+        for _ in range(cfg.max_replans + 2):
+            state = self.state_store.load(self.control_task_id)
+            if state.status != "running":
+                break
+
+            # explicit_target_url alone never navigates the browser (docs/BROWSERAGENT_MASTER_
+            # STATUS.md's Phase 0 section: "the model's own open_url step then navigates the
+            # blank page there") — every fresh browser session (the first one, and any restart
+            # after a low-level-recovery-exhausted/consequential-refusal replan below) starts
+            # on about:blank with no other grounding, exactly like a delegated-mode child would
+            # if _subgoal_child_goal's "Open {target_url} first." intro were skipped. Mirror
+            # that intro here via `goal_override` — a prompt-only override, never persisted —
+            # rather than mutating current_subgoal/plan text (an earlier version of this fix
+            # did that and corrupted completed_subgoals: memory/replay.py's SUBGOAL_CHANGED
+            # handling treats any change to current_subgoal's *text* as "the old one is done,
+            # superseded" even when it is really the same logical subgoal with a hint prepended).
+            goal_override = f"Open {hub_url} first. {task.goal}" if hub_url else None
+            loop = AgentLoop(
+                self.config, self.control_task_id, explicit_target_url=hub_url,
+                event_store=self.event_store, state_store=self.state_store,
+                goal_override=goal_override,
+            )
+            if self._child_llama_client_factory is not None:
+                loop.llama = self._child_llama_client_factory()
+            loop.finish_intercept = self._make_continuous_finish_intercept(task)
+
+            remaining_subgoals = max(1, len(state.plan) - len(state.completed_subgoals))
+            step_budget = cfg.max_steps_per_subgoal * (remaining_subgoals + 1)
+            state = await loop.run(max_steps=step_budget)
+
+            if state.status == "blocked" and _is_replan_eligible_block(state.blocked_reason):
+                state = await self._replan_or_block(
+                    task, reason_hint=f"repeated_failure: subgoal {state.current_subgoal!r} "
+                                      f"blocked ({state.blocked_reason})",
+                )
+                if state.status != "running":
+                    return state
+                continue  # rebuild a fresh AgentLoop bound to the same task_id and resume
+            return state
+
+        return self.state_store.load(self.control_task_id)
+
+    def _make_continuous_finish_intercept(
+        self, task: TaskRecord,
+    ) -> Callable[[ModelDecision, TaskState, PageObservation], Awaitable[Optional[TaskState]]]:
+        async def intercept(decision: ModelDecision, state: TaskState, observation: PageObservation) -> Optional[TaskState]:
+            subgoal = state.current_subgoal
+            plan = state.plan
+            if subgoal is None or subgoal not in plan:
+                # agent/loop.py's own internal low-level replan (build_replan_prompt, fired on
+                # repeated action failure, unrelated to this controller) can rename
+                # current_subgoal/plan out from under this controller's own plan — never trust
+                # an unrecognized subgoal as "the last one" (that would risk ending the whole
+                # task on one ambiguous finish). Re-ground via the controller's own bounded,
+                # budgeted replan instead of guessing.
+                return await self._replan_or_block(
+                    task, reason_hint=f"desynced_subgoal: model called finish for {subgoal!r}, "
+                                      "which this controller's own current plan does not recognize",
+                )
+
+            idx = plan.index(subgoal)
+            is_last = idx == len(plan) - 1
+            if not self._continuous_subgoal_has_evidence(subgoal, decision):
+                # No verifiable completion evidence for *this* subgoal yet (item 9: a subgoal
+                # is not done just because the model says so) — fall through to agent/loop.py's
+                # own existing terminal-evidence gate in _handle_finish, which will correctly
+                # reject this finish and advance recovery exactly as it already does for every
+                # other caller, without this controller inventing a second rejection path.
+                return None
+
+            self._ingest_continuous_subgoal_result(subgoal, decision, observation)
+
+            # Always advance via SUBGOAL_CHANGED (mirroring the delegated strategy's own
+            # _advance_subgoal) — including moving to None on the last subgoal, which is what
+            # makes memory/replay.py fold `subgoal` into completed_subgoals. A direct _finish()
+            # without this step would silently drop the final subgoal from completed_subgoals.
+            next_subgoal = plan[idx + 1] if not is_last else None
+            self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan})
+            state = self._reset_recovery_for_new_subgoal()
+            if next_subgoal is not None:
+                return state
+
+            # Final subgoal believed done: one mandatory whole-goal completion check — the
+            # same single boundary _evaluate_and_replan_or_finish already performs when the
+            # (delegated-mode) plan is exhausted, not a new call type, and not paid for any
+            # *intermediate* subgoal (item 8: no planner call after every subgoal).
+            workspace = self.workspace_store.load(self.control_task_id)
+            try:
+                evaluation = await self._planner_evaluate_completion(task, workspace)
+            except PlannerOutputError as exc:
+                return self._block(f"completion evaluation failed schema validation: {exc}")
+            self._append(EventType.COMPLETION_EVALUATED, evaluation.model_dump())
+            if evaluation.satisfied:
+                return self._finish(evaluation, completion_claim=decision.params.get("result"))
+            if evaluation.next_recommendation == "ask_user":
+                return self._block("; ".join(evaluation.missing_requirements) or "clarification needed")
+            reason = "completion_rejection: " + (
+                "; ".join(evaluation.missing_requirements) or "final subgoal complete but goal unsatisfied"
+            )
+            return await self._replan_or_block(task, reason_hint=reason)
+
+        return intercept
+
+    def _continuous_subgoal_has_evidence(self, subgoal: str, decision: ModelDecision) -> bool:
+        """Deterministic subgoal-completion evidence check (item 9/18: no new LLM call merely
+        to judge this) — same evidence bar agent/loop.py's own _has_evidence_backed_structured_
+        result uses for a batch child's finish, plus "a verified action happened since this
+        subgoal became active" for interactive (non-extraction) subgoals."""
+        structured = decision.params.get("structured_result")
+        if isinstance(structured, dict):
+            findings = structured.get("findings")
+            if isinstance(findings, list) and any(
+                isinstance(f, dict) and str(f.get("evidence") or "").strip() and str(f.get("value") or "").strip()
+                for f in findings
+            ):
+                return True
+            fields = structured.get("fields")
+            if isinstance(fields, dict) and any(
+                isinstance(f, dict) and f.get("status") == "found" and str(f.get("evidence") or "").strip()
+                for f in fields.values()
+            ):
+                return True
+        events = self.event_store.all_events(self.control_task_id)
+        last_change_id = 0
+        for e in events:
+            if e.type == EventType.SUBGOAL_CHANGED and e.payload.get("subgoal") == subgoal:
+                last_change_id = e.id
+        return any(
+            e.type == EventType.VERIFICATION_RESULT and e.id > last_change_id
+            and bool(e.verification_result and e.verification_result.get("passed"))
+            for e in events
+        )
+
+    def _ingest_continuous_subgoal_result(
+        self, subgoal: str, decision: ModelDecision, observation: PageObservation,
+    ) -> None:
+        result_text = str(decision.params.get("result", ""))
+        structured_result = decision.params.get("structured_result")
+        result_event_id = self._append(EventType.DELEGATE_RESULT, {
+            "substrate": "continuous_step", "subgoal": subgoal, "child_task_id": self.control_task_id,
+            "status": "completed", "result": result_text, "final_url": observation.url,
+            "structured_result": structured_result, "blocked_reason": None,
+        })
+        if result_text or structured_result:
+            excerpt = result_text or json.dumps(structured_result)[:500]
+            patch = WorkspacePatch(
+                add_facts=[WorkspaceFact(key=f"subgoal_result::{subgoal}", value=result_text)],
+                add_evidence=[EvidenceRef(
+                    fact_key=f"subgoal_result::{subgoal}",
+                    source_event_id=result_event_id,
+                    source_url=observation.url,
+                    excerpt=excerpt,
+                )],
+            )
+            self.workspace_store.apply_patch(self.control_task_id, patch)
+
+    def _reset_recovery_for_new_subgoal(self) -> TaskState:
+        """A subgoal transition (advance or replan) is a natural point to reset the local
+        action-level recovery ladder — a repeated-click failure on the *previous* subgoal's
+        page must not immediately re-trip DEEP_RECOVERY/USER_REQUIRED on the *next* subgoal's
+        first action. Never clears completed_subgoals/workspace facts/plan history (item 13) —
+        only the transient recovery_level/retry_count/status fields agent/loop.py's own
+        recovery ladder owns. A no-op for delegated-mode callers (a fresh child TaskState
+        already starts at NORMAL/0), so this is safe to share between both strategies."""
+        state = self.state_store.load(self.control_task_id)
+        state.status = "running"
+        state.recovery_level = RecoveryLevel.NORMAL.value
+        state.retry_count = 0
+        self.state_store.save(state)
+        return state
 
     # ---- crash recovery ---------------------------------------------------------------
 

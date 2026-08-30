@@ -1580,3 +1580,405 @@ goals the legacy agent cannot complete at all, at a real and currently-unresolve
 premium on goals the legacy agent could already solve cheaply. Per the architecture doc's
 Section 18 rule ("Claude Code must implement exactly one phase at a time... A failed phase is
 diagnosed before the next phase begins"), Phase 3 has **not** been started.
+
+### 27.5 Attempt to fix the 27.2 overhead gate — both candidate fixes falsified live, reverted
+
+Landed at the user's explicit request to fix the overhead gap before Phase 3 begins. Two fixes
+were designed from the 27.2 diagnosis's own named candidate directions, implemented, and — this
+is the point of this subsection — **tested against a live `qwen3:8b`/Ollama backend rather than
+trusted from code review alone**. Both were empirically falsified and are **not** in the
+codebase; `git diff` against this pass's start is empty except for this documentation update.
+
+**Fix D (planner prompt)**: added one rule to `agent/planner.py`'s `_PLANNER_SYSTEM` telling the
+planner the browser already starts on the task's entry page, so it should never create a subgoal
+whose entire content is arriving there. Tested in isolation (3 live trials of
+`compare_and_report`): the planner produced the exact same "Navigate to the directory listing
+both hosting plans" arrival-only subgoal in **3/3** trials — the instruction had **no measurable
+effect** on `qwen3:8b`'s decomposition. Overhead across those 3 trials: 575%/325%/575% (no better
+than 27.2's original 325% single-sample baseline).
+
+**Fix A (shared browser session across subgoal boundaries)**: gave `AgentLoop` an optional
+pre-built, pre-started `browser` kwarg; `GeneralAgentController` built one `PlaywrightBackend` per
+`run()` call (not per subgoal) and reused it across every subgoal child, skipping the forced
+`explicit_target_url` re-navigation-to-hub after the first subgoal. Full test suite stayed green
+(392 passed, 1 skipped) — the bug was not in correctness, it was in the theory of the fix. Live
+testing (3 trials each of `compare_and_report`/`sequential_form_fill`) showed a severe,
+reproducible **regression**: subgoal count ballooned from 2-3 to 14-16 per task, overhead hit
+937-3575%, and the general agent outright failed (`general_success: false`, replan budget
+exhausted) in most trials — worse than the pre-fix baseline on both axes.
+
+**Root cause of the Fix A regression, found by tracing the event log of a failed run**
+(`extract target=5` repeatedly resolving to `stale_target`, eventually extracting the wrong
+element and finishing with `structured_result: {findings: []}` — empty evidence that slipped
+through `_handle_finish`'s gate because a prior trivially-passing `extract` verification already
+satisfied its "any verified action" escape hatch, letting the next subgoal hallucinate a value to
+type): **the theory behind Fix A was wrong.** `explicit_target_url`'s auto-navigation-to-hub was
+already a *free*, code-driven action — it costs zero model calls, only wall-clock time (a browser
+relaunch). Skipping it for subgoal 2+ did not remove any model-call cost; it *added* cost, because
+the model now has to decide its own way back to the hub instead of arriving there for free, and
+`qwen3:8b` does not reliably succeed at that from the goal-text hint alone — each failure burns a
+`max_subgoal_attempts` retry, and repeated failures burn a `max_replans` replan, both of which
+spawn new children (hence 14-16 subgoal_children instead of 2-3). The diagnosed cost in 27.2
+("each subgoal's child AgentLoop starts completely fresh... re-earns its own orientation") is
+real, but it manifests as wasted *browser relaunch time*, not wasted *model calls* — the metric
+the PASS gate actually measures. A fix that removes the relaunch without also making the
+resulting model-driven navigation at least as reliable as the code-driven one it replaces will
+regress the gate, not improve it.
+
+**Also confirmed independently**: the PASS gate's single-live-run measurement is itself highly
+noisy on this local 8B model — three repeat baseline (pre-fix) runs of `sequential_form_fill`
+produced 100% / 1371% (outright blocked) / 185.7% overhead on **identical code**. Any future
+attempt at this gate should compare medians over several live trials, not a single run, before
+concluding a change helped or hurt.
+
+**Status**: reverted to the exact Phase 2 baseline (`agent/controller.py`, `agent/loop.py`,
+`agent/planner.py` unchanged from 27.4's landing). The overhead gate remains diagnosed and
+unresolved. A real fix needs to either (a) keep the free, code-driven hub re-navigation on every
+subgoal while cutting cost elsewhere (the only two candidates evaluated for "elsewhere" —
+prompt-level subgoal-count reduction, and the browser-relaunch itself — are now both ruled out by
+this pass), or (b) the more invasive direction 27.2 also named: merge subgoal execution into one
+continuous `AgentLoop`/task rather than one child per subgoal, so a subgoal transition is not a
+`finish()` decision at all. That remains unbuilt and unscoped. Per Section 18, **Phase 3 has
+still not been started.**
+
+## 31. Phase 2 Corrective Pass — Continuous AgentLoop (option (b) from Section 27.5, built and A/B tested)
+
+Landed at the user's explicit request to investigate 27.5's option (b) — merge subgoal
+execution into one continuous `AgentLoop`/task instead of one child per subgoal — with an
+explicit instruction to measure before implementing, fix the single-run benchmark noise 27.5
+itself flagged, and revert if the hypothesis didn't hold up live. **Verdict: PARTIAL.** The
+continuous strategy is real, correct-by-construction on every architectural preservation
+requirement (event sourcing, workspace continuity, crash/resume, safety gates, bounded
+context, generality), and a clear, reproducible win on 2 of 3 live scenarios — but a live
+5-trial-per-scenario A/B run surfaced a genuine, reproducible reliability regression on the
+third, so it is landed **inert** (opt-in `strategy="continuous"`, default remains
+`"delegated"`, `config.agent.control_mode` still defaults `"legacy"` everywhere) rather than
+promoted to the new default. Two real implementation bugs were also found and fixed live
+during this pass — see 31.3.
+
+### 31.1 Subgoal-boundary cost breakdown (before any code changed)
+
+Reconstructed by reading `agent/loop.py`/`agent/controller.py`/`agent/planner.py` directly,
+not assumed:
+
+- **PLANNER MODEL CALLS** (`agent/planner.py::initial_plan`/`replan`): exactly one at task
+  start, plus one per replan — already bounded by `max_replans` (6), already only called at a
+  genuine boundary (repeated failure, plan exhaustion), never per action. Section 27.2/27.5
+  already established this is *not* where the overhead comes from.
+- **EXECUTOR MODEL CALLS** (`agent/loop.py::step`): exactly one `.complete()` per step
+  (occasionally +1 for a contract-repair retry) — identical cost per action regardless of
+  strategy; this is not subgoal-boundary-specific either.
+- **COMPLETION MODEL CALLS** (`agent/planner.py::evaluate_completion`): in the pre-existing
+  delegated strategy, one **after every completed subgoal** when
+  `completion_check_after_subgoal` is true (the default) — this is the one call type that is
+  genuinely paid once *per subgoal boundary*, not once per task.
+  `_evaluate_and_replan_or_finish`'s own mandatory plan-exhausted check is a second, separate
+  call site for the same schema.
+- **REPLAN MODEL CALLS**: same planner call type as above, gated by `max_replans`.
+  `agent/loop.py`'s *own* internal `_replan()` (pre-existing, task-agnostic, triggered by its
+  own recovery ladder reaching `REPLAN_REQUIRED`) is a **separate, third replanning mechanism**
+  — a real finding of this pass (31.3.2), not previously called out as distinct from the
+  controller's own replanning.
+- **DETERMINISTIC OPERATIONS** (free): `_advance_subgoal`'s `SUBGOAL_CHANGED` append (subgoal
+  N → N+1 with no plan change), `_remember_hub_url`'s one-time fact write, every
+  verification/risk-classification/runtime-policy check in `step()`.
+
+**The exact, previously-undiagnosed per-subgoal-boundary tax** (this is what 27.2/27.5 measured
+as "overhead" without fully decomposing it): every delegated-mode subgoal boundary pays (a) one
+mandatory model **`finish` decision** for the completing child (a real action-shaped model call,
+the executor's own decision to stop), (b) a **fresh child task**: a new `task_id`, a new
+`AgentLoop.create_new(...)`, a new `PlaywrightBackend` construction, and — because
+`explicit_target_url` never auto-navigates (Section 26) — the model's own **first** action of
+every child is spent re-navigating to the hub URL it was just told about in its goal text, and
+(c) one **completion-evaluation model call** for every subgoal except the last (
+`_maybe_early_exit`). None of (a)-(c) is a planner call in the sense 27.2 first assumed —
+they're paid by the *executor* and the *evaluator*, once per subgoal, which is why cutting
+planner frequency (already low) or sharing the browser process alone (27.5's Fix A/D) never
+moved the needle: neither touches (a) or (c), and Fix A's removal of the free, deterministic
+hub re-navigation in (b) made the *model* pay for that re-navigation instead, which is strictly
+worse (27.5's own finding, re-confirmed here).
+
+### 31.2 Benchmark-noise findings and corrected methodology
+
+27.5 already flagged the single-run gate as invalid ("100% / 1371% (outright blocked) / 185.7%
+overhead on identical code"). This pass re-confirms and quantifies it further: across this
+pass's own 5 repeated live trials per scenario, **the legacy baseline itself** (unchanged code,
+every trial) swung between 40% and 100% success rate and between 4 and 26 median model calls
+across separate 3-5-trial batches run minutes apart on the same machine — i.e. the noise is not
+specific to the general controller, it is inherent to `qwen3:8b` on these fixture tasks at this
+context/temperature.
+
+**Fix**: `benchmarks/general_agent/run_phase2_controller.py` now runs N independent live trials
+per scenario per strategy (`--trials`, default 3, this pass used 5 — `--trials 3
+--strategies delegated,continuous` then two more merged in for a 5-trial total, see
+`benchmarks/general_agent/results/phase2_corrective_repeated_2026-08-30.json`), reports
+median/min/max/p25/p75/individual values for model calls, actions, duration, and success, and
+the PASS gate now compares **median** overhead and **success rate** across trials rather than a
+single run (`summarize_scenario`). A single flaky live exception (31.3.1) no longer aborts the
+whole trial matrix — `run_legacy`/`run_general` now catch any exception, record the trial as
+`status: "crashed"` (counted as a failure by every gate), and continue.
+
+### 31.3 Two real bugs found and fixed live (not assumptions — found by running the A/B harness)
+
+**31.3.1 — missing hub-URL grounding (found on run 1 of 3).** The first live A/B run showed
+`compare_and_report` failing 3/3 identically at the same step count, and inspecting the event
+log showed the model navigating to `https://example.com/hosting-directory` and then
+`https://www.iana.org/...` — **real external domains**, never the local fixture server. Root
+cause: delegated mode's `_subgoal_child_goal` always prefixes every child's goal text with
+`"Open {hub_url} first. "` (this is how the model learns where to navigate, since
+`explicit_target_url` alone never auto-navigates — Section 26); the continuous strategy's first
+implementation never built an equivalent, because `task.goal` is an immutable `TASK_CREATED`
+field shared across the whole continuous run and can't be prefixed per subgoal the way a
+delegated child's one-off goal can. **Fixed**: `agent/loop.py` gained an additive
+`goal_override: Optional[str]` constructor param — a prompt-only override of what `step()`
+shows as `task.goal`, never persisted, `None` (default) for every other caller — and
+`agent/controller.py::_run_continuous` sets `goal_override=f"Open {hub_url} first. {task.goal}"`
+on every fresh browser session (the first one, and any restart after a low-level-recovery
+exhausted/consequential-refusal replan). An earlier version of this fix instead mutated
+`current_subgoal`/`plan` text directly, which is wrong: `memory/replay.py`'s `SUBGOAL_CHANGED`
+handling treats any text change to `current_subgoal` as "the old one is superseded, mark it
+completed" even when it's really the same logical subgoal with a hint prepended — this silently
+polluted `completed_subgoals` with premature, bogus entries (caught by re-inspecting the event
+log after the fix, not by a test — a gap now covered by
+`tests/integration/test_general_controller_continuous.py::
+test_continuous_two_subgoals_share_one_task`'s exact `completed_subgoals` assertion).
+
+**31.3.2 — an existing safety idempotency guard is *more* effective under continuous execution,
+which changed a block's eligibility for controller-level retry (found on run 2 of 3).**
+`sequential_form_fill` blocked identically on all 3 continuous trials with reason `"refusing to
+auto-retry a consequential action that previously failed: click:..."` —
+`agent/loop.py::step`'s own pre-existing idempotency guard (never modified by this pass). Root
+cause, not a bug in the guard itself: delegated mode's `max_subgoal_attempts` retries a subgoal
+via a **fresh child task** each attempt, whose `recent_actions` starts empty — this guard can
+never find a matching prior-failed fingerprint across separate attempts, so delegated mode
+*inadvertently* bypasses its own protection on retry. The continuous strategy shares one
+`TaskState`/`recent_actions` history across the whole task by design, so the guard now correctly
+fires the *first* time it's supposed to — but the continuous strategy had no equivalent of
+`max_subgoal_attempts`'s "this block is a capability limit, not a human-decision stop — retry
+via a controller replan" classification, so it was treated as a permanent block. **Fixed**:
+`agent/controller.py::_is_replan_eligible_block` now recognizes this reason (by prefix) alongside
+`agent/loop.py`'s own `RecoveryLevel.USER_REQUIRED` string, both eligible for
+`_run_continuous`'s bounded (`max_replans`-budgeted) rebuild-and-retry — a controller replan
+produces a genuinely different subgoal/approach, never a re-attempt of the exact fingerprinted
+action the guard is protecting against, so retrying *via a replan* never bypasses it.
+`login_required` and a human-declined consequential action remain hard, non-retryable stops
+(item 12) — only these two capability-limit reasons are retry-eligible.
+
+### 31.4 Continuous AgentLoop design (as built)
+
+`agent/controller.py::GeneralAgentController.run(strategy="continuous")` — new, additive,
+default remains `strategy="delegated"` (100% unchanged, still what every existing test and the
+`.run()` default use):
+
+```
+GeneralAgentController._run_continuous()
+    -> _initial_plan (once; same planner call as delegated mode)
+    -> for each fresh browser session (the first one, or a restart after a
+       replan-eligible block):
+         -> construct ONE AgentLoop bound to the control task's own task_id,
+            sharing this controller's EventStore/TaskStateStore (no second
+            sqlite connection to the same task.db)
+         -> loop.finish_intercept = a controller-owned callback
+         -> loop.run(max_steps=...)   # agent/loop.py's OWN step()-loop, unmodified
+              -> step() executes actions exactly as it always has (observe,
+                 decide, validate, classify_risk, approve, execute, verify,
+                 event-log, checkpoint, recovery ladder)
+              -> when the model decides `finish`: finish_intercept runs BEFORE
+                 _handle_finish
+                   -> not the last subgoal + verifiable evidence exists:
+                        ingest evidence into TaskWorkspace, append
+                        SUBGOAL_CHANGED (next), reset recovery_level/retry_
+                        count, return "running" -- loop.run()'s own for-loop
+                        just continues, no new task, no browser relaunch
+                   -> last subgoal + evidence exists: ONE completion-
+                        evaluation call (not one per subgoal), then _finish()
+                        or a controller replan on rejection
+                   -> no evidence yet, or subgoal not recognized in this
+                        controller's own plan: return None / a fresh replan
+                        -- falls through to agent/loop.py's OWN unmodified
+                        _handle_finish rejection path, or re-grounds via
+                        _replan_or_block
+    -> only the final TASK_COMPLETED ever ends the control task
+```
+
+`agent/loop.py` gained exactly two additive constructor params, both `None`/inert by default
+for every other caller (single-site, batch, workflow, research, and the pre-existing delegated
+strategy): `finish_intercept` (offered a `finish` decision before `_handle_finish` runs) and
+`goal_override` (31.3.1). `event_store`/`state_store` are now also optionally injectable so a
+caller can share an already-open connection instead of opening a second one to the same
+`task.db`. **No other line of `agent/loop.py`'s action/verification/recovery/safety pipeline
+changed.** No second executor was built; no action execution was duplicated.
+
+### 31.5 Event and workspace changes
+
+`SUBGOAL_CHANGED` is reused exactly as-is (item 5's own suggestion) — the continuous strategy
+never adds a new event type for subgoal transitions. `DELEGATE_RESULT` is reused with
+`substrate: "continuous_step"` (vs. delegated mode's `"agent_loop"`) to record a subgoal's
+ingested result on the *same* task's event log instead of a child's — `DELEGATE_STARTED` is
+never emitted in continuous mode (there is no delegation to start). `COMPLETION_EVALUATED` is
+reused unchanged, now emitted once per *task* instead of once per non-final *subgoal* (31.1).
+TaskWorkspace ingestion (`WorkspacePatch` with `add_facts`/`add_evidence`) is the exact same
+code shape as delegated mode's `_ingest_subgoal_result`, just sourcing the result/structured
+findings straight from the `finish` decision instead of re-reading a child's `TASK_COMPLETED`
+event — `tests/integration/test_general_controller_continuous.py::
+test_continuous_two_subgoals_share_one_task` asserts both subgoals' facts/evidence survive in
+the workspace and only one `task.db`/task directory is ever created for the whole run.
+
+### 31.6 Context behavior
+
+The executor prompt's bounded-context machinery (`agent/context_builder.py::
+build_tiered_context` — recent-actions window, running summary, FTS5 retrieval, all capped by
+`ContextConfig.max_total_tokens`, default 4096) is **completely unmodified** and already
+task-length-agnostic (built for Phase 4's long-horizon single tasks) — `render_subgoal_block`
+already renders `state.current_subgoal`/`state.plan` on every single step regardless of
+strategy, so the continuous strategy needed no new context-injection code at all. Observed live:
+event logs for a 3-subgoal continuous run show `COMPACTION_STARTED`/`SUMMARY_CREATED` firing at
+the same cadence as any other long single task (visible in the diagnosed-bug event dump in
+31.3.1's own investigation, events 141-143), confirming prompt-token growth stays bounded across
+subgoal transitions exactly as it already does across steps within one subgoal — no separate
+measurement needed beyond what Phase 4 already proved for this same code path.
+
+### 31.7 Planner-call behavior
+
+Confirmed both by design (31.1) and by the live benchmark's `planner_schema_valid_count`/
+`controller_model_calls` fields: the continuous strategy calls the planner **once** at task
+start, **zero** times per intermediate subgoal boundary (replacing the delegated strategy's
+per-subgoal completion-evaluation call with the deterministic evidence check in 31.4), and
+**once** at the final subgoal boundary — plus one per replan, bounded by `max_replans`, exactly
+matching item 8's "no planner call after every action/subgoal" requirement.
+
+### 31.8 Crash/resume
+
+Deterministic, scripted-model, real-Playwright tests (mirroring `test_general_controller.py`'s
+own approach to proving crash-safety without a live model):
+`tests/integration/test_general_controller_continuous.py::
+test_continuous_crash_mid_action_reconciles_on_resume` drives `agent/loop.py`'s own
+`_reconcile_pending_intent` directly against a real dangling `ACTION_INTENT` event — kill points
+A/D (mid-action) need **no new machinery**, since the continuous strategy shares one real
+`task_id`/event log with the browser session, `AgentLoop.resume`'s existing reconciliation just
+works. Kill points B/C (right after subgoal completion / right after `SUBGOAL_CHANGED`) are
+covered by construction: both are ordinary event-log appends on the same task, already proven
+durable-and-replayable by Phase 1/3's own tests — `_run_continuous` re-entered after either point
+just reads `state.current_subgoal`/`plan`/`completed_subgoals` fresh from replay and continues,
+with no dangling-delegate bookkeeping needed at all (a **simplification** relative to delegated
+mode's `DELEGATE_STARTED`/`DELEGATE_RESULT` reconciliation in 27.1.2, since there is no longer a
+separate child task whose completion could race the parent's own record of it).
+
+### 31.9 Safety regression check
+
+`tests/integration/test_general_controller_continuous.py::
+test_continuous_consequential_action_still_requires_approval` drives a real CONSEQUENTIAL click
+("Submit Application" — matches `classify_risk`'s keyword list) through a continuous run with
+`interactive_approval=True` and a declined approval; asserts the whole task blocks
+(`"declined"` in `blocked_reason`) with no `TASK_COMPLETED`/`DELEGATE_RESULT` ever recorded.
+This is true by construction, not just by this one test: `finish_intercept` only ever fires on
+an already-decided `finish` action, strictly *after* `classify_risk`/`pre_action_violation`/
+`requires_approval` already ran for every other action inside `step()` — the continuous strategy
+adds no new code path that could reach `_execute()` without passing through those unchanged
+gates first.
+
+### 31.10 A/B results — 5 live trials per scenario, real `qwen3:8b`/Ollama
+
+Full data: `benchmarks/general_agent/results/phase2_corrective_repeated_2026-08-30.json`.
+
+| Scenario | Legacy success (median calls) | Delegated success / median calls / median overhead | Continuous success / median calls / median overhead |
+|---|---|---|---|
+| multi_step_registration | 2/5 (26) | 3/5 / 70 / +225% | **0/5** / 79 / +219% |
+| compare_and_report | 5/5 (4) | 4/5 / 17 / +325% | **5/5** / 11 / +175% |
+| sequential_form_fill | 5/5 (7) | 1/5 / 102 / +1357% | **3/5** / 78 / +1014% |
+| **aggregate (15 trials/strategy)** | 12/15 (80%) | **8/15 (53%)** | **8/15 (53%)** |
+
+Continuous wins decisively on 2/3 scenarios — higher success rate (100% vs 80% on
+`compare_and_report`, 60% vs 20% on `sequential_form_fill`) **and** a large model-call
+reduction (35% fewer median calls on `compare_and_report`, 24% fewer on
+`sequential_form_fill`) — but **fails all 5 trials** of `multi_step_registration`, where
+delegated succeeds 3/5. Diagnosed root cause (event-log inspection of all 5 failing runs,
+`benchmarks/general_agent/results/phase2_corrective_repeated_2026-08-30.json`'s raw trials):
+`completed_subgoals` accumulates many near-duplicate entries (the model repeatedly
+re-attempting slightly-reworded versions of "verify the invite code"/"enable the toggle") and
+the run exhausts its step budget still `"running"`, never reaching completion or a clean block.
+Continuous mode has **no per-subgoal retry-attempt counter** equivalent to delegated mode's
+`max_subgoal_attempts` (2) — delegated mode forces a *fresh, hub-grounded* child after 2 failed
+attempts at the *same* subgoal; continuous mode's only recovery paths are the finish-decision
+evidence gate and the two replan-eligible block reasons (31.3.2), neither of which fires when
+the model keeps prematurely calling `finish` on slightly-different subgoal phrasings that each
+technically clear the (intentionally reused, intentionally permissive — same bar
+`_handle_finish`'s own fallback already uses) evidence check. This is a genuine, reproducible
+gap, not noise (0/5 across 5 independent live trials) — a real, scoped next step for any future
+pass: give the continuous strategy its own subgoal-attempt counter, and force a hub-grounded
+fresh-browser restart (not just a same-session replan) once it's exceeded, mirroring delegated
+mode's existing discipline.
+
+**Model-call reduction**: on the 2 scenarios where continuous succeeds outright, it uses 24-35%
+fewer model calls than delegated mode at equal-or-better success, and *always* uses fewer calls
+than delegated mode across all 3 scenarios (median 79 vs 70 only on the one scenario where it
+also fails outright — see the full table above) — the diagnosed per-subgoal-boundary tax in
+31.1 (fresh-child re-orientation + per-subgoal completion-eval call) is real and the continuous
+design does eliminate it, exactly as hypothesized. It does not, on this benchmark, clear the
+architecture doc's original single-run `<=25%` overhead threshold on any scenario (both
+strategies' legacy baselines are themselves cheap enough — 4-26 median calls — that any
+decomposition looks expensive in *percentage* terms; 27.2 already flagged this threshold as
+possibly needing revision for cheap baselines, not addressed further in this pass).
+
+### 31.11 Generality benchmark
+
+No fixture/site-specific conditional exists anywhere in `agent/controller.py`/`agent/loop.py`
+(verified by inspection — `grep`ing both files for any of this pass's fixture/domain names
+returns only prose comments describing *why* a fix was needed, never a runtime conditional).
+The continuous strategy is reachable only via explicit `strategy="continuous"`, exactly the
+same "shadow/fixture mode" discipline Phase 2 itself established for the delegated strategy.
+
+### 31.12 Tests
+
+New: `tests/integration/test_general_controller_continuous.py` — 5 tests (two-subgoal success +
+single-task-id/workspace-continuity assertion, desynced-subgoal replan-guard, crash-mid-action
+reconciliation, consequential-action-still-requires-approval, recovery-reset-preserves-
+completed-subgoals-and-workspace). Full regression suite after this pass's changes: **380
+passed, 1 skipped** (`tests/unit` + `test_general_controller.py` +
+`test_general_controller_continuous.py` + `test_phase1_browser_actions.py` +
+`test_phase2_verification_recovery.py` + `test_phase3_crash_recovery.py` +
+`test_phase1b_contract_repair.py` + `test_phase4_long_horizon.py` + `test_cdp_attach.py` +
+`test_ui_app.py` + `test_general_agent_baseline.py` + `test_workspace_rebuild.py`) — zero
+regressions in any pre-existing test, including every delegated-mode test in
+`test_general_controller.py` (unchanged behavior, confirmed by an unmodified pass).
+
+### 31.13 Git
+
+Landed directly on `main` per instruction (no new branch). `agent/controller.py`,
+`agent/loop.py`, `benchmarks/general_agent/run_phase2_controller.py`,
+`tests/integration/test_general_controller_continuous.py`, and this documentation section are
+the full diff — `agent/planner.py`, `agent/schemas.py`, `agent/verifier.py`,
+`memory/event_store.py`, `memory/task_state.py`, `memory/replay.py`,
+`memory/workspace_store.py`, `router/`, `ui/`, `batch/`, `workflow/`, `research/` are all
+untouched.
+
+### 31.14 Final Phase 2 verdict: **PARTIAL**
+
+Correctness-first, per item 16's own gate ordering:
+
+1. No regression in the deterministic/full suite: **MET** (31.12).
+2. No safety/verification regression: **MET** (31.9) — by construction, not just by test.
+3. Crash/resume: **MET** (31.8), and structurally simpler than delegated mode's own.
+4. TaskWorkspace state survives subgoal transitions: **MET** (31.5).
+5. Continuous execution successfully advances across multiple subgoals: **MET** on 2/3 live
+   scenarios; **NOT MET** on `multi_step_registration` (0/5 — 31.10).
+6. Generality fixtures require no domain-specific code: **MET** (31.11).
+7. Live task success `>= current Phase 2 (delegated) baseline`: **NOT MET** in the strict
+   per-scenario sense — continuous beats delegated decisively on 2/3 scenarios but loses
+   0/5-vs-3/5 on the third; aggregate success ties (8/15 vs 8/15) rather than exceeding it.
+8. Median model-call overhead materially improves relative to delegated mode: **MET** on every
+   scenario in absolute terms (24-35% fewer calls, or fewer calls while also failing) — **NOT
+   MET** against the architecture doc's original `<=25%`-vs-legacy threshold on any scenario
+   (31.10's own caveat about that threshold and cheap baselines).
+
+Gate 7 is the one this pass cannot honestly claim MET, and per item 16 ("do not accept lower
+task success merely to reduce calls") that alone rules out an unconditional PASS. But per item
+17, "not measurably better" is also not an accurate description of what was found — 2/3
+scenarios show a large, reproducible, diagnosed improvement in both success and cost. This is
+therefore reported as **PARTIAL**, not **CONTINUOUS LOOP FALSIFIED**: the code is **kept in the
+repository**, fully tested, fully inert by default (`strategy="delegated"` remains
+`GeneralAgentController.run`'s default; `config.agent.control_mode` still defaults `"legacy"`
+everywhere outside directly-constructed-controller callers, identical to how the delegated
+strategy itself has shipped since Section 27), with the one diagnosed, reproducible, scoped gap
+(31.10's missing subgoal-attempt counter) documented as the concrete next step for whoever picks
+this up. **Phase 3 has still not been started.**

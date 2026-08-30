@@ -117,20 +117,29 @@ async def run_legacy(scenario: dict[str, Any], base_url: str, output_dir: Path) 
     loop.llama = counting
 
     start = time.monotonic()
-    state = await loop.run(max_steps=scenario["max_steps_legacy"])
+    try:
+        state = await loop.run(max_steps=scenario["max_steps_legacy"])
+        status, current_step = state.status, state.current_step
+    except Exception as exc:  # noqa: BLE001 - a single flaky live browser/model run must
+        # never abort the whole repeated-trial matrix (item 2's own "fix the benchmark noise"
+        # mandate) — record it as a crashed trial (counted as a failure by every gate below)
+        # instead of losing every other already-collected trial to one exception.
+        status, current_step = "crashed", loop.state_store.load(loop.task_id).current_step
+        print(f"  [legacy crashed] {scenario['name']}: {type(exc).__name__}: {exc}", file=sys.stderr)
     duration = time.monotonic() - start
     return {
-        "status": state.status, "steps": state.current_step, "model_calls": counting.calls,
+        "status": status, "steps": current_step, "model_calls": counting.calls,
         "duration_s": round(duration, 2),
     }
 
 
-async def run_general(scenario: dict[str, Any], base_url: str, output_dir: Path) -> dict[str, Any]:
+async def run_general(scenario: dict[str, Any], base_url: str, output_dir: Path,
+                       strategy: str = "delegated", trial: int = 0) -> dict[str, Any]:
     config = load_config(None)
     config.browser.headless = True
     config.browser.interactive_approval = False
     config.agent.max_steps_per_subgoal = scenario["max_steps_per_subgoal"]
-    run_dir = output_dir / scenario["name"] / "general"
+    run_dir = output_dir / scenario["name"] / f"general_{strategy}_trial{trial}"
     config.storage.runtime_dir = str(run_dir / "runtime")
     config.storage.tasks_dir = str(run_dir / "tasks")
     config.browser.user_data_dir = str(run_dir / "tasks")
@@ -152,10 +161,17 @@ async def run_general(scenario: dict[str, Any], base_url: str, output_dir: Path)
     start = time.monotonic()
     error: Optional[str] = None
     try:
-        state = await controller.run(explicit_target_url=target_url)
+        state = await controller.run(explicit_target_url=target_url, strategy=strategy)
     except PlannerOutputError as exc:
         error = f"PlannerOutputError: {exc}"
         state = controller.state_store.load(controller.control_task_id)
+    except Exception as exc:  # noqa: BLE001 - see run_legacy's identical comment: one flaky
+        # live browser/model exception must not abort the whole repeated-trial matrix.
+        error = f"{type(exc).__name__}: {exc}"
+        state = controller.state_store.load(controller.control_task_id)
+        if state.status == "running":
+            state.status = "crashed"
+        print(f"  [{strategy} crashed] {scenario['name']}: {error}", file=sys.stderr)
     duration = time.monotonic() - start
 
     total_model_calls = controller_client.calls + sum(c.calls for c in child_clients)
@@ -174,49 +190,133 @@ async def run_general(scenario: dict[str, Any], base_url: str, output_dir: Path)
     return result
 
 
-async def run_scenario(scenario: dict[str, Any], output_dir: Path) -> dict[str, Any]:
+async def run_scenario_trial(scenario: dict[str, Any], output_dir: Path, trial: int,
+                              strategies: list[str]) -> dict[str, Any]:
     server, base_url = _start_server(FIXTURES_DIR)
     try:
         legacy = await run_legacy(scenario, base_url, output_dir)
-        general = await run_general(scenario, base_url, output_dir)
+        general_by_strategy = {}
+        for strategy in strategies:
+            general_by_strategy[strategy] = await run_general(scenario, base_url, output_dir, strategy, trial)
     finally:
         server.shutdown()
         server.server_close()
 
     legacy_success = legacy["status"] == "completed"
-    general_success = general["status"] == "completed"
-    overhead_pct = None
-    if legacy["model_calls"] > 0:
-        overhead_pct = round(100.0 * (general["model_calls"] - legacy["model_calls"]) / legacy["model_calls"], 1)
+    result: dict[str, Any] = {"scenario": scenario["name"], "trial": trial,
+                               "legacy": legacy, "legacy_success": legacy_success}
+    for strategy, general in general_by_strategy.items():
+        general_success = general["status"] == "completed"
+        overhead_pct = None
+        if legacy["model_calls"] > 0:
+            overhead_pct = round(100.0 * (general["model_calls"] - legacy["model_calls"]) / legacy["model_calls"], 1)
+        result[strategy] = {
+            "general": general,
+            "general_success": general_success,
+            "meets_success_gate": general_success or not legacy_success,  # >= legacy success
+            "model_call_overhead_pct": overhead_pct,
+            "meets_overhead_gate": (overhead_pct is not None and overhead_pct <= 25.0) if legacy_success else None,
+        }
+    return result
+
+
+def _median(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    s = sorted(values)
+    n = len(s)
+    mid = n // 2
+    return s[mid] if n % 2 == 1 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _percentile(values: list[float], pct: float) -> Optional[float]:
+    if not values:
+        return None
+    s = sorted(values)
+    idx = min(len(s) - 1, max(0, round(pct / 100.0 * (len(s) - 1))))
+    return s[idx]
+
+
+def _stats(values: list[float]) -> dict[str, Any]:
     return {
-        "scenario": scenario["name"],
-        "legacy": legacy,
-        "general": general,
-        "legacy_success": legacy_success,
-        "general_success": general_success,
-        "meets_success_gate": general_success or not legacy_success,  # >= legacy success
-        "model_call_overhead_pct": overhead_pct,
-        "meets_overhead_gate": (overhead_pct is not None and overhead_pct <= 25.0) if legacy_success else None,
+        "n": len(values), "values": values,
+        "median": _median(values), "min": min(values) if values else None,
+        "max": max(values) if values else None,
+        "p25": _percentile(values, 25), "p75": _percentile(values, 75),
     }
+
+
+def summarize_scenario(scenario_name: str, trials: list[dict[str, Any]], strategies: list[str]) -> dict[str, Any]:
+    legacy_calls = [t["legacy"]["model_calls"] for t in trials]
+    legacy_actions = [t["legacy"]["steps"] for t in trials]
+    legacy_duration = [t["legacy"]["duration_s"] for t in trials]
+    legacy_success_rate = sum(1 for t in trials if t["legacy_success"]) / len(trials)
+
+    summary: dict[str, Any] = {
+        "scenario": scenario_name,
+        "trial_count": len(trials),
+        "legacy": {
+            "success_rate": legacy_success_rate,
+            "model_calls": _stats(legacy_calls),
+            "actions": _stats(legacy_actions),
+            "duration_s": _stats(legacy_duration),
+        },
+    }
+    for strategy in strategies:
+        calls = [t[strategy]["general"]["model_calls"] for t in trials]
+        actions = [t[strategy]["general"]["subgoal_children"] for t in trials]
+        duration = [t[strategy]["general"]["duration_s"] for t in trials]
+        overheads = [t[strategy]["model_call_overhead_pct"] for t in trials if t[strategy]["model_call_overhead_pct"] is not None]
+        success_rate = sum(1 for t in trials if t[strategy]["general_success"]) / len(trials)
+        median_overhead = _median(overheads)
+        summary[strategy] = {
+            "success_rate": success_rate,
+            "model_calls": _stats(calls),
+            "subgoal_children_or_steps": _stats(actions),
+            "duration_s": _stats(duration),
+            "model_call_overhead_pct": _stats(overheads),
+            # Correctness-first robust gate: success must be >= legacy's median-run success,
+            # and the *median* overhead (not any single run) must clear the budget — a single
+            # favorable/unfavorable run on this local 8B model is not trustworthy on its own
+            # (docs/BROWSERAGENT_MASTER_STATUS.md's Phase 2 corrective-pass section).
+            "meets_success_gate": success_rate >= legacy_success_rate,
+            "meets_overhead_gate": (median_overhead is not None and median_overhead <= 25.0) if legacy_success_rate > 0 else None,
+        }
+    return summary
 
 
 async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--trials", type=int, default=3, help="independent live trials per scenario (min 3, prefer 5)")
+    parser.add_argument("--strategies", default="delegated,continuous",
+                         help="comma-separated GeneralAgentController.run(strategy=...) values to benchmark")
+    parser.add_argument("--scenarios", default=None, help="comma-separated scenario names (default: all)")
     args = parser.parse_args()
     output_dir = Path(args.output_dir) if args.output_dir else ROOT / "runtime" / "benchmark_runs" / "phase2_controller"
     output_dir.mkdir(parents=True, exist_ok=True)
+    strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    scenario_names = {s.strip() for s in args.scenarios.split(",")} if args.scenarios else None
+    scenarios = [s for s in SCENARIOS if scenario_names is None or s["name"] in scenario_names]
 
-    results = []
-    for scenario in SCENARIOS:
-        print(f"--- running {scenario['name']} ---", file=sys.stderr)
-        result = await run_scenario(scenario, output_dir)
-        print(json.dumps(result, indent=2), file=sys.stderr)
-        results.append(result)
+    all_trials: list[dict[str, Any]] = []
+    summaries = []
+    for scenario in scenarios:
+        trials = []
+        for trial in range(args.trials):
+            print(f"--- {scenario['name']} trial {trial + 1}/{args.trials} ---", file=sys.stderr)
+            result = await run_scenario_trial(scenario, output_dir, trial, strategies)
+            print(json.dumps(result, indent=2), file=sys.stderr)
+            trials.append(result)
+            all_trials.append(result)
+        summary = summarize_scenario(scenario["name"], trials, strategies)
+        print(json.dumps(summary, indent=2), file=sys.stderr)
+        summaries.append(summary)
 
-    summary = {"scenario_count": len(results), "results": results}
-    (output_dir / "phase2_results.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(json.dumps(summary, indent=2))
+    output = {"trials_per_scenario": args.trials, "strategies": strategies,
+              "scenario_summaries": summaries, "raw_trials": all_trials}
+    (output_dir / "phase2_repeated_results.json").write_text(json.dumps(output, indent=2), encoding="utf-8")
+    print(json.dumps({"scenario_summaries": summaries}, indent=2))
 
 
 if __name__ == "__main__":

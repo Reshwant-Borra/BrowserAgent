@@ -68,6 +68,12 @@ class AgentLoop:
         runtime_policy: BatchRuntimePolicy | None = None,
         explicit_target_url: Optional[str] = None,
         approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
+        event_store: Optional[EventStore] = None,
+        state_store: Optional[TaskStateStore] = None,
+        finish_intercept: Optional[
+            Callable[[ModelDecision, TaskState, PageObservation], Awaitable[Optional[TaskState]]]
+        ] = None,
+        goal_override: Optional[str] = None,
     ):
         self.config = config
         self.task_id = task_id
@@ -80,9 +86,36 @@ class AgentLoop:
         # pause/resume the loop from an HTTP request instead of a terminal prompt. CLI usage
         # (cli/main.py) never sets this, so `input()` remains the default (Section 20/21).
         self.approval_callback = approval_callback
+        # When set (agent/controller.py's continuous-execution strategy — see docs/
+        # BROWSERAGENT_MASTER_STATUS.md's Phase 2 corrective-pass section), a `finish` decision
+        # is offered to this callback *before* agent/loop.py's own terminal `_handle_finish`
+        # runs. Returning a TaskState short-circuits step() with that state (e.g. "advance to
+        # the next subgoal, task still running"); returning None falls through to the normal,
+        # completely unmodified `_handle_finish` path. None (the default) makes this fully
+        # inert for every other caller — single-site, batch, workflow, research, and the
+        # existing delegated-mode GeneralAgentController never set it.
+        self.finish_intercept = finish_intercept
+        # Same continuous-strategy use case as finish_intercept above: `task.goal` is an
+        # immutable TASK_CREATED field (by event-sourcing design — see memory/task_state.py's
+        # own docstring), but a fresh browser session restarting mid-task (the first one, or
+        # any restart after a low-level recovery/replan) still needs the same "Open {url}
+        # first." grounding a delegated-mode child gets baked into its own one-off task.goal
+        # (agent/controller.py's `_subgoal_child_goal`). This overrides only what the prompt
+        # *shows* as the goal for this AgentLoop instance — never persisted, never affects
+        # task.goal read anywhere else (batch/workflow/research success-criteria matching,
+        # trace rendering, etc. all still read the real stored goal). None (default) leaves
+        # every other caller completely unaffected.
+        self.goal_override = goal_override
 
-        self.event_store = EventStore(self.db_path)
-        self.state_store = TaskStateStore(self.event_store)
+        # Sharing an already-open EventStore/TaskStateStore (rather than opening a second
+        # sqlite connection to the same task.db) is what lets a caller drive this loop's
+        # `step()` directly across multiple subgoals as one continuous task/event-log instead
+        # of spawning a fresh child task per subgoal — see GeneralAgentController's continuous
+        # strategy. Every other caller passes neither and gets today's own private connection,
+        # unchanged.
+        self._owns_event_store = event_store is None
+        self.event_store = event_store or EventStore(self.db_path)
+        self.state_store = state_store or TaskStateStore(self.event_store)
         self.llama = create_inference_client(config)
         preferred_tab_url = (
             runtime_policy.target_url
@@ -164,7 +197,8 @@ class AgentLoop:
 
     async def aclose(self) -> None:
         await self.browser.close()
-        self.event_store.close()
+        if self._owns_event_store:
+            self.event_store.close()
 
     # ---- run loop ------------------------------------------------------------
 
@@ -252,6 +286,8 @@ class AgentLoop:
 
     async def step(self, state: TaskState) -> TaskState:
         task = self.state_store.get_task_record(self.task_id)
+        if self.goal_override is not None and task is not None:
+            task = task.model_copy(update={"goal": self.goal_override})
         step_no = state.current_step + 1
 
         max_chars = self.config.context.max_page_chars
@@ -431,6 +467,10 @@ class AgentLoop:
                               constraint_guard_corrected=True)
 
         if decision.action == ActionType.FINISH:
+            if self.finish_intercept is not None:
+                intercepted = await self.finish_intercept(decision, state, observation)
+                if intercepted is not None:
+                    return intercepted
             return await self._handle_finish(task, state, step_no, decision, observation)
 
         violation = pre_action_violation(self.runtime_policy, decision, element)
