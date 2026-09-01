@@ -83,7 +83,26 @@ def render_task_block(goal: str, success_criteria: list[str]) -> str:
 def render_subgoal_block(current_subgoal: Optional[str], plan: list[str]) -> str:
     plan_str = "\n".join(f"{i+1}. {step}" for i, step in enumerate(plan)) if plan else "(no plan yet)"
     subgoal_str = current_subgoal or "(not yet set)"
-    return f"CURRENT SUBGOAL\n{subgoal_str}\n\nPLAN\n{plan_str}"
+    block = f"CURRENT SUBGOAL\n{subgoal_str}\n\nPLAN\n{plan_str}"
+    if current_subgoal:
+        # Phase 3 (BrowserAgent_General_Autonomous_Agent_Architecture_REVISED.pdf, section 9:
+        # generic entity collection) needs this subgoal's concrete extracted data as real typed
+        # fields, not just prose, to build a comparable workspace entity — applies whenever a
+        # subgoal is active, regardless of which strategy (delegated child goal text already
+        # says this too; continuous mode has no separate per-subgoal goal text to say it in).
+        block += (
+            "\n\nThe browser may still be showing the page from a PREVIOUS subgoal. If the "
+            "current page does not already contain what THIS subgoal asks for, navigate there "
+            "first (e.g. follow a link back to a directory/listing page, then into the specific "
+            "item) before finishing — do not call finish just because some page is open.\n\n"
+            "When you finish this subgoal, if you extracted concrete data (a name, price, "
+            "rating, date, or similar attribute) fill in the real typed `structured_result` "
+            "field directly — one `findings` entry per attribute, each with its own `field`, "
+            "`value`, and `evidence` (the exact page text you read it from). Never write JSON "
+            "text inside the plain `result` field — `structured_result` is a separate real "
+            "field, not something to serialize as a string."
+        )
+    return block
 
 
 def render_recent_actions_block(recent: list[dict]) -> str:

@@ -81,6 +81,28 @@ def replay_task(task_id: str, events: list[Event]) -> TaskState:
             state.current_subgoal = new_subgoal
             state.plan = ev.payload.get("plan", state.plan)
             state.retry_count = 0
+            # A SUBGOAL_CHANGED event can only ever be appended while something is actively
+            # (re)driving this task toward a subgoal — every call site (agent/loop.py's own
+            # _advance_subgoal/_replan, and every agent/controller.py path that reaches
+            # _apply_controller_decision) only fires this after deciding the task should keep
+            # running. Before this fix, a *manual* state.status="running" mutation (e.g.
+            # agent/controller.py::_reset_recovery_for_new_subgoal, called right after a
+            # controller-level replan resumes a blocked continuous-strategy task) only survived
+            # until the next event was appended: TaskStateStore.load()'s staleness check then
+            # forced a fresh replay_task() call over the *entire* history, which — with no code
+            # here to ever clear a status TASK_BLOCKED had set earlier — silently reverted status
+            # back to "blocked" using the *original* blocked_reason, discarding the reset. Live
+            # evidence (docs/BROWSERAGENT_MASTER_STATUS.md's Phase 3 corrective pass): once a
+            # continuous-strategy task's own bounded, expected "subgoal local attempts exhausted"
+            # safety valve fired even once, every later real replan was immediately re-detected
+            # as still "blocked" on the very next event (an OBSERVATION, an ACTION_INTENT — any of
+            # them), instantly re-triggering another replan call before the model could ever take
+            # a second action, burning the *entire* replan budget in seconds regardless of how
+            # well-grounded the browser session actually was. Resetting status here — during
+            # *replay itself*, not a side-channel mutation — makes "replanned, now running again"
+            # durable the same way every other TaskState field already is.
+            state.status = "running"
+            state.blocked_reason = None
 
         elif ev.type == EventType.TASK_COMPLETED:
             state.status = "completed"

@@ -33,6 +33,15 @@ def _normalize_url_for_match(url: str) -> str:
     return f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}?{parts.query}"
 
 
+def urls_match(a: str, b: str) -> bool:
+    """Public identity comparison for two page URLs, same normalization this module already
+    uses internally for tab reuse (_select_page_by_url) — exposed so a caller that needs to
+    decide "is the browser already on the resource it needs" (agent/controller.py's
+    deterministic subgoal reorientation) can reuse the exact same rule instead of a second,
+    possibly-inconsistent one."""
+    return _normalize_url_for_match(a) == _normalize_url_for_match(b)
+
+
 class ElementNotFoundError(Exception):
     pass
 

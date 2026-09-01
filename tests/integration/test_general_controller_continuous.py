@@ -17,8 +17,10 @@ import re
 import pytest
 
 from agent.config import AppConfig
-from agent.controller import GeneralAgentController
+from agent.controller import GeneralAgentController, _HUB_URL_FACT_KEY
 from agent.loop import AgentLoop
+from agent.schemas import ActionType, ModelDecision
+from agent.workspace_models import EvidenceRef, WorkspaceEntity, WorkspaceFact, WorkspacePatch
 from inference.llama_client import CompletionResult
 from memory.event_store import EventStore, EventType
 from tests.integration.fake_llama import ScriptedLlamaClient, decision
@@ -179,6 +181,186 @@ async def test_continuous_desynced_subgoal_triggers_controller_replan(tmp_config
         assert subgoal_changes[-1].payload["subgoal"] == "visit the index page"
         # Never blindly ended the task on the ambiguous finish.
         assert not [e for e in events if e.type == EventType.TASK_COMPLETED]
+    finally:
+        controller.close()
+
+
+# ---- Phase 3 corrective pass: candidate-acquisition reliability fixes ----------------------
+#
+# Live forensic evidence (docs/BROWSERAGENT_MASTER_STATUS.md's Phase 3 corrective pass, 10
+# real Qwen3-8B trials across 5 holdout domains) diagnosed the generality-gate failure to three
+# deterministic, entity-generic gaps rather than a model-capacity limit: (1) a fresh continuous
+# session left the model to discover about:blank on its own instead of already being grounded
+# on a known destination, (2) a desynced-subgoal finish paid for a real replanner call that
+# cannot see what was just accomplished and, live, just re-proposed the same unrecognized text
+# every time, and (3) a subgoal's own plausible-looking structured findings were never checked
+# against *which page* they actually came from, letting one candidate's stale page data get
+# silently recorded as a different candidate's evidence. These tests reproduce each gap
+# directly against the fixed methods, mirroring this file's own existing style of driving the
+# intercept/session methods without needing to coax a live model into the exact failure shape.
+
+async def test_continuous_session_start_deterministically_navigates_to_explicit_target(tmp_config, fixture_site_url):
+    """A fresh continuous session (the first one, or any controller-level-replan restart) must
+    already be grounded on its known destination before the model's first decision — not left
+    on about:blank hoping the model's own `open_url` catches it. A finish with no evidence at
+    all is still correctly rejected (nothing was actually extracted here), but the resulting
+    TaskState's `current_url` proves the browser was navigated before that decision was ever
+    requested."""
+    config = _config(tmp_config, max_steps_per_subgoal=5)
+    url = f"{fixture_site_url}/index.html"
+    controller = GeneralAgentController.create_new(config, "goal", [])
+    try:
+        cid = controller.control_task_id
+        task = controller.state_store.get_task_record(cid)
+        controller.event_store.append(cid, 1, EventType.SUBGOAL_CHANGED, {
+            "subgoal": "goal", "plan": ["goal"], "source": "controller",
+        })
+        loop = AgentLoop(
+            config, cid, explicit_target_url=url,
+            event_store=controller.event_store, state_store=controller.state_store,
+        )
+        loop.llama = ScriptedLlamaClient([decision("finish", params={"result": "nothing found yet"})])
+        loop.finish_intercept = controller._make_continuous_finish_intercept(task)
+
+        result = await controller._drive_continuous_session(loop, step_budget=1)
+
+        assert result.current_url == url
+        events = controller.event_store.all_events(cid)
+        assert any(e.type == EventType.RECOVERY_TRANSITION and e.payload.get("reason") == "premature_finish_rejected"
+                   for e in events)
+    finally:
+        controller.close()
+
+
+async def test_continuous_desynced_subgoal_recovers_via_name_match_without_replanning(tmp_config, fixture_site_url):
+    """The dominant live failure mode for 2 of 5 holdout domains: agent/loop.py's own internal
+    replan renames current_subgoal to fresh free text outside the controller's plan. When the
+    finish that triggers this still carries real, evidence-backed findings identifying one of
+    the controller's own still-pending plan items by name, that item must be credited directly
+    — no real (budget-consuming) replanner call, and the evidence must not be discarded."""
+    config = _config(tmp_config, max_steps_per_subgoal=10, max_replans=2)
+    plan = [
+        "visit the directory",
+        "visit the Widget A detail page and record its price",
+        "visit the Widget B detail page and record its price",
+    ]
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "start_subgoal", "reason_code": "initial_plan",
+             "active_subgoal": plan[0], "plan": plan,
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+        ],
+    })
+    controller = GeneralAgentController.create_new(
+        config, "visit each widget and record its price", [], llama_client=planner_client,
+        child_llama_client_factory=lambda: ScriptedLlamaClient([]),
+    )
+    try:
+        from memory.models import TaskState
+        from browser.page_model import PageObservation
+
+        cid = controller.control_task_id
+        task = controller.state_store.get_task_record(cid)
+        state = await controller._initial_plan(task)
+        assert state.current_subgoal == plan[0]
+        # Advance past the directory subgoal exactly like a normal continuous finish would,
+        # then simulate agent/loop.py's own internal replan renaming current_subgoal.
+        controller.event_store.append(cid, 2, EventType.SUBGOAL_CHANGED, {
+            "subgoal": plan[1], "plan": plan, "source": "controller",
+        })
+        desynced_state = TaskState(
+            task_id=cid, status="running",
+            current_subgoal="go find widget A's page and get its price somehow",
+            plan=plan, completed_subgoals=[plan[0]],
+        )
+        intercept = controller._make_continuous_finish_intercept(task)
+        finish_decision = ModelDecision(action=ActionType.FINISH, params={
+            "result": "Widget A price recorded",
+            "structured_result": {"findings": [
+                {"field": "price", "value": "$10.00", "evidence": "Price: $10.00"},
+            ]},
+        })
+        observation = PageObservation(url=f"{fixture_site_url}/alpha_detail.html", title="t", elements=[],
+                                       visible_text=[], state_hash="h", element_count=0, char_count=0,
+                                       truncated=False)
+
+        result_state = await intercept(finish_decision, desynced_state, observation)
+
+        assert result_state is not None
+        assert result_state.current_subgoal == plan[2]  # advanced past the recovered item
+        assert planner_client.calls.count("ControllerDecision") == 1  # no replan call spent
+
+        workspace = controller.workspace_store.load(cid)
+        names = {e.name for e in workspace.entities}
+        assert any("Widget A" in (n or "") for n in names)
+    finally:
+        controller.close()
+
+
+async def test_stale_evidence_from_hub_page_is_rejected(tmp_config):
+    """The directory/listing (hub) page never carries any one candidate's own attributes in
+    this architecture's hub-and-branch shape — a finish whose evidence claims to be sourced
+    from the hub itself must never count as valid completion evidence for a per-candidate
+    subgoal, regardless of how well-formed the structured_result looks."""
+    config = _config(tmp_config)
+    controller = GeneralAgentController.create_new(config, "goal", [])
+    try:
+        cid = controller.control_task_id
+        hub_url = "http://127.0.0.1:1/widgets/index.html"
+        controller.workspace_store.apply_patch(cid, WorkspacePatch(
+            add_facts=[WorkspaceFact(key=_HUB_URL_FACT_KEY, value=hub_url)],
+        ))
+        finish_decision = ModelDecision(action=ActionType.FINISH, params={
+            "result": "Widget A recorded",
+            "structured_result": {"findings": [
+                {"field": "price", "value": "$10.00", "evidence": "Price: $10.00"},
+            ]},
+        })
+        assert controller._continuous_subgoal_has_evidence(
+            "visit the Widget A detail page and record its price", finish_decision, hub_url,
+        ) is False
+    finally:
+        controller.close()
+
+
+async def test_stale_evidence_from_sibling_page_is_rejected_but_same_candidate_reuse_allowed(tmp_config):
+    """Live-reproduced silent-corruption bug (a *passing* trial still copied one candidate's
+    exact attributes onto a different candidate's entity because the model finished without
+    navigating away): a finish claiming a *different*-named candidate's evidence from a page
+    already recorded as some other entity's own source must be rejected, while a legitimate
+    re-confirmation of the SAME candidate from its own already-used page must still be
+    accepted."""
+    config = _config(tmp_config)
+    controller = GeneralAgentController.create_new(config, "goal", [])
+    try:
+        cid = controller.control_task_id
+        detail_url = "http://127.0.0.1:1/widgets/widget_a.html"
+        controller.workspace_store.apply_patch(cid, WorkspacePatch(
+            add_entities=[WorkspaceEntity(id="ent_a", entity_type="candidate", name="Widget A",
+                                           attributes={"price": "$10.00"})],
+            add_evidence=[EvidenceRef(entity_id="ent_a", field_key="price", source_event_id=1,
+                                       source_url=detail_url, excerpt="Price: $10.00")],
+        ))
+
+        conflicting = ModelDecision(action=ActionType.FINISH, params={
+            "result": "Widget B recorded",
+            "structured_result": {"findings": [
+                {"field": "price", "value": "$10.00", "evidence": "Price: $10.00"},
+            ]},
+        })
+        assert controller._continuous_subgoal_has_evidence(
+            "visit the Widget B detail page and record its price", conflicting, detail_url,
+        ) is False
+
+        reconfirm = ModelDecision(action=ActionType.FINISH, params={
+            "result": "Widget A recorded again",
+            "structured_result": {"findings": [
+                {"field": "price", "value": "$10.00", "evidence": "Price: $10.00"},
+            ]},
+        })
+        assert controller._continuous_subgoal_has_evidence(
+            "visit the Widget A detail page and record its price", reconfirm, detail_url,
+        ) is True
     finally:
         controller.close()
 

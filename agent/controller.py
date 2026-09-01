@@ -30,15 +30,25 @@ import uuid
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
+from agent import ranking
+from agent import workspace_ops
 from agent.config import AppConfig
 from agent.context_builder import build_workspace_summary
 from agent.controller_models import CompletionEvaluation, ControllerDecision
 from agent.loop import AgentLoop
 from agent.planner import PlannerOutputError
 from agent import planner as planner_mod
-from agent.schemas import ModelDecision, RecoveryLevel
-from agent.workspace_models import EvidenceRef, WorkspaceFact, WorkspacePatch, WorkspaceView
+from agent.schemas import ActionType, ModelDecision, RecoveryLevel, ValidationErrorKind
+from agent.workspace_models import (
+    EvidenceRef,
+    WorkspaceEntity,
+    WorkspaceEntityPatch,
+    WorkspaceFact,
+    WorkspacePatch,
+    WorkspaceView,
+)
 from browser.page_model import PageObservation
+from browser.playwright_backend import urls_match
 from inference.llama_client import InferenceClient, create_inference_client
 from memory.event_store import EventStore, EventType
 from memory.models import TaskRecord, TaskState
@@ -212,7 +222,7 @@ class GeneralAgentController:
             )
         except PlannerOutputError as exc:
             return self._block(f"initial planning failed schema validation: {exc}")
-        return self._apply_controller_decision(decision)
+        return await self._apply_controller_decision(decision)
 
     async def _replan_or_block(self, task: TaskRecord, reason_hint: str) -> TaskState:
         cfg = self.config.agent
@@ -231,18 +241,35 @@ class GeneralAgentController:
         except PlannerOutputError as exc:
             return self._block(f"replan failed schema validation: {exc}")
         self._replans_used += 1
-        return self._apply_controller_decision(decision)
+        return await self._apply_controller_decision(decision)
 
-    def _apply_controller_decision(self, decision: ControllerDecision) -> TaskState:
+    async def _apply_controller_decision(self, decision: ControllerDecision) -> TaskState:
         if decision.decision in ("start_subgoal", "revise_plan"):
             plan = decision.plan or ([decision.active_subgoal] if decision.active_subgoal else [])
             active = decision.active_subgoal or (plan[0] if plan else None)
             if not plan or active is None:
                 return self._block("planner returned an empty plan with nothing to do")
+            if active not in plan:
+                # Deterministic self-heal, not a planner-prompt fix (live forensic finding,
+                # Phase 3 continued-validation pass): Qwen3-8B's replan call can return an
+                # active_subgoal that its own plan list omits (observed live: a replan kept
+                # revising `plan`'s earlier collection steps while `active_subgoal` still named
+                # the final "find the N cheapest..." synthesis step, which the returned plan no
+                # longer contained at all). Persisting that mismatch as-is permanently desyncs
+                # _make_continuous_finish_intercept's `subgoal not in plan` check the next time
+                # the model (correctly) finishes for `active`'s own exact text — with no pending
+                # plan item left to recover onto, every subsequent replan just reproduces the same
+                # unrecognized subgoal, burning the entire replan budget (live evidence: two
+                # `desynced_subgoal` trials, both traced to exactly this invariant violation, never
+                # to the model actually finishing for a genuinely different/stale subgoal).
+                # Appending is always safe: `active` is what the planner itself just chose to work
+                # on, so it belongs in the plan by definition regardless of what else the planner
+                # forgot to carry forward.
+                plan = plan + [active]
             self._append(EventType.SUBGOAL_CHANGED, {"subgoal": active, "plan": plan, "source": "controller"})
             return self._reset_recovery_for_new_subgoal()
         if decision.decision == "finish":
-            return self._finish(CompletionEvaluation(
+            return await self._finish(CompletionEvaluation(
                 satisfied=True, next_recommendation="finish",
             ), completion_claim=decision.completion_claim)
         if decision.decision == "ask_user":
@@ -277,7 +304,7 @@ class GeneralAgentController:
             return self._block(f"completion evaluation failed schema validation: {exc}")
         self._append(EventType.COMPLETION_EVALUATED, evaluation.model_dump())
         if evaluation.satisfied:
-            return self._finish(evaluation)
+            return await self._finish(evaluation)
         if evaluation.next_recommendation == "ask_user":
             return self._block("; ".join(evaluation.missing_requirements) or "clarification needed")
         return self.state_store.load(self.control_task_id)
@@ -293,7 +320,7 @@ class GeneralAgentController:
             return self._block(f"completion evaluation failed schema validation: {exc}")
         self._append(EventType.COMPLETION_EVALUATED, evaluation.model_dump())
         if evaluation.satisfied:
-            return self._finish(evaluation)
+            return await self._finish(evaluation)
         if evaluation.next_recommendation == "ask_user":
             return self._block("; ".join(evaluation.missing_requirements) or "clarification needed")
         reason = "completion_rejection: " + ("; ".join(evaluation.missing_requirements) or "plan exhausted without satisfying the goal")
@@ -367,17 +394,158 @@ class GeneralAgentController:
         })
 
         if child_state.status == "completed" and (result_text or structured_result):
-            excerpt = result_text or json.dumps(structured_result)[:500]
-            patch = WorkspacePatch(
-                add_facts=[WorkspaceFact(key=f"subgoal_result::{subgoal}", value=result_text)],
-                add_evidence=[EvidenceRef(
-                    fact_key=f"subgoal_result::{subgoal}",
-                    source_event_id=result_event_id,
-                    source_url=child_state.current_url,
-                    excerpt=excerpt,
-                )],
+            patch = self._build_result_patch(
+                subgoal, result_text, structured_result, result_event_id, child_state.current_url,
             )
             self.workspace_store.apply_patch(self.control_task_id, patch)
+
+    def _build_result_patch(
+        self, subgoal: str, result_text: str, structured_result: Optional[dict],
+        result_event_id: int, source_url: Optional[str], preceding_subgoal: Optional[str] = None,
+    ) -> WorkspacePatch:
+        """Shared by both the delegated and continuous ingest paths (Phase 3: generic entity
+        collection, section 9). Always keeps the pre-existing plain-text subgoal_result fact
+        (unchanged from Phase 2); additionally, when `structured_result` carries at least one
+        valued finding, also materializes one generic WorkspaceEntity with per-attribute
+        evidence via agent/workspace_ops.py::entity_patch_from_findings — the "workspace
+        entities plus deterministic query/computation primitives" fix for the Amazon-class
+        multi-candidate gap, never a domain-specific ranker class. Skips entity materialization
+        when the *subgoal's own text* already names a top-k pattern (agent/workspace_ops.py::
+        parse_requested_top_k, content-based rather than plan-position-based so it works
+        regardless of whether the planner made "report the top-k" its own subgoal or folded it
+        into the last collection subgoal): a subgoal that is itself asking to identify/report
+        already-collected candidates is synthesizing, not describing a new one — without this
+        guard its own finish could add a spurious extra "entity" for the report itself. The
+        plain-text fact is still recorded either way."""
+        add_facts: list[WorkspaceFact] = []
+        add_evidence: list[EvidenceRef] = []
+        add_entities = []
+        if result_text or structured_result:
+            add_facts.append(WorkspaceFact(key=f"subgoal_result::{subgoal}", value=result_text))
+            excerpt = result_text or json.dumps(structured_result)[:500]
+            add_evidence.append(EvidenceRef(
+                fact_key=f"subgoal_result::{subgoal}",
+                source_event_id=result_event_id,
+                source_url=source_url,
+                excerpt=excerpt,
+            ))
+        ingest_entity = workspace_ops.parse_requested_top_k(subgoal) is None
+        entity_patch = workspace_ops.entity_patch_from_findings(
+            workspace_ops.coerce_structured_result(structured_result, result_text),
+            entity_id=f"ent_{uuid.uuid4().hex[:10]}",
+            subgoal=subgoal,
+            source_event_id=result_event_id,
+            source_url=source_url,
+            preceding_subgoal=preceding_subgoal,
+        ) if ingest_entity else None
+        update_entities: list[WorkspaceEntityPatch] = []
+        if entity_patch is not None:
+            new_entity = entity_patch.add_entities[0]
+            # A controller-level replan can re-run an already-completed candidate subgoal
+            # (the planner isn't always perfectly informed by the workspace summary about what
+            # it already collected) — merge into the existing entity by name instead of
+            # creating a second one for the same real-world candidate. Falls back to matching by
+            # source URL when naming alone can't tell: a live planner sometimes atomizes one
+            # candidate into several nameless subgoals ("Extract price_usd from the page"), whose
+            # own text never names the candidate at all — but if some *other* entity already has
+            # evidence from this exact page, that is by far the strongest signal this finding
+            # belongs to it too, not a new candidate. Scoped to `preceding_subgoal is not None`
+            # (the continuous strategy's own signal, never set by the delegated strategy's call
+            # site) — delegated-mode child tasks are independent AgentLoop runs that can
+            # legitimately share a URL across genuinely different candidates in some test/degenerate
+            # setups, where this heuristic would wrongly merge unrelated entities.
+            existing = self._find_active_entity_by_name(new_entity.name) or (
+                self._find_active_entity_by_source_url(source_url)
+                if source_url and preceding_subgoal is not None else None
+            )
+            if existing is not None:
+                update_entities = [WorkspaceEntityPatch(
+                    id=existing.id, attributes={**existing.attributes, **new_entity.attributes},
+                )]
+                add_evidence = add_evidence + [
+                    ev.model_copy(update={"entity_id": existing.id}) for ev in entity_patch.add_evidence
+                ]
+            else:
+                add_entities = entity_patch.add_entities
+                add_evidence = add_evidence + entity_patch.add_evidence
+        return WorkspacePatch(
+            add_facts=add_facts, add_evidence=add_evidence,
+            add_entities=add_entities, update_entities=update_entities,
+        )
+
+    def _find_active_entity_by_name(self, name: Optional[str]) -> Optional[WorkspaceEntity]:
+        if not name:
+            return None
+        norm = name.strip().lower()
+        workspace = self.workspace_store.load(self.control_task_id)
+        for e in workspace.entities:
+            if e.status == "active" and (e.name or "").strip().lower() == norm:
+                return e
+        # Fallback: fuzzy (substring, case-insensitive) match — a controller-level replan can
+        # re-run an already-completed candidate subgoal under a slightly different finish-text
+        # label (e.g. a subgoal that overshoots into recording data names the resulting entity
+        # "SwiftBook Air details" while its own dedicated later subgoal names it "SwiftBook
+        # Air" — same real-world candidate, imprecise label, not two candidates). Same
+        # imprecise-label reasoning as workspace_ops.names_plausibly_match uses elsewhere; only
+        # applied when nothing matched exactly above, and only ever merges into an existing
+        # entity, never creates a false one.
+        for e in workspace.entities:
+            if e.status == "active" and workspace_ops.names_plausibly_match(e.name, name):
+                return e
+        return None
+
+    def _find_active_entity_by_source_url(self, source_url: Optional[str]) -> Optional[WorkspaceEntity]:
+        """Naming-independent dedupe fallback for `_build_result_patch`: an existing active
+        entity that already has evidence sourced from this exact URL is almost certainly the
+        same real-world candidate, regardless of what either subgoal's own text says — the
+        strongest available signal when a nameless follow-up subgoal's own name-inference has
+        nothing to go on. Deliberately only consulted as a fallback (after name matching), and
+        only reachable once agent/loop.py's own `_evidence_source_is_stale`-guarded finish has
+        already passed — so a genuinely different candidate's page was never accepted as
+        evidence here in the first place."""
+        if not source_url:
+            return None
+        workspace = self.workspace_store.load(self.control_task_id)
+        active_by_id = {e.id: e for e in workspace.entities if e.status == "active"}
+        for ev in workspace.evidence:
+            if ev.source_url == source_url and ev.entity_id in active_by_id:
+                return active_by_id[ev.entity_id]
+        return None
+
+    async def _maybe_select_top_k_entities(self, task: TaskRecord) -> Optional[str]:
+        """Deterministic top-k completion path (architecture doc sections 9/13: "exactly the
+        requested top-k... no unsupported final entity"). Only engages when the goal text
+        itself names a top-k pattern (agent/workspace_ops.py::parse_requested_top_k — a
+        generic phrase detector, never a domain keyword) AND the workspace already holds at
+        least k comparable ("active", not yet selected/rejected) entities; otherwise returns
+        None and _finish falls back to its prior plain completion_claim text, unchanged from
+        Phase 2 — this never blocks or forces a replan itself, since a still-incomplete
+        candidate set should already be caught by the completion evaluator's own "not
+        satisfied, continue/replan" recommendation before _finish is ever reached."""
+        k = workspace_ops.parse_requested_top_k(task.goal)
+        if k is None:
+            return None
+        workspace = self.workspace_store.load(self.control_task_id)
+        candidates = [e for e in workspace.entities if e.status == "active"]
+        if len(candidates) < k:
+            return None
+        request = ranking.RankRequest(entity_ids=[e.id for e in candidates], objective=task.goal, k=k)
+        try:
+            result = await ranking.rank_candidates(self.llama, request, candidates)
+        except ranking.RankingOutputError:
+            return None
+        if len(result.ranked_entity_ids) < k:
+            return None
+        selected_ids = result.ranked_entity_ids[:k]
+        by_id = {e.id: e for e in candidates}
+        self.workspace_store.apply_patch(self.control_task_id, WorkspacePatch(
+            update_entities=(
+                [WorkspaceEntityPatch(id=eid, status="selected") for eid in selected_ids]
+                + [WorkspaceEntityPatch(id=e.id, status="rejected") for e in candidates if e.id not in selected_ids]
+            ),
+        ))
+        selected_entities = sorted((by_id[eid] for eid in selected_ids), key=lambda e: selected_ids.index(e.id))
+        return workspace_ops.render_entities_report(selected_entities, result.rationale_by_entity)
 
     def _advance_subgoal(self) -> TaskState:
         state = self.state_store.load(self.control_task_id)
@@ -466,11 +634,34 @@ class GeneralAgentController:
         the browser exactly once, same as one `loop.run()` call would."""
         cfg = self.config.agent
         await loop.start_browser()
+        # Every fresh browser session here (the first one, and any restart after a
+        # controller-level replan) starts on about:blank with no other grounding
+        # (agent/loop.py's own docstring on `explicit_target_url`: it "never navigates the
+        # browser" by itself) — this used to be left entirely to the model's own `open_url`
+        # decision, nudged only by `goal_override`'s text hint. Live forensic evidence (docs/
+        # BROWSERAGENT_MASTER_STATUS.md's Phase 3 corrective pass, and the continued-validation
+        # pass's own event-log forensics) showed Qwen3-8B does not reliably comply, both on a
+        # session restart and — the dominant failure mode — on an ordinary in-session subgoal
+        # ADVANCE, where nothing here previously navigated the browser at all: the very next
+        # `run_steps(1)` call handed the model whatever page the *previous* subgoal happened to
+        # leave open, with only a prompt hint (inference/prompt.py::render_subgoal_block) asking
+        # it to notice and self-correct. `_reorient_for_subgoal` below replaces that reliance on
+        # the model with the same deterministic-positioning discipline this codebase already uses
+        # for CDP tab selection (browser/playwright_backend.py's own explicit_target_url/
+        # preferred_tab_url handling) — resolved via `_resolve_subgoal_resource`, never invented
+        # by the model, and a no-op whenever the browser is already positioned correctly (no
+        # blind reload, no new tab: single-page backend throughout this controller).
+        state = self.state_store.load(self.control_task_id)
+        await self._reorient_for_subgoal(loop, state.current_subgoal)
+        prev_subgoal = state.current_subgoal
         try:
             for _ in range(step_budget):
                 state = await loop.run_steps(1)
                 if state.status != "running":
                     return state
+                if state.current_subgoal != prev_subgoal:
+                    await self._reorient_for_subgoal(loop, state.current_subgoal)
+                    prev_subgoal = state.current_subgoal
                 if state.current_subgoal is not None and self._subgoal_local_attempts() >= cfg.max_subgoal_attempts:
                     # agent/loop.py's own internal low-level replan (build_replan_prompt, fired
                     # when the action-level recovery ladder reaches REPLAN_REQUIRED) has already
@@ -493,6 +684,99 @@ class GeneralAgentController:
             return self.state_store.load(self.control_task_id)
         finally:
             await loop.aclose()
+
+    # ---- deterministic resource-bound subgoal reorientation (Phase 3 continued-validation) --
+    #
+    # The model creates the procedure (what to do); the controller owns resource identity
+    # (what page that procedure actually applies to); the browser deterministically positions
+    # itself there before the model is ever asked to act. Built entirely from existing,
+    # already-proven identity machinery — workspace_ops's name-matching/inference (already used
+    # by _recover_desynced_subgoal and _evidence_source_is_stale) and browser/playwright_
+    # backend.py's own URL-identity helper (already used for CDP tab reuse) — no new ID scheme,
+    # no ResourceResolver/CDP dependency beyond what already exists, no domain vocabulary
+    # anywhere below. Recomputed fresh from persisted workspace evidence on every call, never
+    # cached in memory, so a controller-level replan that merely paraphrases a subgoal's text
+    # (Section 5's "replan invariant") preserves the binding automatically as long as the
+    # paraphrase still names (or, via `preceding`, is immediately preceded by a step naming) the
+    # same real-world candidate — exactly the same imprecise-label tolerance
+    # names_plausibly_match already provides everywhere else in this file.
+
+    async def _reorient_for_subgoal(self, loop: AgentLoop, subgoal: Optional[str]) -> None:
+        """Deterministic browser reorientation (no LLM call) before `subgoal` is attempted.
+        Resolves `subgoal`'s bound resource (`_resolve_subgoal_resource`) and navigates there
+        only when the browser isn't already positioned on it — never a blind reload of the
+        current URL, never a new tab (this controller's PlaywrightBackend is single-page in
+        both `launch` and `cdp_attach` mode). Exceptions are swallowed exactly like the prior
+        session-start-only hub navigation this generalizes already did: worst case, the model's
+        own recovery ladder/prompt-hint fallback (inference/prompt.py::render_subgoal_block)
+        handles it from wherever the browser already is — never worse than before this fix."""
+        if subgoal is None or loop.browser.page is None:
+            return
+        state = self.state_store.load(self.control_task_id)
+        # Falls back to the loop's own explicit_target_url (the pre-existing, simpler
+        # session-start-only guarantee this generalizes) whenever the resolver itself has
+        # nothing to go on yet — e.g. no _hub_url workspace fact recorded at all, the shape
+        # every caller outside of _run_continuous's own normal flow (which always calls
+        # _remember_hub_url first) is in.
+        target = self._resolve_subgoal_resource(subgoal, state.plan) or loop.browser.explicit_target_url
+        if not target:
+            return
+        current = loop.browser.page.url
+        if current and urls_match(current, target):
+            return
+        try:
+            await loop.browser.open_url(target)
+        except Exception:
+            pass
+
+    def _resolve_subgoal_resource(self, subgoal: str, plan: list[str]) -> Optional[str]:
+        """The deterministic resource binding for `subgoal` (Section 2: "a subgoal should
+        contain or reference the canonical resolved resource identity where available").
+
+        A candidate name is inferred from `subgoal`'s own text — falling back to the
+        immediately preceding plan item's text when `subgoal` itself names no candidate (e.g.
+        "record structured finding"; the same reasoning entity_patch_from_findings's own
+        `preceding_subgoal` parameter already documents: a live planner sometimes atomizes one
+        candidate into several subgoals whose later ones never repeat its name). If that name
+        plausibly matches an already-collected active entity (`_find_active_entity_by_name` —
+        same fuzzy match used for desync recovery), this is a REVISIT of an already-discovered
+        candidate: resolve straight to that entity's own last-known non-hub evidence URL, never
+        back through the hub. Otherwise — an unvisited candidate, a directory/navigation
+        subgoal, or a synthesis subgoal naming no single candidate — resolve to the task's hub
+        URL, the safe deterministic entry point every candidate is reachable from. Returns None
+        only when there is no hub URL at all (a task with no explicit_target_url), meaning no
+        deterministic action is possible here."""
+        workspace = self.workspace_store.load(self.control_task_id)
+        hub_url = workspace.facts.get(_HUB_URL_FACT_KEY)
+        idx = plan.index(subgoal) if subgoal in plan else -1
+        preceding = plan[idx - 1] if idx > 0 else None
+        candidate_name = (
+            workspace_ops.infer_entity_name(None, subgoal)
+            or (workspace_ops.infer_entity_name(None, preceding) if preceding else None)
+        )
+        if candidate_name:
+            entity = self._find_active_entity_by_name(candidate_name)
+            if entity is not None:
+                resource_url = self._latest_non_hub_evidence_url(entity, hub_url, workspace)
+                if resource_url:
+                    return resource_url
+        return hub_url
+
+    def _latest_non_hub_evidence_url(
+        self, entity: WorkspaceEntity, hub_url: Optional[str], workspace: WorkspaceView,
+    ) -> Optional[str]:
+        """The most recent page URL this entity's own evidence was actually sourced from,
+        excluding the hub (the hub/listing page never carries any one candidate's own
+        attributes in this architecture's hub-and-branch shape — see
+        `_evidence_source_is_stale`'s own docstring for the same point). None when this entity
+        has no such evidence yet (nothing deterministic to resolve to beyond the hub)."""
+        candidates = [
+            ev for ev in workspace.evidence
+            if ev.entity_id == entity.id and ev.source_url and ev.source_url != hub_url
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda ev: ev.source_event_id).source_url
 
     def _subgoal_local_attempts(self) -> int:
         """How many times agent/loop.py's own internal low-level replan has already rescued
@@ -526,8 +810,33 @@ class GeneralAgentController:
             1 for e in events
             if e.type == EventType.RECOVERY_TRANSITION
             and e.id > last_controller_change_id
-            and e.payload.get("reason") == "replanned"
+            and e.payload.get("reason") in ("replanned", "premature_finish_rejected")
         )
+
+    def _reject_premature_finish(self, decision: ModelDecision) -> TaskState:
+        """Reject a `finish` that lacks completion evidence for the *current* subgoal (Phase 3
+        fix — see the finish intercept's call site for why this no longer falls through to
+        agent/loop.py's own _handle_finish). Appends a failing VERIFICATION_RESULT (so the
+        rejection is visible in the next step's RECENT ACTIONS context, nudging the model
+        toward a different action) and tags it as a RECOVERY_TRANSITION with reason
+        "premature_finish_rejected" — counted by _subgoal_local_attempts alongside
+        agent/loop.py's own internal "replanned" transitions, so repeated premature finishes on
+        the same subgoal are bounded by the exact same max_subgoal_attempts budget and
+        eventually force a controller-level replan rather than looping forever. Status stays
+        "running": the outer run_steps loop in _drive_continuous_session simply continues."""
+        self._append(EventType.VERIFICATION_RESULT, {
+            "action": ActionType.FINISH.value, "target": None, "action_fingerprint": "finish",
+            "result_data": {"result": decision.params.get("result", "")},
+        })
+        self._append(EventType.MODEL_DECISION, {
+            "error": ValidationErrorKind.MODEL_COMPLETION_ERROR.value,
+            "message": "finish rejected: no structured evidence yet for THIS subgoal specifically "
+                       "(not a prior one). The current page may not be the right one for this "
+                       "subgoal — if so, navigate to it first (e.g. use the directory/listing "
+                       "page's own link), then extract the requested data before finishing again.",
+        })
+        self._append(EventType.RECOVERY_TRANSITION, {"reason": "premature_finish_rejected"})
+        return self.state_store.load(self.control_task_id)
 
     def _make_continuous_finish_intercept(
         self, task: TaskRecord,
@@ -538,26 +847,45 @@ class GeneralAgentController:
             if subgoal is None or subgoal not in plan:
                 # agent/loop.py's own internal low-level replan (build_replan_prompt, fired on
                 # repeated action failure, unrelated to this controller) can rename
-                # current_subgoal/plan out from under this controller's own plan — never trust
-                # an unrecognized subgoal as "the last one" (that would risk ending the whole
-                # task on one ambiguous finish). Re-ground via the controller's own bounded,
-                # budgeted replan instead of guessing.
-                return await self._replan_or_block(
-                    task, reason_hint=f"desynced_subgoal: model called finish for {subgoal!r}, "
-                                      "which this controller's own current plan does not recognize",
-                )
+                # current_subgoal/plan out from under this controller's own plan. Live forensic
+                # evidence (docs/BROWSERAGENT_MASTER_STATUS.md's Phase 3 corrective pass) showed
+                # this is not rare: it was the dominant failure mode for 2 of 5 holdout domains,
+                # and a real planner replan call here cannot see what the model just
+                # accomplished — it was observed live to just re-propose the same unrecognized
+                # subgoal text every time, burning the entire replan budget while discarding
+                # perfectly good, evidence-backed findings. Before paying for that call, try a
+                # deterministic reconciliation first: does this finish's own evidence identify
+                # one of the controller's own still-pending plan items by name? If so, that item
+                # actually did just get completed, under a different bookkeeping label — credit
+                # it directly (below, exactly like a non-desynced finish) instead of replanning
+                # from scratch. Only ever recovers to an existing plan item's *exact* text, so a
+                # genuinely ambiguous/novel desync still falls through to a real replan.
+                recovered = self._recover_desynced_subgoal(plan, state.completed_subgoals, decision)
+                if recovered is None:
+                    return await self._replan_or_block(
+                        task, reason_hint=f"desynced_subgoal: model called finish for {subgoal!r}, "
+                                          "which this controller's own current plan does not recognize",
+                    )
+                subgoal = recovered
 
             idx = plan.index(subgoal)
             is_last = idx == len(plan) - 1
-            if not self._continuous_subgoal_has_evidence(subgoal, decision):
+            if not self._continuous_subgoal_has_evidence(subgoal, decision, observation.url, plan):
                 # No verifiable completion evidence for *this* subgoal yet (item 9: a subgoal
-                # is not done just because the model says so) — fall through to agent/loop.py's
-                # own existing terminal-evidence gate in _handle_finish, which will correctly
-                # reject this finish and advance recovery exactly as it already does for every
-                # other caller, without this controller inventing a second rejection path.
-                return None
+                # is not done just because the model says so). Deliberately does NOT fall
+                # through to agent/loop.py's own _handle_finish here (an earlier version of
+                # this code did, returning None) — Phase 3's live benchmark surfaced a real bug
+                # in that plan: _handle_finish's "any prior verified action already passed"
+                # escape hatch was built for a single self-contained task, so the very first
+                # subgoal's own opening navigation (already verified) let a premature,
+                # evidence-less finish silently complete the WHOLE multi-subgoal continuous
+                # task instead of just failing this one subgoal (see docs/BROWSERAGENT_MASTER_
+                # STATUS.md's Phase 3 section for the reproduction). Rejecting here instead
+                # keeps the task running and gives this subgoal specifically another chance.
+                return self._reject_premature_finish(decision)
 
-            self._ingest_continuous_subgoal_result(subgoal, decision, observation)
+            preceding_subgoal = plan[idx - 1] if idx > 0 else None
+            self._ingest_continuous_subgoal_result(subgoal, decision, observation, preceding_subgoal)
 
             # Always advance via SUBGOAL_CHANGED (mirroring the delegated strategy's own
             # _advance_subgoal) — including moving to None on the last subgoal, which is what
@@ -580,7 +908,7 @@ class GeneralAgentController:
                 return self._block(f"completion evaluation failed schema validation: {exc}")
             self._append(EventType.COMPLETION_EVALUATED, evaluation.model_dump())
             if evaluation.satisfied:
-                return self._finish(evaluation, completion_claim=decision.params.get("result"))
+                return await self._finish(evaluation, completion_claim=decision.params.get("result"))
             if evaluation.next_recommendation == "ask_user":
                 return self._block("; ".join(evaluation.missing_requirements) or "clarification needed")
             reason = "completion_rejection: " + (
@@ -590,24 +918,73 @@ class GeneralAgentController:
 
         return intercept
 
-    def _continuous_subgoal_has_evidence(self, subgoal: str, decision: ModelDecision) -> bool:
+    def _recover_desynced_subgoal(
+        self, plan: list[str], completed_subgoals: list[str], decision: ModelDecision,
+    ) -> Optional[str]:
+        """Deterministic recovery for the desynced-subgoal case above: match the finish
+        decision's own evidence to one of the controller's own still-pending plan items by
+        name — pure string comparison, no LLM call. Returns that plan item's exact text (so the
+        caller's normal advance-the-plan logic can treat it identically to a non-desynced
+        finish), or None when nothing in the plan plausibly and unambiguously matches (still
+        needs a real replan)."""
+        result_text = str(decision.params.get("result", ""))
+        structured = workspace_ops.coerce_structured_result(decision.params.get("structured_result"), result_text)
+        candidate_name = workspace_ops.infer_entity_name(structured if isinstance(structured, dict) else None, result_text)
+        if not candidate_name:
+            return None
+        # A raw identity-field value can carry noisy trailing prose (e.g. a kv-fallback "name"
+        # of "DataForge Analytics Intern details recorded") that breaks a plain substring match
+        # against a pending plan item's cleaner subgoal text — strip to the core capitalized
+        # phrase first, falling back to the raw value if nothing capitalized was found.
+        refined_name = workspace_ops.extract_title_phrase(candidate_name) or candidate_name
+        pending = [s for s in plan if s not in completed_subgoals]
+        matches = [s for s in pending if workspace_ops.names_plausibly_match(refined_name, s)]
+        return matches[0] if len(matches) == 1 else None
+
+    def _continuous_subgoal_has_evidence(
+        self, subgoal: str, decision: ModelDecision, observation_url: Optional[str] = None,
+        plan: Optional[list[str]] = None,
+    ) -> bool:
         """Deterministic subgoal-completion evidence check (item 9/18: no new LLM call merely
         to judge this) — same evidence bar agent/loop.py's own _has_evidence_backed_structured_
         result uses for a batch child's finish, plus "a verified action happened since this
         subgoal became active" for interactive (non-extraction) subgoals."""
-        structured = decision.params.get("structured_result")
+        structured = workspace_ops.coerce_structured_result(
+            decision.params.get("structured_result"), str(decision.params.get("result", "")),
+        )
         if isinstance(structured, dict):
             findings = structured.get("findings")
-            if isinstance(findings, list) and any(
+            has_findings = isinstance(findings, list) and any(
                 isinstance(f, dict) and str(f.get("evidence") or "").strip() and str(f.get("value") or "").strip()
                 for f in findings
-            ):
-                return True
+            )
             fields = structured.get("fields")
-            if isinstance(fields, dict) and any(
+            has_found_fields = isinstance(fields, dict) and any(
                 isinstance(f, dict) and f.get("status") == "found" and str(f.get("evidence") or "").strip()
                 for f in fields.values()
-            ):
+            )
+            if has_findings or has_found_fields:
+                if self._evidence_source_is_stale(subgoal, structured, observation_url, plan):
+                    return False
+                return True
+        # A synthesis-only subgoal (Section 9's generic top-k detector, workspace_ops::
+        # parse_requested_top_k — the same one _build_result_patch already uses to tell a
+        # "report the top-k" step apart from a new-candidate-collection step) has no page of its
+        # own to extract evidence from — it is pure reasoning over candidates already collected
+        # and evidenced by their OWN earlier subgoals. Live forensic finding (Phase 3 continued-
+        # validation pass): holding it to the same extraction-evidence bar as every other subgoal
+        # rejected a verbatim-correct finish forever (the model correctly named the top-k
+        # candidates from already-recorded facts, produced no `structured_result`/fresh
+        # verification since nothing on the current page needed acting on, and every replan just
+        # re-proposed the identical unsatisfiable bar) — exhausting the entire replan budget on a
+        # subgoal that was already answerable from persisted state. Accepting it here only lets
+        # the subgoal ADVANCE to the whole-goal completion check below; it never itself selects or
+        # fabricates a final entity — that stays exclusively _finish -> _maybe_select_top_k_
+        # entities's own deterministic (or, failing that, id-only anti-hallucination) path.
+        k = workspace_ops.parse_requested_top_k(subgoal)
+        if k is not None:
+            workspace = self.workspace_store.load(self.control_task_id)
+            if sum(1 for e in workspace.entities if e.status == "active") >= k:
                 return True
         events = self.event_store.all_events(self.control_task_id)
         last_change_id = 0
@@ -620,8 +997,67 @@ class GeneralAgentController:
             for e in events
         )
 
+    def _evidence_source_is_stale(
+        self, subgoal: str, structured: dict, observation_url: Optional[str],
+        plan: Optional[list[str]] = None,
+    ) -> bool:
+        """Grounding check for a per-candidate subgoal's finish (Phase 3 corrective pass, live
+        forensic finding): a plausible-looking `structured_result` is not enough on its own —
+        it must actually have been sourced from a page belonging to *this* subgoal's own
+        candidate, not stale data left visible from a sibling candidate's page the browser
+        never navigated away from. Live evidence: a passing trial still produced one entity
+        with another entity's exact attributes copied verbatim because the model finished
+        without navigating; the existing evidence check had no way to catch it since the
+        `structured_result` itself looked perfectly well-formed. Three checks, all
+        deterministic and entity-generic (no product/domain vocabulary):
+
+        1. The directory/listing (hub) page itself never carries any one candidate's own
+           attributes in this architecture's hub-and-branch shape — findings "sourced" from it
+           are never valid evidence for a specific candidate.
+        2. When `plan` is given and this subgoal already resolves (`_resolve_subgoal_resource`)
+           to a KNOWN, previously-discovered candidate page (i.e. this is a revisit, not this
+           candidate's first visit), the current observation must be exactly that page — a hard
+           identity check, not a name heuristic. Live forensic finding (Phase 3 continued-
+           validation pass): the weaker check #3 below is symmetric-blind to a *forward*
+           overshoot — a subgoal for a candidate that already has its own known page can still
+           get "credited" with a finding sourced from a page belonging to a *sibling* candidate
+           it had not visited before (so check #3's "already claimed by someone else" lookup
+           finds nothing), permanently mislabeling that finding under the wrong entity and, worse,
+           poisoning check #3 for every later, genuinely correct visit to the real owner of that
+           URL (observed live: this exact chain blocked a domain's entire replan budget on a
+           candidate whose own page was never actually revisited, only ever borrowed by a
+           sibling's earlier overshoot).
+        3. If this exact URL was already used as evidence for a *different*-named entity, this
+           finish is reusing a sibling's page rather than having visited its own — unless the
+           subgoal's own implied candidate name plausibly matches that entity (a legitimate
+           re-confirmation of the same real-world candidate, not a conflict).
+        """
+        if not observation_url:
+            return False
+        workspace = self.workspace_store.load(self.control_task_id)
+        hub_url = workspace.facts.get(_HUB_URL_FACT_KEY)
+        expected_name = workspace_ops.infer_entity_name(structured, subgoal)
+        if not expected_name:
+            return False
+        if hub_url and observation_url == hub_url:
+            return True
+        if plan is not None:
+            bound = self._resolve_subgoal_resource(subgoal, plan)
+            if bound and bound != hub_url and not urls_match(bound, observation_url):
+                return True
+        entities_by_id = {e.id: e for e in workspace.entities}
+        for ev in workspace.evidence:
+            if ev.source_url != observation_url or not ev.entity_id:
+                continue
+            entity = entities_by_id.get(ev.entity_id)
+            if entity is None or workspace_ops.names_plausibly_match(entity.name, expected_name):
+                continue
+            return True
+        return False
+
     def _ingest_continuous_subgoal_result(
         self, subgoal: str, decision: ModelDecision, observation: PageObservation,
+        preceding_subgoal: Optional[str] = None,
     ) -> None:
         result_text = str(decision.params.get("result", ""))
         structured_result = decision.params.get("structured_result")
@@ -631,15 +1067,9 @@ class GeneralAgentController:
             "structured_result": structured_result, "blocked_reason": None,
         })
         if result_text or structured_result:
-            excerpt = result_text or json.dumps(structured_result)[:500]
-            patch = WorkspacePatch(
-                add_facts=[WorkspaceFact(key=f"subgoal_result::{subgoal}", value=result_text)],
-                add_evidence=[EvidenceRef(
-                    fact_key=f"subgoal_result::{subgoal}",
-                    source_event_id=result_event_id,
-                    source_url=observation.url,
-                    excerpt=excerpt,
-                )],
+            patch = self._build_result_patch(
+                subgoal, result_text, structured_result, result_event_id, observation.url,
+                preceding_subgoal,
             )
             self.workspace_store.apply_patch(self.control_task_id, patch)
 
@@ -742,9 +1172,11 @@ class GeneralAgentController:
         state = self.state_store.load(self.control_task_id)
         return self.event_store.append(self.control_task_id, state.current_step + 1, event_type, payload)
 
-    def _finish(self, evaluation: CompletionEvaluation, completion_claim: Optional[str] = None) -> TaskState:
+    async def _finish(self, evaluation: CompletionEvaluation, completion_claim: Optional[str] = None) -> TaskState:
         prior = self.state_store.load(self.control_task_id)
-        result = completion_claim or "; ".join(prior.completed_subgoals) or "goal satisfied"
+        task = self.state_store.get_task_record(self.control_task_id)
+        entity_report = await self._maybe_select_top_k_entities(task) if task is not None else None
+        result = entity_report or completion_claim or "; ".join(prior.completed_subgoals) or "goal satisfied"
         self._append(EventType.TASK_COMPLETED, {
             "result": result,
             "missing_requirements": evaluation.missing_requirements,
