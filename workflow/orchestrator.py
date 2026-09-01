@@ -35,6 +35,7 @@ class WorkflowOrchestrator:
         runner: ChildRunner | None = None,
         step_completed_callback: Callable[[dict[str, Any]], None] | None = None,
         approval_callback: Optional[Callable[[Any, Any], Awaitable[bool]]] = None,
+        parent_task_id: str | None = None,
     ):
         self.config = config
         self.store = store
@@ -44,6 +45,9 @@ class WorkflowOrchestrator:
         self.workflow_dir = store.db_path.parent
         self.step_completed_callback = step_completed_callback
         self.approval_callback = approval_callback
+        # Set by a general-controller delegate_workflow decision (agent/controller.py, Phase
+        # 4); every pre-existing caller leaves this None with no behavior change.
+        self.parent_task_id = parent_task_id
 
     async def run(self) -> dict[str, Any]:
         while True:
@@ -167,6 +171,7 @@ class WorkflowOrchestrator:
         steps = [dict(s) for s in self.store.steps(self.workflow_id)]
         return {
             "workflow_id": self.workflow_id,
+            "parent_task_id": self.parent_task_id,
             "status": job["status"],
             "objective": job["objective"],
             "blocked_reason": job.get("blocked_reason"),

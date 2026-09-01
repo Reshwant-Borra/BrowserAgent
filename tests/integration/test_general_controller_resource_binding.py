@@ -295,12 +295,13 @@ async def test_apply_controller_decision_self_heals_active_subgoal_missing_from_
     config = _config(tmp_config)
     controller = GeneralAgentController.create_new(config, "goal", [])
     try:
+        task = controller.state_store.get_task_record(controller.control_task_id)
         malformed = ControllerDecision(
             decision="revise_plan", reason_code="repeated_failure",
             active_subgoal="Find the 2 cheapest and report with evidence",
             plan=["Visit the detail page of DustHunter Pro", "Record price_usd and rating for DustHunter Pro"],
         )
-        state = await controller._apply_controller_decision(malformed)
+        state = await controller._apply_controller_decision(task, malformed)
         assert state.current_subgoal == "Find the 2 cheapest and report with evidence"
         assert state.current_subgoal in state.plan
         assert state.plan[-1] == "Find the 2 cheapest and report with evidence"

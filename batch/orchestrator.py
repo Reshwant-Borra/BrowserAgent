@@ -102,6 +102,7 @@ class BatchOrchestrator:
         result_contract: ResultContract,
         runner: ChildRunner | None = None,
         item_completed_callback: Callable[[dict[str, Any]], None] | None = None,
+        parent_task_id: str | None = None,
     ):
         self.config = config
         self.store = store
@@ -111,6 +112,11 @@ class BatchOrchestrator:
         self.runner = runner or AgentLoopChildRunner()
         self.batch_dir = store.db_path.parent
         self.item_completed_callback = item_completed_callback
+        # Set by a general-controller delegate_batch decision (agent/controller.py, Phase 4)
+        # so the synthesized result carries which control task it was run on behalf of; every
+        # pre-existing caller (ui/jobs.py, benchmarks) leaves this None and gets identical
+        # output to before this field existed.
+        self.parent_task_id = parent_task_id
 
     async def run(self) -> dict[str, Any]:
         started = time.monotonic()
@@ -301,6 +307,7 @@ class BatchOrchestrator:
         quality = _aggregate_quality(rows)
         return {
             "batch_id": self.batch_id,
+            "parent_task_id": self.parent_task_id,
             "status": progress["status"],
             "goal": progress["goal"],
             "item_count": progress["item_count"],

@@ -47,13 +47,21 @@ from agent.workspace_models import (
     WorkspacePatch,
     WorkspaceView,
 )
+from batch.models import BatchPolicy, ResultContract
+from batch.orchestrator import BatchOrchestrator, ChildRunner
+from batch.store import BatchStore
 from browser.page_model import PageObservation
 from browser.playwright_backend import urls_match
 from inference.llama_client import InferenceClient, create_inference_client
-from memory.event_store import EventStore, EventType
+from memory.event_store import Event, EventStore, EventType
 from memory.models import TaskRecord, TaskState
 from memory.task_state import TaskStateStore
 from memory.workspace_store import WorkspaceStore
+from research import discovery as research_discovery
+from router.extract import extract_urls
+from workflow.models import WorkflowPolicy
+from workflow.orchestrator import WorkflowOrchestrator
+from workflow.store import WorkflowStore
 
 # Blocked reasons agent/loop.py's own step()/recovery ladder — or this controller's own
 # per-subgoal local-attempt limit (_subgoal_local_attempts) — can produce that reflect a
@@ -94,6 +102,13 @@ def _is_replan_eligible_block(blocked_reason: Optional[str]) -> bool:
 
 _HUB_URL_FACT_KEY = "_hub_url"
 
+# Generic entity_type used for a source URL discovered by _discover_sources (Phase 4:
+# architecture doc section 18 "Delegation to Existing Batch / Workflow / Research
+# Capabilities" / section 12 "Research subsystem: KEEP + REFACTOR as capability"). Never a
+# domain type — just "a candidate resource the controller itself found," consumed by a later
+# delegate_batch the same way an explicit URL in the goal text is.
+_DISCOVERED_SOURCE_ENTITY_TYPE = "discovered_source"
+
 
 class GeneralAgentController:
     def __init__(
@@ -102,6 +117,7 @@ class GeneralAgentController:
         control_task_id: Optional[str] = None,
         llama_client: Optional[InferenceClient] = None,
         child_llama_client_factory: Optional[Callable[[], InferenceClient]] = None,
+        child_runner: Optional[ChildRunner] = None,
     ):
         self.config = config
         self.control_task_id = control_task_id or uuid.uuid4().hex[:12]
@@ -115,6 +131,13 @@ class GeneralAgentController:
         # client (mirroring tests/integration/conftest.py's `loop.llama = ScriptedLlamaClient
         # (...)` pattern) without agent/loop.py itself needing to know a controller exists.
         self._child_llama_client_factory = child_llama_client_factory
+        # Test-only seam (Phase 4): the same idea, one level up — lets a test give a
+        # delegate_batch/delegate_workflow's own BatchOrchestrator/WorkflowOrchestrator a
+        # scripted `ChildRunner` (batch/orchestrator.py's own Protocol, already used by
+        # tests/unit/test_batch_orchestrator.py) instead of the real AgentLoopChildRunner.
+        # None (the default, every pre-existing caller) is unchanged: both orchestrators
+        # already default to AgentLoopChildRunner() themselves when `runner` is None.
+        self._child_runner = child_runner
         self._replans_used = 0
 
     def close(self) -> None:
@@ -126,9 +149,11 @@ class GeneralAgentController:
     def create_new(cls, config: AppConfig, goal: str, success_criteria: list[str],
                     llama_client: Optional[InferenceClient] = None,
                     child_llama_client_factory: Optional[Callable[[], InferenceClient]] = None,
+                    child_runner: Optional[ChildRunner] = None,
                     ) -> "GeneralAgentController":
         controller = cls(config, llama_client=llama_client,
-                          child_llama_client_factory=child_llama_client_factory)
+                          child_llama_client_factory=child_llama_client_factory,
+                          child_runner=child_runner)
         controller.event_store.create_task(controller.control_task_id, goal, success_criteria)
         controller.event_store.append(controller.control_task_id, 0, EventType.TASK_CREATED,
                                        {"goal": goal, "success_criteria": success_criteria})
@@ -139,9 +164,11 @@ class GeneralAgentController:
     def resume(cls, config: AppConfig, control_task_id: str,
                llama_client: Optional[InferenceClient] = None,
                child_llama_client_factory: Optional[Callable[[], InferenceClient]] = None,
+               child_runner: Optional[ChildRunner] = None,
                ) -> "GeneralAgentController":
         controller = cls(config, control_task_id=control_task_id, llama_client=llama_client,
-                          child_llama_client_factory=child_llama_client_factory)
+                          child_llama_client_factory=child_llama_client_factory,
+                          child_runner=child_runner)
         if not controller.event_store.task_exists(control_task_id):
             raise ValueError(f"no such control task: {control_task_id}")
         return controller
@@ -211,6 +238,9 @@ class GeneralAgentController:
     # ---- planning -------------------------------------------------------------------
 
     async def _initial_plan(self, task: TaskRecord) -> TaskState:
+        deterministic = self._deterministic_initial_decision(task)
+        if deterministic is not None:
+            return await self._apply_controller_decision(task, deterministic)
         cfg = self.config.agent
         workspace = self.workspace_store.load(self.control_task_id)
         try:
@@ -222,7 +252,25 @@ class GeneralAgentController:
             )
         except PlannerOutputError as exc:
             return self._block(f"initial planning failed schema validation: {exc}")
-        return await self._apply_controller_decision(decision)
+        return await self._apply_controller_decision(task, decision)
+
+    def _deterministic_initial_decision(self, task: TaskRecord) -> Optional[ControllerDecision]:
+        """Section 8.1's "deterministic substrate selection before using the LLM": when the
+        goal text itself already lists at least `batch_delegation_min_targets` literal target
+        URLs, delegating to BatchOrchestrator is mechanical — each target needs the same
+        independent look, exactly the "a subgoal contains N resolved independent URLs...
+        BatchOrchestrator is the obvious substrate" case the doc names — so no planning call is
+        spent deciding that. Returns None (fall through to the normal planner call, which can
+        still choose delegate_batch/delegate_workflow/discover_sources itself) for every other
+        goal shape, including one with fewer explicit URLs than the threshold."""
+        urls = extract_urls(task.goal)
+        if len(urls) < self.config.agent.batch_delegation_min_targets:
+            return None
+        active = f"Look at each of the {len(urls)} target pages and report what's relevant to the goal."
+        return ControllerDecision(
+            decision="delegate_batch", reason_code="independent_targets",
+            active_subgoal=active, plan=[active], resource_refs=[],
+        )
 
     async def _replan_or_block(self, task: TaskRecord, reason_hint: str) -> TaskState:
         cfg = self.config.agent
@@ -241,9 +289,9 @@ class GeneralAgentController:
         except PlannerOutputError as exc:
             return self._block(f"replan failed schema validation: {exc}")
         self._replans_used += 1
-        return await self._apply_controller_decision(decision)
+        return await self._apply_controller_decision(task, decision)
 
-    async def _apply_controller_decision(self, decision: ControllerDecision) -> TaskState:
+    async def _apply_controller_decision(self, task: TaskRecord, decision: ControllerDecision) -> TaskState:
         if decision.decision in ("start_subgoal", "revise_plan"):
             plan = decision.plan or ([decision.active_subgoal] if decision.active_subgoal else [])
             active = decision.active_subgoal or (plan[0] if plan else None)
@@ -268,20 +316,22 @@ class GeneralAgentController:
                 plan = plan + [active]
             self._append(EventType.SUBGOAL_CHANGED, {"subgoal": active, "plan": plan, "source": "controller"})
             return self._reset_recovery_for_new_subgoal()
+        if decision.decision == "delegate_batch":
+            return await self._delegate_batch(task, decision)
+        if decision.decision == "delegate_workflow":
+            return await self._delegate_workflow(task, decision)
+        if decision.decision == "discover_sources":
+            return await self._discover_sources(task, decision)
         if decision.decision == "finish":
             return await self._finish(CompletionEvaluation(
                 satisfied=True, next_recommendation="finish",
             ), completion_claim=decision.completion_claim)
         if decision.decision == "ask_user":
             return self._block(decision.clarification_question or "clarification needed to proceed")
-        # delegate_batch / delegate_workflow / discover_sources: valid values in the shared
-        # ControllerDecision contract (section 7), but Phase 2 explicitly implements direct-
-        # subgoal execution only (section 18) — fail safe with a clear reason rather than
-        # silently dropping the decision or half-implementing an unfinished substrate.
-        return self._block(
-            f"planner requested {decision.decision!r}, which this phase (direct-subgoal "
-            "execution only) does not implement yet",
-        )
+        # Defensive only: every literal value of ControllerDecisionType is handled above: this
+        # is unreachable via a schema-valid decision, kept as a fail-safe rather than a silent
+        # no-op if the shared contract (agent/controller_models.py) ever grows a new value.
+        return self._block(f"planner requested {decision.decision!r}, which this controller does not implement")
 
     # ---- completion evaluation --------------------------------------------------------
 
@@ -554,6 +604,252 @@ class GeneralAgentController:
         next_subgoal = plan[idx + 1] if 0 <= idx < len(plan) - 1 else None
         self._append(EventType.SUBGOAL_CHANGED, {"subgoal": next_subgoal, "plan": plan, "source": "controller"})
         return self.state_store.load(self.control_task_id)
+
+    # ---- delegation to Batch/Workflow/Research capabilities (Phase 4) ----------------
+    #
+    # Section 18 "Delegation to Existing Batch / Workflow / Research Capabilities": the
+    # controller chooses an efficient, already-proven substrate instead of serially driving
+    # every independent target or every ordered cross-site step through its own single
+    # AgentLoop subgoal. BatchOrchestrator/WorkflowOrchestrator/research.discovery are reused
+    # completely unmodified in their own execution logic — this section only ever resolves
+    # *which real resources* a delegate should see (never inventing a URL: literal ones come
+    # from router/extract.py's own extract_urls() over the goal text, exactly like the
+    # semantic-planner resolver already does for router/ tasks; discovered ones come from
+    # research/discovery.py's own id-based, anti-hallucination selection) and ingests the
+    # delegate's verified output back into the same generic WorkspaceEntity/EvidenceRef shape
+    # every other ingestion path in this file already uses. A delegate is treated exactly like
+    # one atomic subgoal: marked active, run to completion, ingested, then advanced — so
+    # _finish/_maybe_select_top_k_entities/_planner_evaluate_completion all apply to its output
+    # with zero additional code.
+
+    def _mark_subgoal_active(self, active: str) -> None:
+        self._append(EventType.SUBGOAL_CHANGED, {"subgoal": active, "plan": [active], "source": "controller"})
+        self._reset_recovery_for_new_subgoal()
+
+    async def _finish_delegate_step(self, task: TaskRecord, success: bool,
+                                     failure_reason: Optional[str] = None) -> TaskState:
+        """Shared tail for every delegate branch below — mirrors _handle_subgoal_child_result's
+        own advance-or-don't-advance shape for a plain AgentLoop child. On success, the
+        delegate's own 1-item plan (`_mark_subgoal_active`) always advances straight to None
+        (section 7.2's "boundary reached"), so run()'s own current_subgoal-is-None branch
+        performs the mandatory completion check next — never skipped, never doubled."""
+        if not success:
+            return await self._replan_or_block(task, reason_hint=failure_reason or "repeated_failure: delegate did not complete")
+        state = self._advance_subgoal()
+        if state.current_subgoal is not None and self.config.agent.completion_check_after_subgoal and state.status == "running":
+            state = await self._maybe_early_exit(task)
+        return state
+
+    def _resolve_batch_targets(self, task: TaskRecord) -> list[str]:
+        """The sole target resolution for delegate_batch — code-owned, never model-invented
+        (repository invariant, architecture doc section 22.1): literal URLs already in the
+        goal text (extract_urls, order-preserving) unioned with any not-yet-consumed
+        `discovered_source` entities a prior discover_sources call added to the workspace."""
+        urls = extract_urls(task.goal)
+        workspace = self.workspace_store.load(self.control_task_id)
+        discovered = [
+            e.attributes.get("url") for e in workspace.entities
+            if e.entity_type == _DISCOVERED_SOURCE_ENTITY_TYPE and e.status == "active" and e.attributes.get("url")
+        ]
+        seen: set[str] = set()
+        targets: list[str] = []
+        for url in urls + discovered:
+            if url and url not in seen:
+                seen.add(url)
+                targets.append(url)
+        return targets
+
+    async def _delegate_batch(self, task: TaskRecord, decision: ControllerDecision) -> TaskState:
+        active = decision.active_subgoal or task.goal
+        self._mark_subgoal_active(active)
+        targets = self._resolve_batch_targets(task)
+        if not targets:
+            return await self._finish_delegate_step(
+                task, success=False,
+                failure_reason="resource_missing: delegate_batch requested but no resolved "
+                               "independent targets were found in the goal text or workspace",
+            )
+        batch_id = f"{self.control_task_id}_batch_{uuid.uuid4().hex[:8]}"
+        batch_dir = self.tasks_dir / self.control_task_id / "delegates" / batch_id
+        self._append(EventType.DELEGATE_STARTED, {
+            "substrate": "batch", "subgoal": active, "child_task_id": batch_id,
+            "target_count": len(targets), "delegate_dir": str(batch_dir),
+        })
+        store = BatchStore.for_batch_dir(batch_dir)
+        try:
+            store.create_batch(active, targets, ResultContract(), BatchPolicy(), batch_id=batch_id)
+        finally:
+            store.close()
+        final = await self._run_batch_delegate(batch_dir, batch_id)
+        self._ingest_batch_result(active, batch_id, final)
+        return await self._finish_delegate_step(task, success=True)
+
+    async def _run_batch_delegate(self, batch_dir: Path, batch_id: str) -> dict:
+        store = BatchStore.for_batch_dir(batch_dir)
+        try:
+            orchestrator = BatchOrchestrator(
+                self.config, store, batch_id, BatchPolicy(), ResultContract(),
+                runner=self._child_runner, parent_task_id=self.control_task_id,
+            )
+            return await orchestrator.run()
+        finally:
+            store.close()
+
+    def _ingest_batch_result(self, subgoal: str, batch_id: str, final: dict) -> None:
+        result_event_id = self._append(EventType.DELEGATE_RESULT, {
+            "substrate": "batch", "subgoal": subgoal, "child_task_id": batch_id,
+            "status": final.get("status"), "item_count": final.get("item_count"),
+            "completed": final.get("completed"), "failed": final.get("failed"),
+            "blocked": final.get("blocked"), "deduplicated_findings": final.get("deduplicated_findings"),
+        })
+        add_entities: list[WorkspaceEntity] = []
+        add_evidence: list[EvidenceRef] = []
+        for item in final.get("findings") or []:
+            finding = item.get("finding") or {}
+            provenance = (item.get("provenance") or [{}])[0]
+            value = finding.get("value") or finding.get("title") or finding.get("assignment")
+            if not str(value or "").strip():
+                continue
+            entity_id = f"ent_{uuid.uuid4().hex[:10]}"
+            name = finding.get("title") or str(value)
+            attributes = {k: v for k, v in finding.items() if k != "evidence" and v not in (None, "")}
+            add_entities.append(WorkspaceEntity(
+                id=entity_id, entity_type=str(finding.get("type") or "batch_finding"),
+                name=str(name)[:200], attributes=attributes,
+            ))
+            excerpt = finding.get("evidence") or str(value)
+            add_evidence.append(EvidenceRef(
+                entity_id=entity_id, source_event_id=result_event_id,
+                source_url=provenance.get("final_url") or provenance.get("source_url") or finding.get("source_url"),
+                excerpt=str(excerpt)[:500],
+            ))
+        # Any discovered_source entity that fed this batch is now resolved — never
+        # redelegated by a later delegate_batch call in the same task.
+        workspace = self.workspace_store.load(self.control_task_id)
+        update_entities = [
+            WorkspaceEntityPatch(id=e.id, status="resolved")
+            for e in workspace.entities
+            if e.entity_type == _DISCOVERED_SOURCE_ENTITY_TYPE and e.status == "active"
+        ]
+        if add_entities or add_evidence or update_entities:
+            self.workspace_store.apply_patch(self.control_task_id, WorkspacePatch(
+                add_entities=add_entities, add_evidence=add_evidence, update_entities=update_entities,
+            ))
+
+    async def _delegate_workflow(self, task: TaskRecord, decision: ControllerDecision) -> TaskState:
+        urls = extract_urls(task.goal)
+        objectives = decision.plan or ([decision.active_subgoal] if decision.active_subgoal else [])
+        active = decision.active_subgoal or (objectives[0] if objectives else task.goal)
+        self._mark_subgoal_active(active)
+        n = min(len(urls), len(objectives))
+        if n < 2:
+            return await self._finish_delegate_step(
+                task, success=False,
+                failure_reason="resource_missing: delegate_workflow requested but fewer than "
+                               "2 ordered target URLs with matching step objectives were "
+                               "found in the goal text",
+            )
+        steps = [{"ordinal": i + 1, "target": urls[i], "objective": objectives[i]} for i in range(n)]
+        workflow_id = f"{self.control_task_id}_wf_{uuid.uuid4().hex[:8]}"
+        workflow_dir = self.tasks_dir / self.control_task_id / "delegates" / workflow_id
+        self._append(EventType.DELEGATE_STARTED, {
+            "substrate": "workflow", "subgoal": active, "child_task_id": workflow_id,
+            "step_count": n, "delegate_dir": str(workflow_dir),
+        })
+        store = WorkflowStore.for_workflow_dir(workflow_dir)
+        try:
+            store.create_workflow(task.goal, steps, WorkflowPolicy(), workflow_id=workflow_id)
+        finally:
+            store.close()
+        final = await self._run_workflow_delegate(workflow_dir, workflow_id)
+        self._ingest_workflow_result(active, workflow_id, final)
+        if final.get("status") != "completed":
+            return await self._finish_delegate_step(
+                task, success=False,
+                failure_reason=f"repeated_failure: workflow delegate blocked ({final.get('blocked_reason')})",
+            )
+        return await self._finish_delegate_step(task, success=True)
+
+    async def _run_workflow_delegate(self, workflow_dir: Path, workflow_id: str) -> dict:
+        store = WorkflowStore.for_workflow_dir(workflow_dir)
+        try:
+            policy = WorkflowPolicy()
+            orchestrator = WorkflowOrchestrator(
+                self.config, store, workflow_id, policy,
+                runner=self._child_runner, parent_task_id=self.control_task_id,
+            )
+            return await orchestrator.run()
+        finally:
+            store.close()
+
+    def _ingest_workflow_result(self, subgoal: str, workflow_id: str, final: dict) -> None:
+        result_event_id = self._append(EventType.DELEGATE_RESULT, {
+            "substrate": "workflow", "subgoal": subgoal, "child_task_id": workflow_id,
+            "status": final.get("status"), "blocked_reason": final.get("blocked_reason"),
+        })
+        add_facts: list[WorkspaceFact] = []
+        add_evidence: list[EvidenceRef] = []
+        for step in final.get("steps") or []:
+            if not step.get("summary") and not step.get("facts"):
+                continue
+            key = f"workflow_step_result::{workflow_id}::{step['ordinal']}"
+            add_facts.append(WorkspaceFact(key=key, value=step.get("summary") or ""))
+            add_evidence.append(EvidenceRef(
+                fact_key=key, source_event_id=result_event_id, source_url=step.get("target"),
+                excerpt=(step.get("summary") or json.dumps(step.get("facts") or {}))[:500],
+            ))
+            for fact_key, fact_value in (step.get("facts") or {}).items():
+                wf_key = f"workflow_fact::{fact_key}"
+                add_facts.append(WorkspaceFact(key=wf_key, value=fact_value))
+                add_evidence.append(EvidenceRef(
+                    fact_key=wf_key, source_event_id=result_event_id, source_url=step.get("target"),
+                    excerpt=str(fact_value)[:500],
+                ))
+        if add_facts:
+            self.workspace_store.apply_patch(self.control_task_id, WorkspacePatch(
+                add_facts=add_facts, add_evidence=add_evidence,
+            ))
+
+    async def _discover_sources(self, task: TaskRecord, decision: ControllerDecision) -> TaskState:
+        active = decision.active_subgoal or task.goal
+        self._mark_subgoal_active(active)
+        self._append(EventType.DELEGATE_STARTED, {
+            "substrate": "research_discovery", "subgoal": active, "child_task_id": self.control_task_id,
+            "objective": active,
+        })
+        return await self._run_discovery_and_replan(task, active, active)
+
+    async def _run_discovery_and_replan(self, task: TaskRecord, subgoal: str, objective: str) -> TaskState:
+        profile_dir = self.tasks_dir / self.control_task_id / "delegates" / "discovery_browser_profile"
+        urls = await research_discovery.discover_sources(
+            self.config, self.llama, objective, profile_dir,
+            max_sources=self.config.agent.research_discovery_max_sources,
+        )
+        result_event_id = self._append(EventType.DELEGATE_RESULT, {
+            "substrate": "research_discovery", "subgoal": subgoal, "child_task_id": self.control_task_id,
+            "status": "completed", "source_count": len(urls),
+        })
+        if urls:
+            add_entities: list[WorkspaceEntity] = []
+            add_evidence: list[EvidenceRef] = []
+            for url in urls:
+                entity_id = f"ent_{uuid.uuid4().hex[:10]}"
+                add_entities.append(WorkspaceEntity(
+                    id=entity_id, entity_type=_DISCOVERED_SOURCE_ENTITY_TYPE, name=url,
+                    attributes={"url": url},
+                ))
+                add_evidence.append(EvidenceRef(
+                    entity_id=entity_id, source_event_id=result_event_id, source_url=url,
+                    excerpt=f"discovered via search for: {objective}",
+                ))
+            self.workspace_store.apply_patch(self.control_task_id, WorkspacePatch(
+                add_entities=add_entities, add_evidence=add_evidence,
+            ))
+        reason = (
+            f"resource_discovered: found {len(urls)} candidate source(s) for {objective!r}"
+            if urls else f"resource_missing: discovery for {objective!r} found no candidate sources"
+        )
+        return await self._replan_or_block(task, reason_hint=reason)
 
     # ---- continuous strategy (Phase 2 corrective pass) -------------------------------
     #
@@ -1092,9 +1388,17 @@ class GeneralAgentController:
 
     async def _reconcile_dangling_delegate(self, task: TaskRecord) -> Optional[TaskState]:
         """A DELEGATE_STARTED with no matching DELEGATE_RESULT means the process died while a
-        child AgentLoop was running (or between the child finishing and this controller
-        ingesting its result). Resume that exact child task — never start a fresh duplicate —
-        before doing anything else, mirroring AgentLoop's own `_reconcile_pending_intent`."""
+        delegate was running (or between the delegate finishing and this controller ingesting
+        its result). Resume that exact delegate — never start a fresh duplicate — before doing
+        anything else, mirroring AgentLoop's own `_reconcile_pending_intent`. Branches on the
+        persisted `substrate` (Phase 4): a plain AgentLoop child resumes via `AgentLoop.resume`
+        exactly as before; a batch/workflow delegate reopens its own already-durable store at
+        the persisted `delegate_dir`/id and simply calls `.run()` again — BatchOrchestrator/
+        WorkflowOrchestrator already reconcile their own in-flight work items on `.run()`, so
+        no new resume mechanism is needed here, only reconstructing the same object with the
+        same on-disk identity. A dangling research_discovery delegate has no partial state of
+        its own (one bounded, read-only search round) — resumption simply retries the exact
+        same objective."""
         events = self.event_store.all_events(self.control_task_id)
         started = {e.payload.get("child_task_id"): e for e in events if e.type == EventType.DELEGATE_STARTED}
         resolved = {e.payload.get("child_task_id") for e in events if e.type == EventType.DELEGATE_RESULT}
@@ -1107,11 +1411,38 @@ class GeneralAgentController:
         child_task_id = dangling[-1]
         event = started[child_task_id]
         subgoal = event.payload["subgoal"]
+        substrate = event.payload.get("substrate", "agent_loop")
+        if substrate == "batch":
+            return await self._resume_batch_delegate(task, subgoal, event)
+        if substrate == "workflow":
+            return await self._resume_workflow_delegate(task, subgoal, event)
+        if substrate == "research_discovery":
+            objective = event.payload.get("objective", subgoal)
+            return await self._run_discovery_and_replan(task, subgoal, objective)
         loop = AgentLoop.resume(self.config, child_task_id)
         if self._child_llama_client_factory is not None:
             loop.llama = self._child_llama_client_factory()
         child_state = await loop.run(max_steps=self.config.agent.max_steps_per_subgoal)
         return await self._handle_subgoal_child_result(task, subgoal, child_task_id, child_state)
+
+    async def _resume_batch_delegate(self, task: TaskRecord, subgoal: str, event: Event) -> TaskState:
+        batch_id = event.payload["child_task_id"]
+        batch_dir = Path(event.payload["delegate_dir"])
+        final = await self._run_batch_delegate(batch_dir, batch_id)
+        self._ingest_batch_result(subgoal, batch_id, final)
+        return await self._finish_delegate_step(task, success=True)
+
+    async def _resume_workflow_delegate(self, task: TaskRecord, subgoal: str, event: Event) -> TaskState:
+        workflow_id = event.payload["child_task_id"]
+        workflow_dir = Path(event.payload["delegate_dir"])
+        final = await self._run_workflow_delegate(workflow_dir, workflow_id)
+        self._ingest_workflow_result(subgoal, workflow_id, final)
+        if final.get("status") != "completed":
+            return await self._finish_delegate_step(
+                task, success=False,
+                failure_reason=f"repeated_failure: workflow delegate blocked ({final.get('blocked_reason')})",
+            )
+        return await self._finish_delegate_step(task, success=True)
 
     async def _remember_hub_url(self, explicit_target_url: Optional[str]) -> None:
         """Persist the task's starting page once, so every subgoal's child AgentLoop returns

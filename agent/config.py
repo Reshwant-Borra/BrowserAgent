@@ -120,6 +120,17 @@ class AgentControlConfig:
     completion_check_after_subgoal: bool = True
     max_workspace_entities_in_context: int = 12
     max_workspace_evidence_in_context: int = 8
+    # Phase 4 (delegation to existing Batch/Workflow/Research capabilities, architecture doc
+    # section 18/8.1): "deterministic substrate selection before using the LLM" — when the
+    # goal text itself already names at least this many literal target URLs, the controller
+    # skips the initial planning call entirely and goes straight to a delegate_batch decision
+    # (section 8.1: "If a subgoal contains 20 resolved independent URLs... BatchOrchestrator
+    # is the obvious substrate... Only ambiguous structural choices require a controller model
+    # call"). Below this threshold, whether to delegate remains the planner's own explicit
+    # decision (delegate_batch/delegate_workflow/discover_sources are always available to it
+    # regardless of this threshold).
+    batch_delegation_min_targets: int = 3
+    research_discovery_max_sources: int = 8
 
 
 @dataclass

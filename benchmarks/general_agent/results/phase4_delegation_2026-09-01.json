@@ -1,0 +1,82 @@
+{
+  "scale_trials": [
+    {
+      "n": 25,
+      "status": "completed",
+      "elapsed_s": 2.164,
+      "target_count_requested": 25,
+      "completed": 25,
+      "failed": 0,
+      "delegate_started_count": 1,
+      "planner_calls": [
+        "CompletionEvaluation"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "true_positives": 9,
+      "false_positives": 0,
+      "false_negatives": 0
+    },
+    {
+      "n": 50,
+      "status": "completed",
+      "elapsed_s": 4.521,
+      "target_count_requested": 50,
+      "completed": 50,
+      "failed": 0,
+      "delegate_started_count": 1,
+      "planner_calls": [
+        "CompletionEvaluation"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "true_positives": 17,
+      "false_positives": 0,
+      "false_negatives": 0
+    },
+    {
+      "n": 100,
+      "status": "completed",
+      "elapsed_s": 9.615,
+      "target_count_requested": 100,
+      "completed": 100,
+      "failed": 0,
+      "delegate_started_count": 1,
+      "planner_calls": [
+        "CompletionEvaluation"
+      ],
+      "precision": 1.0,
+      "recall": 1.0,
+      "true_positives": 34,
+      "false_positives": 0,
+      "false_negatives": 0
+    }
+  ],
+  "crash_recovery_trials": [
+    {
+      "n": 25,
+      "status": "completed",
+      "delegate_started_count": 1,
+      "delegate_result_count": 1,
+      "completed": 25,
+      "no_duplicate_delegation": true
+    },
+    {
+      "n": 50,
+      "status": "completed",
+      "delegate_started_count": 1,
+      "delegate_result_count": 1,
+      "completed": 50,
+      "no_duplicate_delegation": true
+    },
+    {
+      "n": 100,
+      "status": "completed",
+      "delegate_started_count": 1,
+      "delegate_result_count": 1,
+      "completed": 100,
+      "no_duplicate_delegation": true
+    }
+  ],
+  "phase4_gate_met": true
+}

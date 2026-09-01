@@ -217,14 +217,16 @@ async def test_ask_user_decision_blocks_without_spawning_a_child(tmp_config):
         controller.close()
 
 
-async def test_unsupported_delegate_decision_fails_safe(tmp_config):
-    """Phase 2 implements direct-subgoal execution only; a planner decision naming an
-    unimplemented substrate must block with a clear reason, never crash or silently no-op."""
-    config = _config(tmp_config)
+async def test_delegate_batch_with_no_resolvable_targets_blocks(tmp_config):
+    """Phase 4 implements delegate_batch for real; a decision naming it with nothing
+    resolvable (no explicit URLs in the goal, nothing discovered yet) must still block with a
+    clear reason rather than crash or silently no-op, exactly like any other exhausted replan
+    budget (max_replans=0 forces an immediate block with no second scripted response needed)."""
+    config = _config(tmp_config, max_replans=0)
     planner_client = _SequencedSchemaClient({
         "ControllerDecision": [
             {"decision": "delegate_batch", "reason_code": "independent_targets",
-             "active_subgoal": None, "plan": None, "resource_refs": [],
+             "active_subgoal": "process each independent target", "plan": None, "resource_refs": [],
              "clarification_question": None, "completion_claim": None},
         ],
     })
@@ -236,6 +238,7 @@ async def test_unsupported_delegate_decision_fails_safe(tmp_config):
         state = await controller.run()
         assert state.status == "blocked"
         assert "delegate_batch" in (state.blocked_reason or "")
+        assert "resource_missing" in (state.blocked_reason or "")
     finally:
         controller.close()
 
