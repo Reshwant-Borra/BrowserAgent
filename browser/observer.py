@@ -20,7 +20,7 @@ CANONICAL_INTERACTIVE_SELECTOR = (
     "[role=tab], [role=menuitem], [role=combobox], [role=textbox]"
 )
 
-CANONICAL_TEXT_SELECTOR = "h1, h2, h3, h4, h5, h6, p, li, span"
+CANONICAL_TEXT_SELECTOR = "h1, h2, h3, h4, h5, h6, p, li, span, div"
 
 CANONICAL_MODAL_SELECTOR = '[role="dialog"]'
 

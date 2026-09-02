@@ -71,6 +71,26 @@ _RESEARCH_VERBS = re.compile(
     re.IGNORECASE,
 )
 
+# Acceptance-test finding (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section,
+# RC-4): a single explicit URL used to route unconditionally to SINGLE_SITE regardless of
+# language implying the page is a hub to discover/compare multiple items from ("look at all
+# the widgets listed there, check each one"). That sent a genuinely multi-entity task to the
+# single-page legacy AgentLoop substrate, which has no way to represent "already visited N of
+# M candidates" and looped re-opening the same hub URL until its step budget was exhausted.
+# Same deterministic-marker style as _looks_sequential/_looks_research above — domain-agnostic
+# (applies to widgets, courses, products, files, anything), not a benchmark-specific hack.
+_DISCOVERY_MARKERS = re.compile(
+    r"\beach\s+(?:one|item|page|link|entry|option|listing|result|widget)\b|"
+    r"\bevery\s+(?:one|item|page|link|entry|option|listing|result)\b|"
+    r"\ball\s+(?:the|of\s+the)\s+\w+\s+(?:listed|there|on\s+it|on\s+this\s+page)\b|"
+    r"\bcheck\s+each\b|\bcompare\s+(?:them|all|the)\b|\blook\s+at\s+all\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_discovery(text: str, url_count: int) -> bool:
+    return url_count == 1 and bool(_DISCOVERY_MARKERS.search(text))
+
 
 def extract_urls(text: str) -> list[str]:
     """Extracts URLs exactly as written (trailing punctuation trimmed), preserving the
@@ -174,6 +194,10 @@ def try_deterministic_route(text: str) -> RouterDecision | None:
             result_contract="generic",
             workflow_steps=steps,
         )
+
+    if _looks_discovery(stripped, len(urls)):
+        return None  # discovery language on a single starting URL — defer to the
+        # general-controller-capable semantic/hybrid path rather than the single-page substrate
 
     if len(urls) == 1:
         return RouterDecision(

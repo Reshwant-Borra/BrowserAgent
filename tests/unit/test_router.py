@@ -150,6 +150,30 @@ def test_router_never_invents_targets_beyond_the_text():
     assert set(decision.targets) == {"http://a.test", "http://b.test"}
 
 
+@pytest.mark.parametrize("prompt", [
+    "Go to http://a.test and look at all the widgets listed there, check each one.",
+    "Open http://a.test, check every item, and compare them.",
+    "Go to http://a.test and look at all the products on this page.",
+])
+def test_single_url_with_discovery_language_defers_to_model(prompt):
+    """Acceptance-test finding (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE
+    section, RC-4): a single explicit URL used to route unconditionally to SINGLE_SITE
+    regardless of language implying the page is a hub to discover/compare multiple items
+    from. That sent a real live task to the single-page legacy AgentLoop substrate (no way
+    to track "already visited N of M candidates") which looped re-opening the same hub URL
+    for 200 steps. Discovery-shaped language on a single URL must defer to the model/general-
+    controller path instead of being force-classified as a single-page read."""
+    assert try_deterministic_route(prompt) is None
+
+
+def test_single_url_without_discovery_language_still_routes_single_site():
+    """Negative control: an ordinary single-URL, single-page prompt must be unaffected."""
+    decision = try_deterministic_route("Go to http://a.test and tell me the price.")
+    assert decision is not None
+    assert decision.task_type == TaskType.SINGLE_SITE
+    assert decision.targets == ["http://a.test"]
+
+
 def test_router_accuracy_summary():
     """Aggregate accuracy gate for the deterministic-obvious slice: Section 64 targets
     >=95% on tuned+holdout; this slice (unambiguous-by-construction prompts) should be 100%,

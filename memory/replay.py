@@ -29,6 +29,35 @@ from memory.models import TaskState
 
 _RECENT_ACTIONS_CAP = 20
 
+# check_action_default()'s (agent/verifier.py) default per-action checks when the model
+# supplies no expected_result: these two assert only "something changed" (any state-hash/URL
+# difference passes), never a specific outcome the model actually claimed. A finish decision
+# must not be able to treat a passing check of this shape as evidence the task succeeded — see
+# _handle_finish's use of the "strong_verification" flag this module attaches below.
+#
+# type_value/select_value were tried here too (round 2 of the acceptance corrective pass,
+# docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section): a live task typed a wrong
+# value and finished anyway on the strength of type_value's tautological pass (the field holds
+# exactly what was typed, regardless of whether that was the *right* thing to type). But
+# excluding them broke a different, legitimate live case: a `select` whose very next
+# observation showed the real, correct confirmation text ("Current mode: Compact") was then
+# rejected too, forcing a correct completion into a replan spiral. Unlike meaningful_state_
+# change/back_navigation (which assert nothing about *what* changed), type_value/select_value
+# do assert a specific, real fact about the resulting DOM state — the residual gap (a
+# self-consistently-typed but factually wrong value) is a genuine model fact-recall limitation
+# with no cheap deterministic fix, not a defect in the verification shape itself; documented as
+# a known limitation rather than "fixed" by breaking a correct case to catch an incorrect one.
+_WEAK_VERIFICATION_CHECK_TYPES = frozenset({"meaningful_state_change", "back_navigation"})
+
+
+def _is_strong_verification(verification_result: Optional[dict]) -> bool:
+    if not verification_result or not verification_result.get("passed"):
+        return False
+    checks = verification_result.get("checks") or []
+    if not checks:
+        return False
+    return any(c.get("type") not in _WEAK_VERIFICATION_CHECK_TYPES for c in checks)
+
 
 def replay_task(task_id: str, events: list[Event]) -> TaskState:
     state = TaskState(task_id=task_id)
@@ -60,6 +89,7 @@ def replay_task(task_id: str, events: list[Event]) -> TaskState:
                 "url": action_payload.get("url"),
                 "result_data": action_payload.get("result_data") or {},
                 "verification": "pass" if passed else "fail",
+                "strong_verification": _is_strong_verification(ev.verification_result),
             })
             state.recent_actions = state.recent_actions[-_RECENT_ACTIONS_CAP:]
             state.retry_count = 0 if passed else state.retry_count + 1

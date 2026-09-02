@@ -487,3 +487,213 @@ async def test_discover_sources_then_delegate_batch_ingests_real_candidates(tmp_
             controller.close()
     finally:
         discovery_mod.discover_sources = real_discover_sources
+
+
+# ---- Acceptance-test corrective pass (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE
+# section, RC-2): discover_sources must check known/open resources before ever reaching for a
+# live web search in cdp_attach mode -----------------------------------------------------
+
+async def test_discover_sources_cdp_attach_resolves_open_tabs_without_web_search(tmp_config, monkeypatch):
+    """Three independent live acceptance tasks ("my open course pages", "this page", "the
+    widget pages I have open") all skipped straight to a live open-web search — in one case
+    navigating to and requesting approval to click into a real, unrelated third party's
+    website as if it were the user's own page. router/policy.py's own route() already
+    resolves exactly this class of reference deterministically against the user's actual open
+    tabs (never inventing a target); this proves the controller now calls it, and never
+    reaches research_discovery.discover_sources, when real tabs resolve the reference."""
+    config = _config(tmp_config)
+    config.browser.mode = "cdp_attach"
+    resolved_urls = ["http://127.0.0.1:1/candidate_alpha.html", "http://127.0.0.1:1/candidate_beta.html"]
+
+    async def fake_route(text, client, cfg):
+        from router.schema import RouterDecision, TaskType
+        return RouterDecision(task_type=TaskType.MULTISITE_SWEEP, objective=text, targets=resolved_urls)
+
+    monkeypatch.setattr("agent.controller.route", fake_route)
+
+    async def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("discover_sources must not run a live web search when open tabs already resolved the reference")
+
+    import research.discovery as discovery_mod
+    monkeypatch.setattr(discovery_mod, "discover_sources", _must_not_be_called)
+
+    goal = "Look through the widget pages I have open and tell me which is the best value."
+    outcomes = {u: {"summary": "relevant", "structured_result": {
+        "relevant": True, "summary": "relevant",
+        "findings": [{"field": "summary", "value": "relevant content", "evidence": "relevant content", "source_url": u}],
+    }} for u in resolved_urls}
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "discover_sources", "reason_code": "resource_missing",
+             "active_subgoal": "find the widget pages I have open", "plan": None,
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+            {"decision": "delegate_batch", "reason_code": "independent_targets",
+             "active_subgoal": "inspect each open widget page", "plan": None, "resource_refs": [],
+             "clarification_question": None, "completion_claim": None},
+        ],
+        "CompletionEvaluation": [_SATISFIED],
+    })
+    controller = GeneralAgentController.create_new(
+        config, goal, [], llama_client=planner_client,
+        child_runner=FakeBatchChildRunner(outcomes),
+    )
+    try:
+        state = await controller.run()
+        assert state.status == "completed"
+        events = controller.event_store.all_events(controller.control_task_id)
+        assert not any(
+            e.type == EventType.DELEGATE_STARTED and e.payload.get("substrate") == "research_discovery"
+            for e in events
+        )
+        workspace = controller.workspace_store.load(controller.control_task_id)
+        resolved_sources = [e for e in workspace.entities if e.entity_type == "discovered_source"]
+        assert {e.name for e in resolved_sources} == set(resolved_urls)
+    finally:
+        controller.close()
+
+
+async def test_discover_sources_cdp_attach_unresolved_reference_asks_instead_of_searching(tmp_config, monkeypatch):
+    """The other half of RC-2: when nothing open actually matches the description, the
+    controller must ask for clarification (matching every other dispatch path in this
+    codebase via router/policy.py's NeedsInput), never silently fall through to the open
+    internet and invent a target."""
+    config = _config(tmp_config)
+    config.browser.mode = "cdp_attach"
+    question = "I don't have any matching pages open. Open them or paste the URL."
+
+    async def fake_route(text, client, cfg):
+        from router.policy import NeedsInput
+        from router.plan_schema import TaskPlan, PlanIntent, ExecutionShape
+        plan = TaskPlan(goal=text, intent=PlanIntent.READ, execution_shape=ExecutionShape.SINGLE)
+        return NeedsInput(question=question, plan=plan)
+
+    monkeypatch.setattr("agent.controller.route", fake_route)
+
+    async def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("an unresolved known-resource reference must ask, not search the open web")
+
+    import research.discovery as discovery_mod
+    monkeypatch.setattr(discovery_mod, "discover_sources", _must_not_be_called)
+
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "discover_sources", "reason_code": "resource_missing",
+             "active_subgoal": "find my open course pages", "plan": None,
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+        ],
+    })
+    controller = GeneralAgentController.create_new(
+        config, "Check my open course pages and tell me what's due.", [], llama_client=planner_client,
+    )
+    try:
+        state = await controller.run()
+        assert state.status == "blocked"
+        assert state.blocked_reason == question
+        events = controller.event_store.all_events(controller.control_task_id)
+        blocked = [e for e in events if e.type == EventType.TASK_BLOCKED]
+        assert blocked and blocked[-1].payload.get("kind") == "ask_user"
+    finally:
+        controller.close()
+
+
+async def test_discover_sources_cdp_attach_genuine_web_research_still_searches(tmp_config, monkeypatch):
+    """Negative control: a genuine open-web research request (no open-tab/current-page
+    reference at all) must keep working exactly as before, even in cdp_attach mode — this is
+    what B2-style "research this topic" acceptance tasks depend on."""
+    config = _config(tmp_config)
+    config.browser.mode = "cdp_attach"
+
+    async def fake_route(text, client, cfg):
+        from router.schema import RouterDecision, TaskType, SafetyPolicy
+        return RouterDecision(task_type=TaskType.RESEARCH, objective=text, targets=[],
+                               requires_discovery=True, preferred_policy=SafetyPolicy.READ_ONLY,
+                               result_contract="research")
+
+    monkeypatch.setattr("agent.controller.route", fake_route)
+
+    calls: list[str] = []
+
+    async def fake_discover_sources(cfg, client, objective, profile_dir, max_sources=5, search_engine_url=None):
+        calls.append(objective)
+        return ["https://example.edu/photosynthesis-overview"]
+
+    import research.discovery as discovery_mod
+    monkeypatch.setattr(discovery_mod, "discover_sources", fake_discover_sources)
+
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "discover_sources", "reason_code": "resource_missing",
+             "active_subgoal": "find sources about photosynthesis", "plan": None,
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+            {"decision": "delegate_batch", "reason_code": "independent_targets",
+             "active_subgoal": "read each discovered source", "plan": None, "resource_refs": [],
+             "clarification_question": None, "completion_claim": None},
+        ],
+        "CompletionEvaluation": [_SATISFIED],
+    })
+    controller = GeneralAgentController.create_new(
+        config, "Research how photosynthesis works using reputable sources.", [], llama_client=planner_client,
+        child_runner=FakeBatchChildRunner({
+            "https://example.edu/photosynthesis-overview": {"summary": "relevant", "structured_result": {
+                "relevant": True, "summary": "relevant", "findings": [
+                    {"field": "summary", "value": "relevant content", "evidence": "relevant content",
+                     "source_url": "https://example.edu/photosynthesis-overview"},
+                ],
+            }},
+        }),
+    )
+    try:
+        state = await controller.run()
+        assert calls, "a genuine open-web research request must still reach research_discovery.discover_sources"
+        assert state.status == "completed"
+    finally:
+        controller.close()
+
+
+async def test_discover_sources_cdp_attach_current_page_needs_no_discovery(tmp_config, monkeypatch):
+    """Bug found while rerunning the acceptance campaign after the fix above (docs/
+    BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section, RC-2 rerun): route() correctly
+    classifies a "the current page"-shaped subgoal as SINGLE_SITE with empty targets — router/
+    resources.py's own documented "no requirement, or only a current_page one: empty targets
+    is the existing, correct signal AgentLoop already handles" shape — but the controller's
+    `if not result.targets: return None` fallback treated this identically to "nothing
+    resolved," incorrectly falling through to a live web search anyway for the most
+    unambiguous case of all (no discovery needed whatsoever)."""
+    config = _config(tmp_config)
+    config.browser.mode = "cdp_attach"
+
+    async def fake_route(text, client, cfg):
+        from router.schema import RouterDecision, TaskType
+        return RouterDecision(task_type=TaskType.SINGLE_SITE, objective=text, targets=[], requires_discovery=False)
+
+    monkeypatch.setattr("agent.controller.route", fake_route)
+
+    async def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("a current-page reference needs no discovery at all, let alone a live web search")
+
+    import research.discovery as discovery_mod
+    monkeypatch.setattr(discovery_mod, "discover_sources", _must_not_be_called)
+
+    planner_client = _SequencedSchemaClient({
+        "ControllerDecision": [
+            {"decision": "discover_sources", "reason_code": "resource_missing",
+             "active_subgoal": "identify the key information gaps on the current page", "plan": None,
+             "resource_refs": [], "clarification_question": None, "completion_claim": None},
+            {"decision": "finish", "reason_code": "completion_satisfied",
+             "active_subgoal": None, "plan": None, "resource_refs": [],
+             "clarification_question": None, "completion_claim": "done"},
+        ],
+    })
+    controller = GeneralAgentController.create_new(
+        config, "Tell me what I still need to know from this page.", [], llama_client=planner_client,
+    )
+    try:
+        state = await controller.run()
+        assert state.status == "completed"
+        events = controller.event_store.all_events(controller.control_task_id)
+        assert not any(
+            e.type == EventType.DELEGATE_STARTED and e.payload.get("substrate") == "research_discovery"
+            for e in events
+        )
+    finally:
+        controller.close()

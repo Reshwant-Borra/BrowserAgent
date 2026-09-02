@@ -1043,9 +1043,26 @@ class AgentLoop:
         result_text = decision.params.get("result", "")
         blob = self._finish_evidence_blob(observation)
         matched = [c for c in task.success_criteria if c.lower() in blob]
+        # Acceptance-test finding (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE
+        # section, RC-1): `any(... == "pass" ...)` over the *whole* recent-actions window let a
+        # `finish` through on the strength of an action from several steps back, even when the
+        # action immediately preceding `finish` had already failed against a page now showing
+        # an explicit error the model ignored (observed live: two independent cases where the
+        # model looped re-clicking a "Verify"/link action that kept failing, then finished
+        # anyway because an earlier open_url in the same task had structurally passed). Only
+        # the LAST action matters for "is there evidence *right now* that this specific finish
+        # claim is warranted" — and it must be a genuine assertion (a real expected value was
+        # checked), not merely `check_action_default`'s weak "did anything change" default for
+        # clicks/back-navigation, which passes even when the change is a visible failure state.
+        last_action = state.recent_actions[-1] if state.recent_actions else None
+        has_terminal_action_evidence = bool(
+            last_action
+            and last_action.get("verification") == "pass"
+            and last_action.get("strong_verification")
+        )
         if (
             not task.success_criteria
-            and not any(r.get("verification") == "pass" for r in state.recent_actions)
+            and not has_terminal_action_evidence
             and not self._has_evidence_backed_structured_result(decision)
         ):
             self.event_store.append(self.task_id, step_no, EventType.VERIFICATION_RESULT, {

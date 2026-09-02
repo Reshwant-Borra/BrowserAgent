@@ -59,6 +59,8 @@ from memory.task_state import TaskStateStore
 from memory.workspace_store import WorkspaceStore
 from research import discovery as research_discovery
 from router.extract import extract_urls
+from router.policy import NeedsInput, RoutingError, route
+from router.schema import TaskType
 from workflow.models import WorkflowPolicy
 from workflow.orchestrator import WorkflowOrchestrator
 from workflow.store import WorkflowStore
@@ -825,11 +827,105 @@ class GeneralAgentController:
     async def _discover_sources(self, task: TaskRecord, decision: ControllerDecision) -> TaskState:
         active = decision.active_subgoal or task.goal
         self._mark_subgoal_active(active)
+        if self.config.browser.mode == "cdp_attach":
+            resolved = await self._resolve_against_known_resources(task, active)
+            if resolved is not None:
+                return resolved
         self._append(EventType.DELEGATE_STARTED, {
             "substrate": "research_discovery", "subgoal": active, "child_task_id": self.control_task_id,
             "objective": active,
         })
         return await self._run_discovery_and_replan(task, active, active)
+
+    async def _resolve_against_known_resources(self, task: TaskRecord, objective: str) -> Optional[TaskState]:
+        """Invariant: a subgoal must never reach for a live open-web search (`research_
+        discovery`) before first checking whether it actually refers to a resource
+        BrowserAgent already knows about — the currently attached page, or one of the user's
+        other open tabs (persistent-browser mode only; `launch` mode has no such inventory to
+        check). Live acceptance-test evidence (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL
+        ACCEPTANCE section, RC-2): three independent tasks phrased around the user's own
+        context ("my open course pages", "this page", "the widget pages I have open") all
+        skipped straight to `discover_sources`, and in one case navigated to and requested
+        approval to click into a real, unrelated third party's website — a direct violation
+        of the documented "never invents a URL" promise, since nothing ever checked the
+        actually-open tabs first or asked when none matched.
+
+        Reuses `router/policy.py::route()` verbatim — the exact deterministic
+        classify-then-resolve pipeline (`router/semantic_planner.py` + `router/resources.py`)
+        the legacy/hybrid dispatch path already relies on for this same decision — rather than
+        reimplementing resource resolution here. That pipeline never invents a target: an
+        unresolved open-tab/current-page reference becomes `NeedsInput` (clarification),
+        exactly like every other dispatch path in this codebase. Returns None only when the
+        classification itself determined this is a genuine open-web research need (an
+        `OPEN_RESEARCH`-shaped plan with no open-tab/current-page resource requirement), in
+        which case the caller proceeds to the pre-existing live web search unchanged — this is
+        what keeps a real "research this topic" request (no first-person/current-context
+        reference at all) working exactly as before.
+        """
+        try:
+            result = await route(objective, self.llama, self.config)
+        except RoutingError:
+            return None  # classification itself failed — fall back to the pre-existing behavior
+        if isinstance(result, NeedsInput):
+            return self._block(result.question, kind="ask_user")
+        if result.task_type == TaskType.RESEARCH and result.requires_discovery and not result.targets:
+            return None  # genuine open-web research need — let the caller run discover_sources
+        if result.task_type == TaskType.SINGLE_SITE and not result.targets:
+            # CURRENT_PAGE (router/resources.py's own documented shape: "no requirement, or
+            # only a current_page one: empty targets is the existing, correct signal AgentLoop
+            # already handles"). Nothing to discover at all — the very next subgoal should
+            # just work with whatever's already attached, exactly like every other current-
+            # page task in this codebase. Fixing this bug found during the acceptance-fix
+            # rerun (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section): the
+            # earlier `if not result.targets: return None` below treated this identically to
+            # "nothing resolved," incorrectly falling through to a live web search anyway.
+            return await self._replan_or_block(
+                task, reason_hint=f"resource_discovered: {objective!r} refers to the current page; no discovery needed",
+            )
+        if not result.targets:
+            return None  # defensive: nothing resolved and not a NeedsInput either
+
+        result_event_id = self._append(EventType.DELEGATE_RESULT, {
+            "substrate": "known_resource", "subgoal": objective, "child_task_id": self.control_task_id,
+            "status": "completed", "resolved_targets": result.targets,
+        })
+        workspace = self.workspace_store.load(self.control_task_id)
+        add_facts: list[WorkspaceFact] = []
+        add_entities: list[WorkspaceEntity] = []
+        add_evidence: list[EvidenceRef] = []
+        if result.task_type == TaskType.MULTISITE_SWEEP:
+            # Several real, already-open tabs matched — the same shape as several web-
+            # discovered sources, so later subgoals can inspect/compare them as entities.
+            for url in result.targets:
+                entity_id = f"ent_{uuid.uuid4().hex[:10]}"
+                add_entities.append(WorkspaceEntity(
+                    id=entity_id, entity_type=_DISCOVERED_SOURCE_ENTITY_TYPE, name=url,
+                    attributes={"url": url},
+                ))
+                add_evidence.append(EvidenceRef(
+                    entity_id=entity_id, source_event_id=result_event_id, source_url=url,
+                    excerpt=f"resolved from the user's own open browser tabs for: {objective}",
+                ))
+        else:
+            # SINGLE_SITE: one already-open/current resource, not a list of candidates to
+            # compare — anchor it as the task's hub so subsequent subgoals' AgentLoop
+            # delegation actually attaches there (mirrors _remember_hub_url's idempotency).
+            target_url = result.targets[0]
+            if _HUB_URL_FACT_KEY not in workspace.facts:
+                add_facts.append(WorkspaceFact(key=_HUB_URL_FACT_KEY, value=target_url))
+            fact_key = f"known_resource::{objective}"
+            add_facts.append(WorkspaceFact(key=fact_key, value=target_url))
+            add_evidence.append(EvidenceRef(
+                fact_key=fact_key, source_event_id=result_event_id, source_url=target_url,
+                excerpt=f"resolved from the user's own current browser context for: {objective}",
+            ))
+        self.workspace_store.apply_patch(self.control_task_id, WorkspacePatch(
+            add_facts=add_facts, add_entities=add_entities, add_evidence=add_evidence,
+        ))
+        return await self._replan_or_block(
+            task,
+            reason_hint=f"resource_discovered: resolved {len(result.targets)} known resource(s) for {objective!r}",
+        )
 
     async def _run_discovery_and_replan(self, task: TaskRecord, subgoal: str, objective: str) -> TaskState:
         profile_dir = self.tasks_dir / self.control_task_id / "delegates" / "discovery_browser_profile"

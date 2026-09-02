@@ -45,7 +45,16 @@ class ScriptedLlamaClient:
 
 def decision(action: str, target: Optional[int] = None, params: Optional[dict] = None,
              expected_result: Optional[dict] = None, confidence: float = 0.9) -> str:
+    # verification_mode defaults to "action_default" (not agent/schemas.py::ModelDecision's own
+    # pydantic default of "legacy") to match what a real model decision always emits (see
+    # tests/unit/test_phase1b_contract.py's own assertion of this). "legacy" mode combined
+    # with an empty expected_result skips agent/verifier.py's check_action_default() entirely,
+    # producing a vacuous zero-check "pass" no real decision ever produces — see RC-1
+    # (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section): several scripted tests
+    # were unknowingly relying on this unrealistic vacuous pass as `finish` completion
+    # evidence, which real production decisions never get.
     return json.dumps({
         "action": action, "target": target, "params": params or {},
         "expected_result": expected_result or {}, "confidence": confidence,
+        "verification_mode": "action_default",
     })

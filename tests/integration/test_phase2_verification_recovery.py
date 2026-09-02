@@ -17,7 +17,18 @@ async def test_noop_button_triggers_recovery_escalation(make_agent_loop, fixture
     loop = make_agent_loop("Trigger the no-op button and notice nothing happens", [], [
         decision("open_url", params={"url": fixture_site_url + "/noop.html"}),
         decision("click", target=1, expected_result={"element_present": "nothing happened confirmation"}),
-        decision("finish", params={"result": "confirmed no-op"}),
+        # RC-1 (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section): finish no
+        # longer accepts an unrelated earlier structural pass as completion evidence, so the
+        # declared outcome now needs its own evidence — a fresh passing action would instead
+        # reset recovery_level to NORMAL (next_recovery_level's own reset rule), defeating
+        # this test's actual point, so the finish carries its own structured_result findings.
+        decision("finish", params={
+            "result": "confirmed no-op",
+            "structured_result": {"findings": [{
+                "field": "outcome", "value": "no-op confirmed",
+                "evidence": "Do Nothing button still present; no page state change occurred",
+            }]},
+        }),
     ])
     state = await loop.run(max_steps=10)
     assert state.status == "completed"
@@ -45,14 +56,30 @@ async def test_delayed_navigation_is_awaited_correctly(make_agent_loop, fixture_
     assert state.status == "completed"
     events = read_events(loop)
     verifications = [e for e in events if e.type == EventType.VERIFICATION_RESULT]
-    assert all(e.verification_result["passed"] for e in verifications if e.verification_result)
+    # The click's own default "meaningful_state_change" check (RC-1's test-harness realism
+    # fix: verification_mode now defaults to "action_default", matching real model output)
+    # correctly reports no *immediate* DOM change — the button's effect is a delayed
+    # setTimeout navigation, not a synchronous one — so it need not pass on its own; what
+    # actually matters is that the explicit `wait` step's own real assertion did.
+    wait_checks = [
+        c for e in verifications if e.verification_result
+        for c in e.verification_result["checks"] if c["type"] == "url_contains"
+    ]
+    assert wait_checks and all(c["passed"] for c in wait_checks)
 
 
 async def test_wrong_navigation_is_caught_by_verifier(make_agent_loop, fixture_site_url):
     loop = make_agent_loop("Continue on the wrong-nav page", [], [
         decision("open_url", params={"url": fixture_site_url + "/wrongnav.html"}),
         decision("click", target=1, expected_result={"url_contains": "wrongnav_next.html"}),
-        decision("finish", params={"result": "done"}),
+        # See RC-1 note above: finish needs its own evidence now, not a resettable fresh pass.
+        decision("finish", params={
+            "result": "done",
+            "structured_result": {"findings": [{
+                "field": "outcome", "value": "landed on unexpected page",
+                "evidence": "This is not where you expected to land",
+            }]},
+        }),
     ])
     state = await loop.run(max_steps=10)
     assert state.status == "completed"
@@ -70,7 +97,14 @@ async def test_navigation_loop_is_detected(make_agent_loop, fixture_site_url):
         decision("click", target=1),  # b -> a
         decision("click", target=1),  # a -> b
         decision("click", target=1),  # b -> a
-        decision("finish", params={"result": "done"}),
+        # See RC-1 note above: finish needs its own evidence now, not a resettable fresh pass.
+        decision("finish", params={
+            "result": "done",
+            "structured_result": {"findings": [{
+                "field": "outcome", "value": "loop between pages A and B",
+                "evidence": "Loop Page A / Loop Page B link back and forth to each other",
+            }]},
+        }),
     ])
     state = await loop.run(max_steps=10)
     assert state.status == "completed"
@@ -92,7 +126,14 @@ async def test_repeated_readonly_action_with_no_state_change_triggers_recovery_e
         decision("open_url", params={"url": url}),
         decision("open_url", params={"url": url}),
         decision("open_url", params={"url": url}),
-        decision("finish", params={"result": "report-v3.zip"}),
+        # See RC-1 note above: finish needs its own evidence now, not a resettable fresh pass.
+        decision("finish", params={
+            "result": "report-v3.zip",
+            "structured_result": {"findings": [{
+                "field": "build_filename", "value": "report-v3.zip",
+                "evidence": "Build filename: report-v3.zip",
+            }]},
+        }),
     ])
     state = await loop.run(max_steps=10)
     assert state.status == "completed"
@@ -119,7 +160,14 @@ async def test_repeated_readonly_action_with_changing_hash_still_triggers_recove
         decision("open_url", params={"url": url}),
         decision("open_url", params={"url": url}),
         decision("open_url", params={"url": url}),
-        decision("finish", params={"result": "report-v3.zip"}),
+        # See RC-1 note above: finish needs its own evidence now, not a resettable fresh pass.
+        decision("finish", params={
+            "result": "report-v3.zip",
+            "structured_result": {"findings": [{
+                "field": "build_filename", "value": "report-v3.zip",
+                "evidence": "Build filename: report-v3.zip",
+            }]},
+        }),
     ])
     state = await loop.run(max_steps=10)
     assert state.status == "completed"
@@ -141,7 +189,14 @@ async def test_repeated_wait_with_no_state_change_does_not_trigger_loop_escalati
         decision("wait", params={"ms": 1}),
         decision("wait", params={"ms": 1}),
         decision("wait", params={"ms": 1}),
-        decision("finish", params={"result": "done waiting"}),
+        # See RC-1 note above: finish needs its own evidence now, not a resettable fresh pass.
+        decision("finish", params={
+            "result": "done waiting",
+            "structured_result": {"findings": [{
+                "field": "build_filename", "value": "report-v3.zip",
+                "evidence": "Build filename: report-v3.zip",
+            }]},
+        }),
     ])
     state = await loop.run(max_steps=10)
     assert state.status == "completed"
@@ -205,6 +260,77 @@ async def test_finish_with_empty_structured_result_and_no_prior_action_is_still_
         if e.type == EventType.MODEL_DECISION and e.payload.get("error") == "model_completion_error"
     ]
     assert decision_errors, "the unevidenced finish should have been rejected at least once"
+    assert state.status == "completed"
+
+
+async def test_finish_after_only_weak_verification_is_rejected(make_agent_loop, fixture_site_url):
+    """Acceptance-test finding (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE
+    section, RC-1): a `click` with no expected_result only gets `check_action_default`'s
+    weak "meaningful_state_change" check (did the page change at all, regardless of whether
+    the change was good or bad) — this used to be enough, on its own, to satisfy `finish`'s
+    "no success_criteria, but *some* prior action verified pass" fallback. Two independent
+    live acceptance tasks exploited exactly this: the model clicked a button whose only
+    effect was to render an on-page error message, and `finish` was accepted anyway because
+    that click had structurally "passed". noop.html's button changes nothing structurally
+    (see test_noop_button_triggers_recovery_escalation above), so it doesn't reproduce this;
+    this uses wizard_confirm.html's Submit button, which does change the page (adds visible
+    status text) without the model ever stating what a *correct* outcome should contain."""
+    loop = make_agent_loop("Submit the application and confirm it went through", [], [
+        decision("open_url", params={"url": fixture_site_url + "/wizard_confirm.html"}),
+        decision("click", target=1),  # no expected_result -> weak "meaningful_state_change" only
+        decision("finish", params={"result": "submitted successfully"}),  # must be rejected
+        decision("extract", params={}),
+        decision("finish", params={
+            "result": "submitted successfully",
+            "structured_result": {"findings": [{
+                "field": "outcome", "value": "submitted",
+                "evidence": "Submitted 1 time(s)",
+            }]},
+        }),
+    ])
+    state = await loop.run(max_steps=10)
+    events = read_events(loop)
+    decision_errors = [
+        e for e in events
+        if e.type == EventType.MODEL_DECISION and e.payload.get("error") == "model_completion_error"
+    ]
+    assert decision_errors, "finish after only a weak (structural-only) verification must be rejected"
+    assert state.status == "completed"
+
+
+async def test_finish_after_weak_last_action_is_rejected_even_with_earlier_strong_pass(
+    make_agent_loop, fixture_site_url,
+):
+    """Negative control distinguishing RC-1's actual fix (check the LAST action, and require
+    it to be a genuine assertion) from a weaker fix that would have merely required *some*
+    strong pass anywhere in history. The task's own first action (open_url) is a real,
+    strong-checked pass — under the old `any(...)` gate this alone was enough to wave through
+    a `finish` issued after a later, purely-structural click, exactly reproducing the live
+    A4/A7 shape (type/open_url succeed, then a click that changes the page to show an error,
+    then an unwarranted finish)."""
+    loop = make_agent_loop("Submit the application and confirm it went through", [], [
+        decision("open_url", params={"url": fixture_site_url + "/wizard_confirm.html"}),  # strong pass
+        decision("click", target=1),  # weak pass — this is the LAST action before finish
+        decision("finish", params={"result": "submitted successfully"}),  # must be rejected
+        decision("extract", params={}),
+        decision("finish", params={
+            "result": "submitted successfully",
+            "structured_result": {"findings": [{
+                "field": "outcome", "value": "submitted",
+                "evidence": "Submitted 1 time(s)",
+            }]},
+        }),
+    ])
+    state = await loop.run(max_steps=10)
+    events = read_events(loop)
+    decision_errors = [
+        e for e in events
+        if e.type == EventType.MODEL_DECISION and e.payload.get("error") == "model_completion_error"
+    ]
+    assert decision_errors, (
+        "an earlier strong pass must not excuse a finish issued right after a later, "
+        "purely structural (weak) verification"
+    )
     assert state.status == "completed"
 
 

@@ -333,7 +333,19 @@ async def test_manual_login_wait_and_continue(tmp_config, tmp_path, fixture_site
          "expected_result": {"url_contains": "127.0.0.1"}, "confidence": 0.9},
         # a login page is observed next -> the driver pauses here without any model call
         {"action": "extract", "target": None, "params": {}, "expected_result": {}, "confidence": 0.9},
-        {"action": "finish", "target": None, "params": {"result": "account status active"}, "expected_result": {}, "confidence": 0.9},
+        # RC-1 (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE section): `extract` is
+        # read-only and has no discrete pass/fail check of its own (agent/verifier.py's
+        # check_action_default has no case for it), so `finish` right after one now needs its
+        # own structured_result evidence — the same, pre-existing bypass real extraction tasks
+        # already use (see test_finish_with_evidence_backed_findings_completes_with_no_prior_
+        # verified_action) — rather than an unrelated earlier action's pass excusing it.
+        {"action": "finish", "target": None, "params": {
+            "result": "account status active",
+            "structured_result": {"findings": [{
+                "field": "account_status", "value": "active",
+                "evidence": "observed after signing in",
+            }]},
+        }, "expected_result": {}, "confidence": 0.9},
     ]
     _patch_model(monkeypatch, FakeUIClient(script=script))
     store = UIJobStore(tmp_path / "ui_jobs.db")

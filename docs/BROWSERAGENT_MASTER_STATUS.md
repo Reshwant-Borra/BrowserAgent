@@ -3749,3 +3749,205 @@ make daily use unsafe to recommend: the system will, in real observed cases, eit
 success when it plainly failed, or quietly substitute a real stranger's website for "your open
 page." The regression suite remaining green throughout confirms these are gaps the existing
 deterministic test suite does not cover, not gaps introduced by this pass.
+
+
+---
+
+## 40. FINAL ACCEPTANCE CORRECTIVE PASS (Round 1)
+
+This section reports a corrective pass against Section 39's baseline. Per its own governing
+instructions, this is **not Phase 7**: no optional components were added, no domain-specific
+logic was introduced, and the baseline dataset (task/batch/workflow `.db` files for every
+failed/inconclusive Section 39 task) was snapshotted to `runtime/acceptance_baseline_snapshot/`
+before any code change, per Section 1's freeze requirement.
+
+### 40.1 Causal chains (first divergence, not just the final symptom)
+
+| Task | Expected | Actual | First divergence | Downstream effect | Root owner |
+|---|---|---|---|---|---|
+| A6 | Discover 3 widgets → compare → answer | 200-step loop re-opening the hub URL | `router/extract.py::try_deterministic_route`'s `len(urls)==1` branch fired despite "look at all... check each one" | Single-page `AgentLoop` substrate has no multi-entity memory → unproductive loop → step budget exhausted | ROUTER |
+| A4 | Read code, enter it, verify | `finish` claimed success while page showed "Error: code does not match" | Verifier's `type`/`click` default checks (`type_value`, `meaningful_state_change`) are tautological — they confirm the action executed, not that its content/outcome was correct — and `_handle_finish`'s "any prior pass" gate accepted any of them from anywhere in history | Model typed the wrong field's value, saw a literal on-page error, and finished anyway | COMPLETION (contributing: RESOURCE_RESOLUTION, fact confusion) |
+| A5 | Change mode, verify, move on | Step 1 never completed (200-step budget) | `browser/observer.py::CANONICAL_TEXT_SELECTOR` excludes `<div>` — the fixture's own confirmation (`<div id="mode-status">`) was structurally invisible to every observation | Model could not observe its own successful `select`, oscillated `click`↔`select` forever | OBSERVATION |
+| A7 | Try obvious route, fail, try alternative | Clicked the same wrong link twice (ignored the visible "Archive" alternative), then `finish`ed on a page reading "No quarterly report is listed here" | Same completion gate as A4 — a `click`'s weak "state changed" pass from anywhere in history satisfied `finish` | False success claim despite the page's own text stating failure | COMPLETION (contributing: PLANNER — no genuine replanning) |
+| A8 | Ask for clarification when nothing open matches | Delegated to `research_discovery`, ran a real web search, navigated to a real, unrelated third party's site, requested approval to click into it | `agent/controller.py::_discover_sources` never checked the actual open-tab inventory before reaching for the open web — `router/resources.py::ResourceResolver`, the exact deterministic mechanism the legacy dispatch path already uses for this, was never wired into the general controller | Documented "never invents a URL" promise violated; approval gate was the only thing that stopped a real navigation | CONTROLLER (contributing: RESOURCE_RESOLVER — the resolver existed but was unreachable from this code path) |
+| C1 | Answer from the current tab, no discovery | Delegated to `research_discovery` for "this page" — an unambiguous current-tab reference | Same missing wiring as A8 | Live web search + hollow final "summary" (see 40.6) | CONTROLLER |
+| C2 | Answer from open tabs, no discovery | Delegated to `research_discovery`; also spawned 5 redundant `agent_loop` child delegates for 2 conceptual subgoals | Same missing wiring as A8, plus a separate delegation-retry inefficiency | 218s for a task whose answer was already on-screen | CONTROLLER (contributing: DELEGATION) |
+
+### 40.2 Clustering
+
+| Root cause | Affected tests | Count | % of Section 39 failures | Deterministic or model | Severity | Fix location | Tests recovered |
+|---|---|---|---|---|---|---|---|
+| RC-1: `finish`'s terminal-evidence gate accepts any prior structurally-weak pass, not just the one relevant to the claim | A4, A7 | 2 | 22% | Deterministic (verification-shape gap) | P0 (fabricated result) | `agent/loop.py::_handle_finish`, `memory/replay.py` | A7 (full); A4 (severity downgraded, see 40.4) |
+| RC-2: general controller never checks known/open resources before reaching for a live web search | A8, C1, C2 | 3 | 33% | Deterministic (missing integration) | P0 (A8: real navigation to an uninvolved external site) / P1 (C1, C2) | `agent/controller.py` (`_discover_sources`, new `_resolve_against_known_resources`) | A8 (severity downgraded), C1 & C2 (architectural defect closed; see 40.6 for residual) |
+| RC-3: `CANONICAL_TEXT_SELECTOR` excludes `<div>` | A5 (step 1) | 1 | 11% | Deterministic | P1 | `browser/observer.py` | A5 step 1 (full) |
+| RC-4: router's single-URL heuristic ignores discovery language | A6 | 1 | 11% | Deterministic | P1 (200-step pathological loop) | `router/extract.py` | A6 (full) |
+| RC-5: deterministic multi-URL sweep has no ranking/synthesis step | A3 | 1 | 11% | Deterministic (routing gap) | P2 | *(not fixed — entangled with the pre-existing, already-documented Section 38.6 entity-ingestion regression; see 40.5)* | none |
+| RC-6: real-site cookie-consent/nav boilerplate crowds out article content | B2 | 1 | 11% | Deterministic (extraction gap, site-general) | P1 | *(not fixed — no safe generic design identified this pass)* | none |
+
+Four of six root causes (RC-1, RC-2, RC-3, RC-4) account for 78% of Section 39's failures and
+were fixed at their correct architectural boundary this round. RC-5/RC-6 were deliberately not
+touched (see 40.5).
+
+### 40.3 The "six defects" — independence and shared boundaries
+
+- **Genuinely independent**: RC-1 (COMPLETION boundary), RC-3 (OBSERVATION→MODEL boundary), and
+  RC-4 (PLAN→SUBGOAL/ROUTER boundary) touch disjoint code paths and were fixed independently
+  with no interaction between them.
+- **RC-2 is the single highest-leverage fix**: it is the *shared* boundary behind three
+  separate Section 39 failures (A8, C1, C2), all instances of the same missing invariant
+  (RESOURCE → BROWSER STATE: "check what's already known before asking the model to invent a
+  discovery step"). One fix at `agent/controller.py::_discover_sources` recovered all three.
+- **Why 484/489/494 regression tests never caught these**: none of RC-1/RC-2/RC-3/RC-4 involve
+  incorrect *mechanics* (the event log, replay, recovery ladder, and batch/workflow
+  orchestration all already behave exactly as designed) — they are gaps in what the existing,
+  correctly-functioning mechanics were never asked to check. RC-1's gate has always existed and
+  always worked exactly as written; it was simply too permissive. RC-2's resolver has always
+  existed and always worked correctly on the legacy path; it was simply never called from the
+  general controller. No test exercised the specific combination (RC-4: single URL + discovery
+  language; RC-1: a *later* weak pass following an *earlier* strong one; RC-2: `cdp_attach`
+  mode + a first-person resource reference) because these combinations were never enumerated
+  as scenarios, not because the code that would have caught them was broken.
+- **One stronger invariant does not eliminate multiple defects here**: RC-1/RC-2/RC-3/RC-4 sit
+  at four genuinely different boundaries (COMPLETION, RESOURCE→BROWSER STATE, OBSERVATION→MODEL,
+  PLAN→SUBGOAL respectively) — no single deterministic check subsumes more than one of them.
+
+### 40.4 Invariant verification (Section 5)
+
+- **B. Resource ownership** — **was violated, now upheld for RC-2's three cases**: the
+  controller now calls the same `router/policy.py::route()` pipeline the legacy path already
+  used, so a known open tab is used directly rather than rediscovered via web search.
+- **F. Completion** — **was violated (A4, A7), partially upheld now**: completion now requires
+  the *specific, most recent* action to carry real (non-tautological) verification, not merely
+  *some* action anywhere in history. A residual gap remains (40.5): `type_value`/`select_value`
+  checks are real assertions about DOM state but say nothing about whether the *committed
+  value itself* was factually correct — genuinely undecidable deterministically without
+  semantic content understanding, and out of scope for a generic fix this round.
+- **G. Task isolation** — held throughout; no cross-task contamination was observed rerunning
+  the same fixture set repeatedly.
+- Invariants A (plan ownership), C (observation grounding), D (result materialization), E
+  (replan consistency) were not found violated in this round's causal chains and were not
+  touched.
+
+### 40.5 What was deliberately NOT fixed, and why
+
+- **RC-5 (A3, no comparison synthesis)**: the architecturally "correct" fix (route
+  comparison-shaped multi-URL prompts to the general controller, which already has
+  `agent/ranking.py` wired for synthesis) was evaluated and rejected this round — Section 38.6
+  of this document already recorded a live, unfixed regression in the general controller's own
+  batch-delegation entity ingestion (only some collected candidates become real
+  `WorkspaceEntity` records). Redirecting RC-5's traffic into that known-broken path risked
+  trading a mild "under-delivers, but returns real correct facts" failure for a worse "produces
+  nothing at all" failure. Left as a documented, isolated finding rather than fixed blind.
+- **RC-6 (B2, cookie-banner/nav-chrome crowding out article content)**: real-website-specific,
+  requires either a generic boilerplate-detection heuristic or richer observation — no design
+  was found this round that is both generic (not a per-site selector) and low-risk. Deferred.
+- **A4's residual gap** (type a self-consistent but factually wrong value, then finish): a
+  second, narrower fix (excluding `type_value`/`select_value` from "strong" evidence) was
+  implemented, tested, and then **reverted** after it was found to break a *legitimate* live
+  case (A5's `select` — see 40.6) — a worse trade (blocking correct completions to catch one
+  incorrect one). Documented as a known `MODEL_RELIABILITY`-adjacent limitation rather than
+  patched a third time, per the "do not endlessly patch" instruction.
+- **RC-7 (newly discovered this round, not in Section 39's original six)**: the general
+  controller's final job-level `summary` is the plan's subgoal *titles* concatenated, not a
+  synthesized answer from the workspace's actual entities/facts — visible on C1 and C2 only
+  once RC-2 stopped the `research_discovery` detour that had been masking it. A real, generic,
+  P1-severity defect; not fixed this round (a fresh discovery late in an already-long pass, and
+  the instructions cap this session at two corrective rounds spent on the *original* six
+  causes) — flagged as the top priority for a subsequent pass.
+
+### 40.6 Regression tests added (each reproduces the real failure, fails pre-fix, passes post-fix)
+
+- `tests/unit/test_observation.py::test_div_status_text_appears_in_visible_text` (RC-3)
+- `tests/unit/test_router.py::test_single_url_with_discovery_language_defers_to_model` (×3
+  parametrized) and `test_single_url_without_discovery_language_still_routes_single_site`
+  (RC-4, plus its own negative control)
+- `tests/integration/test_phase2_verification_recovery.py::test_finish_after_only_weak_
+  verification_is_rejected` and `test_finish_after_weak_last_action_is_rejected_even_with_
+  earlier_strong_pass` (RC-1)
+- `tests/integration/test_general_controller_delegation.py::test_discover_sources_cdp_attach_
+  resolves_open_tabs_without_web_search`, `..._unresolved_reference_asks_instead_of_searching`,
+  `..._genuine_web_research_still_searches` (RC-2, including its own negative control
+  preserving real research capability), and `..._current_page_needs_no_discovery` (a second,
+  narrower RC-2 bug found and fixed *during this pass's own acceptance rerun* — see below)
+
+Six pre-existing tests needed updating, not because their own intent was wrong, but because
+they had been unknowingly relying on the *unrealistic* test-harness default (`decision()`
+defaulted to `verification_mode="legacy"`, which — combined with an empty `expected_result` —
+produces a vacuous zero-check "pass" no real model decision ever emits; confirmed by
+`test_phase1b_contract.py`'s own assertion that real decisions always use `"action_default"`).
+Fixed the harness default (`tests/integration/fake_llama.py`) and gave each affected test's
+final `finish` real `structured_result` evidence — the same, pre-existing bypass mechanism
+genuine extraction tasks already use — rather than relying on an unrelated earlier action's
+pass: `test_noop_button_triggers_recovery_escalation`, `test_wrong_navigation_is_caught_by_
+verifier`, `test_navigation_loop_is_detected`, `test_repeated_readonly_action_with_no_state_
+change_triggers_recovery_escalation`, `test_repeated_readonly_action_with_changing_hash_still_
+triggers_recovery_escalation`, `test_repeated_wait_with_no_state_change_does_not_trigger_loop_
+escalation`, plus `test_delayed_navigation_is_awaited_correctly` (relaxed to check the `wait`
+step's own real assertion rather than requiring every verification in the trace to pass — a
+click's own immediate-effect check legitimately fails when its real effect is a delayed
+navigation) and `test_ui_jobs.py::test_manual_login_wait_and_continue` (given real
+`structured_result` evidence for its own `finish`, since its last action, `extract`, has no
+discrete pass/fail check of its own by design).
+
+**A second RC-2 bug was found and fixed during this round's own acceptance rerun** (not part
+of the original six): `route()` correctly classifies a "current page" reference as
+`SINGLE_SITE` with empty targets (the documented, correct "use whatever's attached" signal),
+but `_resolve_against_known_resources`'s defensive `if not result.targets: return None` treated
+that identically to "nothing resolved," incorrectly falling through to a web search anyway for
+the single most unambiguous case. Fixed and covered by
+`test_discover_sources_cdp_attach_current_page_needs_no_discovery`.
+
+### 40.7 Full regression
+
+`pytest tests/ -q` — **495 passed, 1 skipped, 0 failed**, both immediately after Round 1's four
+fixes and again after the CURRENT_PAGE bug fix above. Zero production-code regressions
+introduced; every pre-existing test that needed updating was updated for a documented, correct
+reason (test-harness realism or evidence-bypass usage), not to paper over a real behavior
+change.
+
+### 40.8 Acceptance rerun: before → after
+
+Same prompts, same fixtures, same `config/acceptance.yaml` (`control_mode: hybrid`,
+`browser.mode: cdp_attach`), same qwen3:8b/RTX 4070 environment, UI server restarted to load
+the fixed code, tabs reset to a clean baseline before each rerun.
+
+| Task | Before | After | Notes |
+|---|---|---|---|
+| A6 | FAIL — 200-step nav loop | **PASS** | Correct grounded answer: "Beta Widget, price=$10.00, rating=4.8/5" |
+| A4 | FAIL — false `finish` ("Verified" claim, page showed an error) | FAIL — honest step-budget exhaustion, **no false claim** | Root cause narrowed from architecture (COMPLETION gate) to `MODEL_RELIABILITY` (persistent confusion between "project name" and "project code" over 100+ attempts) |
+| A5 | FAIL — step 1 never completes (200 steps) | Step 1 **now completes correctly and honestly** ("The mode is already set to Compact", verified: true); step 2 fails for a newly-exposed, unrelated reason (model navigates to a third page mid-task) | Div-selector fix directly confirmed working; step 2's issue was invisible in the baseline since step 1 never got that far |
+| A7 | FAIL — false `finish` (page read "No quarterly report is listed here") | FAIL — honest `ACTION_LOOP`/timeout, **no false claim** | Same P0→P1 downgrade pattern as A4; genuine "try the untried alternative" replanning gap remains, not addressed by any of RC-1–RC-4 |
+| A8 | FAIL — real web search, navigated toward an uninvolved third party's live website | Still FAIL by strict answer-quality standard, but the **security-relevant defect is closed**: zero external navigation, resolution stays within the user's own already-open local tabs | Residual: the small model's own tab-selection sub-call (pre-existing `router/resources.py` infrastructure) picked 2 unrelated *local* tabs instead of correctly returning "no match" |
+| C1 | FAIL — unwarranted `research_discovery` | Still FAIL (hollow summary, RC-7), but **no research_discovery call**, ~25% faster | RC-2 confirmed working; RC-7 is the new blocker |
+| C2 | FAIL — unwarranted `research_discovery` + 5 redundant delegate attempts | Still FAIL (hollow summary, RC-7), but **no research_discovery call**, duration 218s → 130s | Same pattern as C1 |
+
+**Overall/Tier A/Tier C/novel-generalization scores remain below every release gate** — this
+round fixed real, severe architectural defects but did not lift raw pass/fail counts anywhere
+near the required thresholds (only A6 flips a strict PASS/FAIL verdict). The release gates in
+Section 15 are unchanged and are **not** met. What changed is the *character* of the remaining
+failures: two of the most dangerous patterns in Section 39 (fabricated success claims;
+inventing/visiting a real external site) are now either eliminated or substantially narrowed
+into honest, safe failure modes, and the newly-exposed RC-7 (hollow final synthesis) is now the
+clearest, single highest-priority target for a next pass.
+
+### 40.9 Safety / memory / crash-resume (unchanged from Section 39 except where noted)
+
+- **Prompt injection (A10)**: unaffected by this round's changes, still PASS.
+- **Consequential-action approval**: unaffected, still correctly gates and respects denial.
+- **"Never invents a URL"**: materially improved — A8's live rerun no longer reaches the open
+  internet at all (see 40.8); the residual failure mode is now bounded to the user's own
+  already-open local resources, a categorically less severe class of mistake.
+- **Memory/replay**: `test_workspace_rebuild.py` still 3/3 (unaffected, no production
+  storage-layer code was touched this round).
+- **Crash/resume**: `test_phase3_crash_recovery.py` still passing (3/3); not re-verified live
+  this round (out of scope for a corrective pass focused on the six named root causes).
+
+### 40.10 Git
+
+Commit includes: `agent/controller.py`, `agent/loop.py`, `browser/observer.py`,
+`memory/replay.py`, `router/extract.py` (production fixes, all four generic and all
+documented above); `tests/integration/fake_llama.py`, `tests/integration/test_general_
+controller_delegation.py`, `tests/integration/test_phase2_verification_recovery.py`,
+`tests/integration/test_ui_jobs.py`, `tests/unit/test_observation.py`,
+`tests/unit/test_router.py` (new/updated regression tests); this document. No optional Phase 6
+components, no domain-specific logic, no site-specific selectors were added.

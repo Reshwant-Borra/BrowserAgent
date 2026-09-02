@@ -68,6 +68,23 @@ async def test_heading_and_text_appear_in_visible_text(page):
     assert any("visible paragraph" in t for t in obs.visible_text)
 
 
+async def test_div_status_text_appears_in_visible_text(page):
+    """Acceptance-test finding (docs/BROWSERAGENT_MASTER_STATUS.md's FINAL ACCEPTANCE
+    section, RC-3): CANONICAL_TEXT_SELECTOR used to omit `<div>`, the single most common
+    real-world container for status/confirmation text. A live task correctly `select`ed a
+    dropdown option, but could never observe the resulting "Current mode: Compact" status
+    div, so it endlessly oscillated between the wrong action (click) and the right one
+    (select) until its step budget was exhausted. This reproduces the minimal shape: a status
+    div with no other wrapping heading/paragraph/span/list element around its text."""
+    await page.set_content(
+        '<html><body><h1>Preferences</h1>'
+        '<div id="mode-status">Current mode: Compact</div>'
+        '</body></html>'
+    )
+    obs = await extract_observation(page, max_chars=5000, max_visible_text_items=20)
+    assert any("Current mode: Compact" in t for t in obs.visible_text)
+
+
 async def test_state_hash_present_and_stable_across_identical_content(page):
     await page.set_content(FIXTURE_HTML)
     obs1 = await extract_observation(page, max_chars=5000, max_visible_text_items=20)
