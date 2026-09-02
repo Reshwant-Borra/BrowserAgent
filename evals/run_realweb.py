@@ -42,8 +42,19 @@ class TaskResult:
     goal: str
     success: bool
     status: str
+    trial: int = 1
     failures: list[str] = field(default_factory=list)
     answer: str = ""
+    #: FULL_SUCCESS / PARTIAL_GROUNDED / SAFE_FAILURE / UNSUPPORTED_SUCCESS (V2 hardening §29).
+    outcome: str = ""
+    unsupported_claims: list[str] = field(default_factory=list)
+    source_coverage: str = ""
+    evidence_records: int = 0
+    evidence_rejected: int = 0
+    resources_observed: int = 0
+    computations: int = 0
+    compute_errors: int = 0
+    grounding_challenges: int = 0
     steps: int = 0
     llm_calls: int = 0
     llm_s: float = 0.0
@@ -110,13 +121,33 @@ def check(expect: dict[str, Any], state: TaskState) -> list[str]:
         if not any(required in visited for visited in state.domains):
             problems.append(f"never visited {required} (visited: {', '.join(state.domains) or 'nothing'})")
 
+    # Grounding gates (V2 hardening §28). These are not per-task expectations so much as
+    # standing conditions: a task that produces the right words while asserting something no
+    # page showed has not passed, whatever its answer_contains says.
+    if expect.get("no_unsupported_claims", True) and state.unsupported_claims:
+        problems.append("answer carries unsupported claims: "
+                        + "; ".join(state.unsupported_claims[:3]))
+
+    min_sources = expect.get("min_visited_sources")
+    if min_sources and state.metrics.resources_observed < int(min_sources):
+        problems.append(f"observed only {state.metrics.resources_observed} sources, "
+                        f"wanted {min_sources}")
+
+    min_evidence = expect.get("min_evidence")
+    if min_evidence and state.metrics.evidence_records < int(min_evidence):
+        problems.append(f"only {state.metrics.evidence_records} evidence records, "
+                        f"wanted {min_evidence}")
+
+    if expect.get("requires_computation") and state.metrics.computations == 0:
+        problems.append("did no deterministic computation")
+
     return problems
 
 
 async def run_task(task: dict, config, memory: Optional[MemoryStore], out_dir: Path,
-                   verbose: bool) -> TaskResult:
+                   verbose: bool, trial: int = 1) -> TaskResult:
     result = TaskResult(id=task["id"], capability=task.get("capability", ""), goal=task["goal"],
-                        success=False, status="not_started")
+                        success=False, status="not_started", trial=trial)
     backend = build_session(config, explicit_target_url=task.get("start_url"))
     started = time.time()
     try:
@@ -134,10 +165,11 @@ async def run_task(task: dict, config, memory: Optional[MemoryStore], out_dir: P
         session=BrowserSession(backend),
         client=client,
         memory=memory,
-        task_dir=out_dir / task["id"],
+        task_dir=out_dir / f"{task['id']}-t{trial}",
         budget=ContextBudget(max_total_tokens=config.v2.max_total_tokens, blocks={
             "goal": 120, "memory": config.v2.memory_tokens, "state": config.v2.state_tokens,
-            "recent": 260, "tabs": 140, "page": config.v2.page_tokens, "hint": 260,
+            "evidence": config.v2.evidence_tokens, "recent": 260, "tabs": 140,
+            "page": config.v2.page_tokens, "hint": 260,
         }),
         limits=LoopLimits(max_steps=int(task.get("max_steps", config.v2.max_steps))),
         max_output_tokens=config.v2.max_output_tokens,
@@ -147,6 +179,7 @@ async def run_task(task: dict, config, memory: Optional[MemoryStore], out_dir: P
         takeover=None,
         on_step=_printer(task["id"]) if verbose else None,
         memory_top_k=config.v2.memory_top_k,
+        evidence_top_k=config.v2.evidence_top_k,
     )
 
     try:
@@ -157,17 +190,33 @@ async def run_task(task: dict, config, memory: Optional[MemoryStore], out_dir: P
                 await agent.session._goto(backend.page, task["start_url"])
             except Exception as exc:
                 result.error = f"start_url did not load ({type(exc).__name__}); agent started anyway"
-        state = await agent.run(task["goal"], task_id=task["id"])
+        state = await agent.run(task["goal"], task_id=f"{task['id']}-t{trial}")
     except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"
         result.total_s = time.time() - started
         return result
     finally:
+        # Unattended, so nobody is going to look at the tabs this task opened. Leaving them
+        # is how a long suite ends up with several hundred tabs in one profile and takes the
+        # browser down with it; the agent itself still never closes a tab it did not open.
+        try:
+            await agent.session.close_agent_tabs()
+        except Exception:
+            pass
         await backend.close()
 
     metrics = state.metrics
     result.status = state.status
     result.answer = state.answer
+    result.outcome = state.outcome
+    result.unsupported_claims = list(state.unsupported_claims)
+    result.source_coverage = state.source_coverage
+    result.evidence_records = metrics.evidence_records
+    result.evidence_rejected = metrics.evidence_rejected
+    result.resources_observed = metrics.resources_observed
+    result.computations = metrics.computations
+    result.compute_errors = metrics.compute_errors
+    result.grounding_challenges = metrics.grounding_challenges
     result.steps = state.step
     result.llm_calls = metrics.llm_calls
     result.llm_s = round(metrics.llm_ms / 1000, 2)
@@ -224,28 +273,100 @@ async def main_async(args) -> int:
     memory = None if args.no_memory else MemoryStore(args.memory_db or config.v2.memory_db)
 
     results: list[TaskResult] = []
-    for task in tasks:
-        print(f"\n=== {task['id']} [{task.get('capability', '')}]\n    {task['goal']}", flush=True)
-        result = await run_task(task, config, memory, out_dir, verbose=not args.quiet)
-        results.append(result)
-        verdict = "PASS" if result.success else "FAIL"
-        detail = result.error or ("; ".join(result.failures) or "")
-        print(f"    -> {verdict}  {result.steps} steps, {result.llm_calls} calls, "
-              f"{result.total_s}s, max prompt {result.max_prompt_chars} chars", flush=True)
-        if detail:
-            print(f"       {detail}", flush=True)
-        if result.answer:
-            print(f"       answer: {result.answer[:300]}", flush=True)
+    for trial in range(1, args.trials + 1):
+        if args.trials > 1:
+            print(f"\n########## trial {trial} of {args.trials}", flush=True)
+        for task in tasks:
+            print(f"\n=== {task['id']} [{task.get('capability', '')}]\n    {task['goal']}",
+                  flush=True)
+            result = await run_task(task, config, memory, out_dir, verbose=not args.quiet,
+                                    trial=trial)
+            results.append(result)
+            verdict = "PASS" if result.success else "FAIL"
+            detail = result.error or ("; ".join(result.failures) or "")
+            print(f"    -> {verdict} [{result.outcome or 'n/a'}]  {result.steps} steps, "
+                  f"{result.llm_calls} calls, {result.total_s}s, "
+                  f"{result.resources_observed} sources, {result.evidence_records} evidence, "
+                  f"max prompt {result.max_prompt_chars} chars", flush=True)
+            if detail:
+                print(f"       {detail}", flush=True)
+            if result.answer:
+                print(f"       answer: {result.answer[:300]}", flush=True)
 
     if memory is not None:
         memory.close()
 
-    passed = sum(1 for r in results if r.success)
-    summary = {
-        "suite": args.suite,
+    summary = summarise(args.suite, stamp, results)
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    _print_summary(summary, out_dir)
+    return 0 if summary["passed"] == summary["total"] and not summary["gates"]["violations"] else 1
+
+
+def summarise(suite: str, stamp: str, results: list[TaskResult]) -> dict[str, Any]:
+    """Aggregate across trials. A single run's pass count says very little about a stochastic
+    model, so per-task pass rate and spread are reported alongside it (V2 hardening §27)."""
+    by_task: dict[str, list[TaskResult]] = {}
+    for result in results:
+        by_task.setdefault(result.id, []).append(result)
+
+    per_task = []
+    for task_id, runs in by_task.items():
+        passes = sum(1 for r in runs if r.success)
+        per_task.append({
+            "id": task_id,
+            "trials": len(runs),
+            "passed": passes,
+            "pass_rate": round(passes / len(runs), 2),
+            "flaky": 0 < passes < len(runs),
+            "steps": _spread([r.steps for r in runs]),
+            "llm_calls": _spread([r.llm_calls for r in runs]),
+            "actions": _spread([r.actions for r in runs]),
+            "seconds": _spread([r.total_s for r in runs]),
+            "max_prompt_chars": _spread([r.max_prompt_chars for r in runs]),
+            "outcomes": sorted({r.outcome for r in runs if r.outcome}),
+            "failures": sorted({f for r in runs for f in r.failures}),
+        })
+
+    # A run that stopped to ask for a human is none of the four spec outcomes — it has not
+    # finished at all — so it is counted separately rather than silently dropped, which would
+    # make the outcome tallies quietly fail to add up to the number of runs.
+    outcomes: dict[str, int] = {}
+    for result in results:
+        outcomes[result.outcome or "INCOMPLETE"] = outcomes.get(result.outcome or "INCOMPLETE", 0) + 1
+
+    # The release gates that are about correctness rather than task success.
+    violations = []
+    for result in results:
+        if result.outcome == "UNSUPPORTED_SUCCESS":
+            violations.append(f"{result.id} t{result.trial}: UNSUPPORTED_SUCCESS")
+        if result.compute_errors and not result.computations:
+            violations.append(f"{result.id} t{result.trial}: compute error with no computation")
+
+    return {
+        "suite": suite,
         "when": stamp,
-        "passed": passed,
+        "trials": max((len(v) for v in by_task.values()), default=0),
+        "passed": sum(1 for r in results if r.success),
         "total": len(results),
+        "tasks_fully_green": sum(1 for t in per_task if t["pass_rate"] == 1.0),
+        "tasks_flaky": sum(1 for t in per_task if t["flaky"]),
+        "task_count": len(per_task),
+        "outcomes": outcomes,
+        "gates": {
+            "unsupported_success": outcomes.get("UNSUPPORTED_SUCCESS", 0),
+            "partial_grounded": outcomes.get("PARTIAL_GROUNDED", 0),
+            "safe_failure": outcomes.get("SAFE_FAILURE", 0),
+            "full_success": outcomes.get("FULL_SUCCESS", 0),
+            "violations": violations,
+        },
+        "medians": {
+            "llm_calls": _median([r.llm_calls for r in results]),
+            "actions": _median([r.actions for r in results]),
+            "seconds": _median([r.total_s for r in results]),
+            "prompt_chars": _median([r.max_prompt_chars for r in results]),
+            "evidence_records": _median([r.evidence_records for r in results]),
+            "resources_observed": _median([r.resources_observed for r in results]),
+        },
         "totals": {
             "llm_calls": sum(r.llm_calls for r in results),
             "actions": sum(r.actions for r in results),
@@ -255,13 +376,50 @@ async def main_async(args) -> int:
             "loop_breaks": sum(r.loop_breaks for r in results),
             "human_interventions": sum(r.human_interventions for r in results),
             "memory_hits": sum(r.memory_hits for r in results),
+            "evidence_records": sum(r.evidence_records for r in results),
+            "evidence_rejected": sum(r.evidence_rejected for r in results),
+            "computations": sum(r.computations for r in results),
+            "grounding_challenges": sum(r.grounding_challenges for r in results),
             "max_prompt_chars": max((r.max_prompt_chars for r in results), default=0),
         },
-        "tasks": [asdict(r) for r in results],
+        "per_task": per_task,
+        "runs": [asdict(r) for r in results],
     }
-    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"\n{passed}/{len(results)} passed — {out_dir / 'summary.json'}")
-    return 0 if passed == len(results) else 1
+
+
+def _print_summary(summary: dict, out_dir: Path) -> None:
+    print(f"\n{'=' * 78}")
+    print(f"{summary['suite']}: {summary['passed']}/{summary['total']} runs passed "
+          f"({summary['trials']} trial(s) x {summary['task_count']} tasks)")
+    print(f"  fully green tasks: {summary['tasks_fully_green']}/{summary['task_count']}"
+          f"   flaky: {summary['tasks_flaky']}")
+    print(f"  outcomes: {summary['outcomes']}")
+    print(f"  medians:  {summary['medians']}")
+    gates = summary["gates"]
+    print(f"  UNSUPPORTED_SUCCESS: {gates['unsupported_success']} "
+          f"(release gate requires 0)")
+    for violation in gates["violations"]:
+        print(f"    !! {violation}")
+    for task in summary["per_task"]:
+        if task["pass_rate"] < 1.0:
+            print(f"  {task['id']}: {task['passed']}/{task['trials']} — "
+                  + "; ".join(task["failures"][:2]))
+    print(f"  {out_dir / 'summary.json'}")
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return round(float(ordered[middle]), 2)
+    return round((ordered[middle - 1] + ordered[middle]) / 2, 2)
+
+
+def _spread(values: list[float]) -> dict[str, float]:
+    return {"median": _median(values), "min": round(min(values), 2) if values else 0,
+            "max": round(max(values), 2) if values else 0}
 
 
 def main() -> int:
@@ -271,6 +429,8 @@ def main() -> int:
     parser.add_argument("--config", default=None)
     parser.add_argument("--mode", choices=["cdp_attach", "launch"], default="cdp_attach")
     parser.add_argument("--cdp-endpoint", default=None)
+    parser.add_argument("--trials", type=int, default=1,
+                        help="repeat the whole suite N times; one run is not a measurement")
     parser.add_argument("--memory-db", default=None)
     parser.add_argument("--no-memory", action="store_true")
     parser.add_argument("--quiet", action="store_true")

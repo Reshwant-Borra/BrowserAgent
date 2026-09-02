@@ -190,6 +190,30 @@ async def test_a_paused_task_resumes_from_disk(backend, make_agent, fixture_site
     assert "the home page lists a products link" in client2.decision_prompts[0]  # and was re-injected
 
 
+async def test_only_the_tabs_the_agent_opened_are_ever_closed(backend, make_agent,
+                                                              fixture_site_url):
+    """`close_agent_tabs` is what the unattended evaluation harness calls between tasks. It
+    must not become a way for the user's own tabs to disappear."""
+    agent, client = make_agent(backend, [
+        {"action": "open_url", "url": f"{fixture_site_url}/index.html", "reason": "user's page"},
+        {"action": "open_tab", "url": f"{fixture_site_url}/products.html", "reason": "mine"},
+        {"action": "open_tab", "url": f"{fixture_site_url}/docs.html", "reason": "mine too"},
+        {"action": "finish", "answer": "opened two tabs", "reason": "done"},
+    ])
+    await agent.run("Open a couple of pages")
+
+    before = await agent.session.tabs()
+    assert sum(1 for t in before if t.owner == "agent") == 2
+    users = {t.id for t in before if t.owner == "user"}
+
+    closed = await agent.session.close_agent_tabs()
+    after = await agent.session.tabs()
+
+    assert closed == 2
+    assert all(t.owner == "user" for t in after)
+    assert {t.id for t in after} == users
+
+
 async def test_a_consequential_action_asks_before_acting(backend, make_agent, fixture_site_url):
     asked: list[str] = []
 

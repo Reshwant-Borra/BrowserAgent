@@ -92,15 +92,21 @@ async def main() -> int:
           f"handovers={state.metrics.human_interventions}")
     print(f"  answer: {state.answer[:200]}")
 
-    log = (task_dir / "steps.jsonl").read_text(encoding="utf-8") if (task_dir / "steps.jsonl").exists() else ""
-    state_json = (task_dir / "state.json").read_text(encoding="utf-8")
+    def read(name: str) -> str:
+        path = task_dir / name
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
     memories = " ".join(m.text for m in memory.all_active())
     memory.close()
 
     channels = {
         "prompts the model saw": "\n".join(prompts),
-        "step log on disk": log,
-        "persisted task state": state_json,
+        "step log on disk": read("steps.jsonl"),
+        "persisted task state": read("state.json"),
+        # The ledger stores page text, so it is the channel most likely to have picked the
+        # password up off the form after the human typed it (V2 hardening §26).
+        "evidence ledger": read("evidence.json"),
+        "spilled facts": read("facts.log"),
         "long-term memory": memories,
     }
     print("\n  searching every channel for the password:")

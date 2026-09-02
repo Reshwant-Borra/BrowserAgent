@@ -181,6 +181,12 @@ def content_terms(text: str) -> set[str]:
 #: to invent. Ordinary prose can be paraphrased freely without touching any of them.
 _DISTINCTIVE_RE = re.compile(r"\b(?:[A-Z][A-Za-z0-9]{2,}|[A-Z]{2,}|[A-Za-z]*\d[A-Za-z0-9]*)\b")
 
+#: A capital letter at the start of a sentence says nothing about whether the word is a name —
+#: English puts one there regardless. Counting it cost a real holdout task: the model's own
+#: note "Visited repository overview page" was rejected because the *verb* "Visited" appeared
+#: nowhere on the page, and the challenges that followed used up its step budget.
+_SENTENCE_START_RE = re.compile(r"(?:^|(?<=[.!?;:]\s)|(?<=[.!?;:]\s\s))\s*([A-Z][A-Za-z0-9]*)")
+
 
 def distinctive_terms(text: str) -> set[str]:
     """The names and coined tokens in a sentence.
@@ -188,14 +194,21 @@ def distinctive_terms(text: str) -> set[str]:
     Whether a *paraphrase* of a page is faithful is not something containment can decide, and
     pretending otherwise would flag honest wording as invention (V2 hardening §7). What
     containment can decide is whether the sentence introduces a proper noun, product name or
-    identifier that the page never contained — which is what an invented source or an
-    invented product looks like. Common words are ignored entirely.
+    identifier that the page never contained — which is what an invented product looks like.
+    Common words, and words capitalised only because a sentence began, are ignored.
     """
+    text = str(text or "")
+    sentence_starts = {m.group(1).lower() for m in _SENTENCE_START_RE.finditer(text)}
     out: set[str] = set()
-    for token in _DISTINCTIVE_RE.findall(str(text or "")):
+    for token in _DISTINCTIVE_RE.findall(text):
         word = token.lower()
-        if len(word) >= 3 and word not in _STOPWORDS:
-            out.add(word)
+        if len(word) < 3 or word in _STOPWORDS:
+            continue
+        # …unless it is an acronym or carries a digit, neither of which happens by accident
+        # at the start of a sentence.
+        if word in sentence_starts and token[1:].islower() and not any(c.isdigit() for c in token):
+            continue
+        out.add(word)
     return out
 
 

@@ -136,6 +136,19 @@ def test_a_site_the_task_never_opened_never_becomes_evidence():
     assert "specsauthority.example" in why
 
 
+def test_a_capital_letter_at_the_start_of_a_sentence_is_not_a_name():
+    """From a real holdout run: the note "Visited repository overview page" was refused
+    because the verb "Visited" appears nowhere on the page, and the challenges that followed
+    used up the task's step budget. English capitalises sentence openings regardless."""
+    from agent_v2.ledger import distinctive_terms
+    assert distinctive_terms("Visited repository overview page") == set()
+    assert distinctive_terms("Found the download link. Clicked it.") == set()
+    # …but a real name mid-sentence, an acronym, and anything with a digit still count
+    assert "widget" in distinctive_terms("The page lists Widget A and Widget B")
+    assert "rfc" in distinctive_terms("RFC 2616 is the title")
+    assert "v26" in distinctive_terms("V26 is printed at the top")
+
+
 def test_a_paraphrase_of_the_page_is_still_evidence():
     """Rewording is not the failure mode, so it is not treated as one."""
     ledger = EvidenceLedger("t1")

@@ -1,0 +1,85 @@
+# Grounding suite — the tasks the hardening exists for.
+#
+# Every task here is a real, harmless, public-web task whose *failure mode* is a confident
+# wrong answer rather than a visible error. A model that never opens the third source can
+# still produce a paragraph that reads perfectly; a model that cannot subtract can still
+# state a difference. So the checks are as much about provenance and arithmetic as about
+# words: `min_visited_sources` counts pages BrowserAgent actually observed,
+# `no_unsupported_claims` fails any answer carrying a figure or a source the ledger cannot
+# account for, and `requires_computation` fails an answer whose arithmetic the model did in
+# its head.
+#
+# No task names a shop, a product or a vendor that the agent has any special handling for —
+# there is none. These are ordinary sites chosen for being stable and freely readable.
+
+tasks:
+  - id: multi-source-research
+    capability: multi-source research
+    goal: >-
+      Research the current stable release of three different open-source projects — Python,
+      Node.js and Go — by opening each project's own official website, and report the version
+      number each site lists. Say which sites you actually opened.
+    start_url: "https://www.python.org/downloads/"
+    max_steps: 30
+    expect:
+      answer_matches: "3\\.\\d+"
+      visited_domains: ["python.org", "nodejs.org", "go.dev"]
+      min_visited_sources: 3
+      min_evidence: 3
+      no_unsupported_claims: true
+
+  - id: comparison-with-arithmetic
+    capability: numeric comparison across pages
+    goal: >-
+      On this book catalogue, find the price of 'A Light in the Attic' and the price of
+      'Tipping the Velvet', then tell me which is cheaper and exactly how much cheaper it is.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      answer_contains_any: ["Tipping the Velvet"]
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+
+  - id: three-candidates-compared
+    capability: candidate comparison
+    goal: >-
+      From this book catalogue, pick three books from the Travel category, open each one, and
+      compare them on price and star rating. Give me exactly three, with the price and rating
+      you read for each. Do not buy anything.
+    start_url: "https://books.toscrape.com/catalogue/category/books/travel_2/index.html"
+    max_steps: 30
+    expect:
+      # Three books read plus the category listing they were found on. The listing itself
+      # legitimately supplies one of the three prices, so three observed pages is the floor.
+      min_visited_sources: 3
+      min_evidence: 3
+      answer_matches: "£\\s?\\d+\\.\\d\\d"
+      no_unsupported_claims: true
+
+  - id: date-comparison
+    capability: dates
+    goal: >-
+      Find the publication date of RFC 2616 and the publication date of RFC 7230 on
+      rfc-editor.org, and tell me which came first and how many years apart they are.
+    start_url: "https://www.rfc-editor.org/rfc/rfc2616.txt"
+    max_steps: 24
+    expect:
+      answer_contains_any: ["2616"]
+      min_visited_sources: 2
+      no_unsupported_claims: true
+
+  - id: unreachable-third-source
+    capability: honest partial result
+    goal: >-
+      Report the current stable Python version from python.org, and also the version listed at
+      https://this-domain-does-not-resolve-browseragent.example/versions. Tell me plainly if
+      you could not get one of them.
+    start_url: "https://www.python.org/downloads/"
+    max_steps: 20
+    expect:
+      # The correct outcome is a grounded partial answer, never an invented second figure.
+      answer_matches: "3\\.\\d+"
+      answer_contains_any: ["could not", "couldn't", "unable", "did not", "didn't", "not able",
+                            "no access", "failed"]
+      no_unsupported_claims: true

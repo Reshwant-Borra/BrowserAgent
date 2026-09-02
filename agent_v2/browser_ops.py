@@ -102,6 +102,36 @@ class BrowserSession:
     def current_tab_id(self) -> Optional[int]:
         return self._id_of(self.backend.page)
 
+    async def close_agent_tabs(self) -> int:
+        """Close every tab this run opened, leaving the user's exactly as they were.
+
+        Never called by the loop: interactively, a tab the agent opened is a tab the user can
+        see and may want, so tidying up behind them would be presumptuous. It is for
+        unattended callers — the evaluation harness — which otherwise leave one tab per task
+        behind. Ninety task runs against one persistent profile accumulated several hundred
+        open tabs and several hundred renderer processes, which is what eventually took the
+        browser down mid-suite.
+        """
+        closed = 0
+        for tab_id, owner in list(self._owner.items()):
+            if owner != "agent":
+                continue
+            page = self._pages.get(tab_id)
+            self._pages.pop(tab_id, None)
+            self._owner.pop(tab_id, None)
+            if page is None or page.is_closed():
+                continue
+            try:
+                await page.close()
+                closed += 1
+            except Exception:
+                pass
+        remaining = [p for p in self._live_pages() if not p.is_closed()]
+        if remaining and (self.backend.page is None or self.backend.page.is_closed()):
+            self.backend.page = remaining[0]
+            self.backend.context = remaining[0].context
+        return closed
+
     @staticmethod
     def render_tabs(tabs: list[TabInfo], limit: int = 8) -> str:
         if len(tabs) <= 1:

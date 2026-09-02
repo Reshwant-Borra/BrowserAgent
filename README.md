@@ -249,8 +249,15 @@ python -m agent_v2 "your task, in plain language"
 ```
 
 One loop, bounded prompts, durable cross-task memory, and human takeover for anything that
-needs a password. Your browser, profile and tabs are never closed. See **[docs/V2.md](docs/V2.md)**
-for setup, human takeover, memory, tests and the real-web evaluation harness.
+needs a password. Your browser, profile and tabs are never closed.
+
+The model decides what to do; BrowserAgent keeps its own record of what actually happened. A
+page counts as a source only once it has been observed, a finding becomes citable evidence
+only once it has been checked against the page it was written against, arithmetic is done by
+software rather than by an 8B model, and an answer asserting something the record cannot
+account for is handed over with that part named rather than presented as read. See
+**[docs/V2.md](docs/V2.md)** for setup, human takeover, grounding, memory, tests and the
+real-web evaluation harness.
 
 The original agent (`agent/`, `browser-agent …`) is unchanged and remains the default;
 `agent.version` in `config/default.yaml` selects between them.

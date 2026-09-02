@@ -33,7 +33,6 @@ from agent_v2.ledger import (
     EvidenceLedger,
     EvidenceRecord,
     all_figure_keys,
-    canonical_url,
     content_terms,
     figure_keys,
     normalize,
