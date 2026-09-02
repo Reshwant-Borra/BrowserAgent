@@ -63,6 +63,7 @@ routing:
 
 agent:
   control_mode: "legacy"      # "legacy" | "general" | "hybrid" — see agent/controller.py
+  version: "v1"               # "v1" (agent/) | "v2" (agent_v2/) — see docs/V2.md
   planner_max_subgoals: 5
   max_replans: 6
   max_subgoal_attempts: 2     # consecutive failed delegate attempts before a subgoal replan
@@ -77,3 +78,17 @@ security:
   default_domain_permission: "browser_control"  # "read_only" | "browser_control" | "no_access"
   block_local_schemes: true
   cross_origin_sensitive_transfer_requires_approval: true
+
+v2:                                   # BrowserAgent V2 (agent_v2/) — see docs/V2.md
+  max_steps: 40
+  tasks_dir: "./runtime/v2/tasks"
+  memory_db: "./runtime/v2/memory.sqlite3"
+  memory_enabled: true
+  memory_top_k: 6
+  max_total_tokens: 3600              # hard ceiling on the whole prompt
+  page_tokens: 1500
+  memory_tokens: 380
+  state_tokens: 700
+  max_output_tokens: 400
+  keep_alive: "30m"                   # keep the model resident between steps
+  request_timeout_s: 120

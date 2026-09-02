@@ -26,7 +26,7 @@ CANONICAL_MODAL_SELECTOR = '[role="dialog"]'
 
 # Executed in the page context. Returns plain-JSON-serializable data only.
 _EXTRACTION_JS = """
-([interactiveSel, textSel, modalSel]) => {
+([interactiveSel, textSel, modalSel, maxTextNodes]) => {
   function isVisible(el) {
     if (el.hasAttribute('hidden')) return false;
     const style = window.getComputedStyle(el);
@@ -129,29 +129,47 @@ _EXTRACTION_JS = """
   });
 
   const interactiveSet = new Set(interactiveNodes);
-  const textNodes = Array.from(document.querySelectorAll(textSel));
   const visibleText = [];
   const seen = new Set();
-  for (const el of textNodes) {
-    if (!isVisible(el)) continue;
-    let insideInteractive = false;
-    let p = el.parentElement;
-    while (p) {
-      if (interactiveSet.has(p)) { insideInteractive = true; break; }
-      p = p.parentElement;
+
+  // Content-first ordering. On a real site the first N text nodes in raw DOM order are
+  // almost always navigation chrome, so the article/answer never reaches the model. When
+  // the page declares a main-content landmark (a web standard, not a per-site rule) that
+  // subtree is read first and the surrounding chrome second. Pages without landmarks —
+  // including every test fixture — take the `document.body` path, which is exactly the
+  // original single-pass behavior.
+  const mainRoot = document.querySelector('main, [role="main"], article');
+  const chromeSel = 'nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"]';
+
+  function collect(root, skipChrome, limit) {
+    for (const el of Array.from(root.querySelectorAll(textSel))) {
+      if (visibleText.length >= limit) return;
+      if (!isVisible(el)) continue;
+      if (skipChrome && el.closest(chromeSel)) continue;
+      let insideInteractive = false;
+      let p = el.parentElement;
+      while (p) {
+        if (interactiveSet.has(p)) { insideInteractive = true; break; }
+        p = p.parentElement;
+      }
+      if (insideInteractive) continue;
+      const direct = Array.from(el.childNodes)
+        .filter(n => n.nodeType === Node.TEXT_NODE)
+        .map(n => n.textContent.trim())
+        .join(' ')
+        .trim();
+      const text = direct || el.textContent.replace(/\\s+/g, ' ').trim();
+      if (!text || seen.has(text)) continue;
+      seen.add(text);
+      visibleText.push(text.slice(0, 200));
     }
-    if (insideInteractive) continue;
-    const direct = Array.from(el.childNodes)
-      .filter(n => n.nodeType === Node.TEXT_NODE)
-      .map(n => n.textContent.trim())
-      .join(' ')
-      .trim();
-    const text = direct || el.textContent.replace(/\\s+/g, ' ').trim();
-    if (!text || seen.has(text)) continue;
-    seen.add(text);
-    visibleText.push(text.slice(0, 200));
-    if (visibleText.length >= 40) break;
   }
+
+  if (mainRoot) {
+    collect(mainRoot, true, maxTextNodes);
+    collect(document.body, true, maxTextNodes);
+  }
+  collect(document.body, false, maxTextNodes);
 
   const modalPresent = !!document.querySelector(modalSel);
 
@@ -166,12 +184,23 @@ _EXTRACTION_JS = """
 """
 
 
-async def extract_observation(page: Any, max_chars: int, max_visible_text_items: int) -> PageObservation:
+DEFAULT_MAX_TEXT_NODES = 40
+
+
+async def extract_observation(page: Any, max_chars: int, max_visible_text_items: int,
+                              max_text_nodes: int = DEFAULT_MAX_TEXT_NODES) -> PageObservation:
     """`page` is a playwright.async_api.Page. Returns a fully-populated PageObservation,
-    including its state_hash, computed here so callers never forget to hash."""
+    including its state_hash, computed here so callers never forget to hash.
+
+    `max_text_nodes` bounds how much page text is *captured*, as distinct from how much is
+    *rendered* (`max_visible_text_items`). It defaults to the historical 40 so the legacy
+    loop's observations, memories and state hashes are byte-identical; agent_v2 raises it,
+    because V2 budgets the rendered page in tokens and would rather trim a large capture
+    than never see the paragraph that answers the question."""
     raw: dict = await page.evaluate(
         _EXTRACTION_JS,
-        [CANONICAL_INTERACTIVE_SELECTOR, CANONICAL_TEXT_SELECTOR, CANONICAL_MODAL_SELECTOR],
+        [CANONICAL_INTERACTIVE_SELECTOR, CANONICAL_TEXT_SELECTOR, CANONICAL_MODAL_SELECTOR,
+         max_text_nodes],
     )
 
     elements: list[ElementRef] = []

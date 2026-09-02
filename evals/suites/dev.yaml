@@ -1,0 +1,97 @@
+# Development capability suite — real public websites, one task per capability class.
+#
+# These exist to expose GENERAL failures (perception / grounding / reasoning / state /
+# memory / execution / verification / recovery). They are NOT a scoreboard: a fix that only
+# makes a task here pass, and would not help on a site nobody has looked at, is a fix in the
+# wrong layer (V2 spec §27/§39).
+#
+# `expect` is objective wherever the web allows it. Where a page's content legitimately
+# changes hour to hour, the check is structural (a non-empty answer of the right shape,
+# grounded in facts the agent actually collected) rather than a hardcoded string.
+
+tasks:
+  - id: read-current-page
+    capability: information extraction
+    goal: "Quote, word for word, the sentence on example.com that says what this domain is for."
+    start_url: "https://example.com"
+    max_steps: 6
+    expect:
+      # example.com's wording is "This domain is for use in documentation examples without
+      # needing permission." (checked 2026-09-02 — it was reworded from the older
+      # "illustrative examples in documents" phrasing at some point).
+      answer_contains_any: ["documentation examples without needing permission"]
+
+  - id: search-and-extract
+    capability: search
+    goal: "Use the search box on Wikipedia to find in which year the Eiffel Tower was completed."
+    start_url: "https://en.wikipedia.org/wiki/Main_Page"
+    max_steps: 14
+    expect:
+      answer_contains_any: ["1889"]
+
+  - id: navigate-links
+    capability: navigation
+    goal: "Starting from the Python.org home page, find and report the latest Python version that the site offers for download."
+    start_url: "https://www.python.org"
+    max_steps: 14
+    expect:
+      answer_matches: "3\\.\\d+"
+
+  - id: table-extraction
+    capability: tables
+    goal: "From this page, list the three highest mountains and their heights in metres."
+    start_url: "https://en.wikipedia.org/wiki/List_of_highest_mountains_on_Earth"
+    max_steps: 14
+    expect:
+      answer_contains_all: ["Everest"]
+      answer_matches: "8[,.]?8\\d\\d"
+
+  - id: dynamic-listing
+    capability: dynamic SPA / lists
+    goal: "What are the titles of the top two stories on Hacker News right now?"
+    start_url: "https://news.ycombinator.com"
+    max_steps: 12
+    expect:
+      min_answer_chars: 25
+      min_facts: 1
+
+  - id: scroll-for-content
+    capability: lazy loading / scrolling
+    goal: "On this page, find what the 'Zen of Python' says about explicit versus implicit, quoting the exact line."
+    start_url: "https://peps.python.org/pep-0020/"
+    max_steps: 14
+    expect:
+      answer_contains_any: ["Explicit is better than implicit"]
+
+  - id: multi-page-research
+    capability: multi-page research
+    goal: "Find the current stable version numbers of both Python and Node.js from their official websites, and report both."
+    start_url: "https://www.python.org/downloads/"
+    max_steps: 22
+    expect:
+      answer_matches: "3\\.\\d+"
+      answer_contains_any: ["node", "Node"]
+
+  - id: multi-tab
+    capability: multi-tab
+    goal: "Open the Python and Node.js download pages in two separate tabs, then tell me which project lists a higher major version number."
+    start_url: "https://www.python.org/downloads/"
+    max_steps: 20
+    expect:
+      min_answer_chars: 20
+
+  - id: recover-from-dead-end
+    capability: error recovery
+    goal: "Find the official RFC 2616 document title. The page http://www.rfc-editor.org/rfc/rfc999999.txt does not exist, so find the right one yourself."
+    start_url: "https://www.rfc-editor.org/rfc/rfc999999.txt"
+    max_steps: 16
+    expect:
+      answer_contains_any: ["Hypertext Transfer Protocol", "HTTP/1.1"]
+
+  - id: form-interaction
+    capability: forms
+    goal: "On this page, type 'browseragent' into the search field and report the title of the first result."
+    start_url: "https://duckduckgo.com/html/"
+    max_steps: 14
+    expect:
+      min_answer_chars: 15

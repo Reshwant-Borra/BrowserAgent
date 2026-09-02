@@ -136,6 +136,10 @@ class AgentControlConfig:
     """
 
     control_mode: str = "legacy"  # "legacy" | "general" | "hybrid"
+    # Which agent implementation a generic entry point uses: "v1" is everything under
+    # agent/ (controller/loop/planner/router), "v2" is agent_v2/'s single loop. Default
+    # stays "v1" so no existing caller changes behavior (V2 spec §33).
+    version: str = "v1"  # "v1" | "v2"
     planner_max_subgoals: int = 5
     max_replans: int = 6
     max_subgoal_attempts: int = 2
@@ -157,6 +161,31 @@ class AgentControlConfig:
 
 
 @dataclass
+class V2Config:
+    """BrowserAgent V2 (agent_v2/). Entirely additive: nothing here is read by the legacy
+    controller/loop, and `agent.version` (below) still defaults to "v1", so installing V2
+    changes no existing behavior until it is explicitly selected.
+
+    `keep_alive` is longer than the legacy default because V2 issues one model call per
+    browser action — a cold reload of an 8B model between steps costs more than the step
+    itself (V2 spec §23 Optimization D).
+    """
+
+    max_steps: int = 40
+    tasks_dir: str = "./runtime/v2/tasks"
+    memory_db: str = "./runtime/v2/memory.sqlite3"
+    memory_enabled: bool = True
+    memory_top_k: int = 6
+    max_total_tokens: int = 3600
+    page_tokens: int = 1500
+    memory_tokens: int = 380
+    state_tokens: int = 700
+    max_output_tokens: int = 400
+    keep_alive: str = "30m"
+    request_timeout_s: float = 120.0
+
+
+@dataclass
 class AppConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     browser: BrowserConfig = field(default_factory=BrowserConfig)
@@ -167,6 +196,7 @@ class AppConfig:
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     agent: AgentControlConfig = field(default_factory=AgentControlConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    v2: V2Config = field(default_factory=V2Config)
 
 
 def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
@@ -229,6 +259,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         routing=_coerce(RoutingConfig, raw.get("routing", {})),
         agent=_coerce(AgentControlConfig, raw.get("agent", {})),
         security=_coerce(SecurityConfig, raw.get("security", {})),
+        v2=_coerce(V2Config, raw.get("v2", {})),
     )
     _resolve_runtime_paths(config)
     return config
