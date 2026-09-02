@@ -1,0 +1,95 @@
+model:
+  backend: "ollama"  # "ollama" or "llama_cpp"
+  endpoint: ""       # optional override; otherwise backend-specific endpoint below is used
+  ollama_endpoint: "http://127.0.0.1:11434"
+  llamacpp_endpoint: "http://127.0.0.1:8080"
+  model_name: "qwen3:8b"
+  temperature: 0.1
+  context_window: 8192
+  max_output_tokens: 256
+  max_output_tokens_deep_recovery: 512
+  request_timeout_s: 30
+  request_connect_timeout_s: 10
+  request_write_timeout_s: 10
+  request_pool_timeout_s: 10
+  max_inference_attempts: 2
+  inference_retry_backoff_s: 0.5
+  ollama_keep_alive: "5m"
+
+browser:
+  headless: false
+  user_data_dir: "./runtime/tasks"   # actual profile: {user_data_dir}/{task_id}/browser_profile
+  action_timeout_ms: 10000
+  interactive_approval: true          # prompt on CLI before CONSEQUENTIAL actions
+  mode: "cdp_attach"                  # FINAL ACCEPTANCE TEST: exercise the persistent-browser
+                                       # path (docs/USING_BROWSERAGENT.md's recommended everyday
+                                       # path), not the disposable "launch" mode default.yaml
+                                       # keeps for tests/fixtures.
+  cdp_endpoint: "http://127.0.0.1:9223"  # default 9222 found unusable on this machine during
+                                          # acceptance pre-flight (see FINAL ACCEPTANCE section,
+                                          # ENV-01) — CDP never becomes reachable on 9222
+                                          # specifically across 4 independent repros, while
+                                          # 9223/9224/9225 all work immediately with identical
+                                          # launch code. Documented as a pre-flight defect, not
+                                          # silently worked around.
+
+context:
+  max_page_chars: 3000
+  max_page_chars_deep_recovery: 6000
+  recent_actions: 5
+  max_visible_text_items: 12
+  max_total_tokens: 4096
+  recent_window_tokens: 800
+  summary_tokens: 500
+  retrieved_memory_tokens: 500
+  page_tokens: 1400
+  retrieved_memory_top_k: 5
+  enable_running_summary: true
+  enable_memory_retrieval: true
+  enable_active_facts: true
+  active_fact_tokens: 300
+  enforce_active_fact_constraints: false
+  summary_rebuild_interval: 4
+
+recovery:
+  max_action_retries: 2
+  identical_action_limit: 3
+  navigation_cycle_limit: 2
+  verification_retry_limit: 2
+
+storage:
+  runtime_dir: "./runtime"
+  tasks_dir: "./runtime/tasks"
+
+logging:
+  level: "INFO"
+  dir: "./runtime/logs"
+  redact_secrets: true
+
+routing:
+  mode: "hybrid"  # "legacy" | "semantic" | "hybrid" — see router/policy.py
+
+agent:
+  control_mode: "hybrid"      # FINAL ACCEPTANCE TEST: default.yaml ships "legacy" deliberately
+                               # (agent/controller.py: general controller stays opt-in until its
+                               # own holdouts pass). This acceptance test's explicit purpose is
+                               # to validate the general controller as a whole system, so it must
+                               # run in a mode that actually engages it. "hybrid" (not "general")
+                               # is chosen because it is the more realistic "intended everyday
+                               # config" per ui/jobs.py: obvious deterministic-URL prompts keep
+                               # the proven legacy fast path, everything else routes through
+                               # GeneralAgentController — not a change made to inflate results.
+  planner_max_subgoals: 5
+  max_replans: 6
+  max_subgoal_attempts: 2     # consecutive failed delegate attempts before a subgoal replan
+  max_steps_per_subgoal: 30   # AgentLoop step budget per delegated subgoal
+  completion_check_after_subgoal: true
+  max_workspace_entities_in_context: 12
+  max_workspace_evidence_in_context: 8
+  batch_delegation_min_targets: 3
+  research_discovery_max_sources: 8
+
+security:
+  default_domain_permission: "browser_control"  # "read_only" | "browser_control" | "no_access"
+  block_local_schemes: true
+  cross_origin_sensitive_transfer_requires_approval: true
