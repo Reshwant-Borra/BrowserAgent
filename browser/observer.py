@@ -22,6 +22,13 @@ CANONICAL_INTERACTIVE_SELECTOR = (
 
 CANONICAL_TEXT_SELECTOR = "h1, h2, h3, h4, h5, h6, p, li, span, div"
 
+#: Adds the block elements real content sites put facts in but the canonical selector never
+#: matched — most importantly table cells, which meant every table on the web was invisible
+#: to the agent except one `extract` call at a time. Kept as a separate constant, and passed
+#: explicitly by agent_v2, so the legacy loop's observations stay byte-for-byte unchanged.
+EXTENDED_TEXT_SELECTOR = (CANONICAL_TEXT_SELECTOR +
+                           ", tr, td, th, caption, dd, dt, blockquote, figcaption, pre")
+
 CANONICAL_MODAL_SELECTOR = '[role="dialog"]'
 
 # Executed in the page context. Returns plain-JSON-serializable data only.
@@ -141,11 +148,29 @@ _EXTRACTION_JS = """
   const mainRoot = document.querySelector('main, [role="main"], article');
   const chromeSel = 'nav, header, footer, aside, [role="navigation"], [role="banner"], [role="contentinfo"]';
 
+  // A table read as a flat list of cells is a table with its rows shuffled: the model sees
+  // every name and every number but nothing tying one to the other, and confidently pairs
+  // the wrong ones. So a <tr> is emitted as a single "cell | cell | cell" line and its own
+  // cells are then suppressed. Only reachable when the caller's selector includes `tr`.
+  function rowLine(el) {
+    const cells = Array.from(el.children).filter(c => c.tagName === 'TD' || c.tagName === 'TH');
+    if (!cells.length) return null;
+    const texts = cells.map(c => c.textContent.replace(/\\s+/g, ' ').trim());
+    for (const text of texts) { if (text) seen.add(text); }
+    const row = texts.filter(Boolean).join(' | ');
+    return row || null;
+  }
+
   function collect(root, skipChrome, limit) {
     for (const el of Array.from(root.querySelectorAll(textSel))) {
       if (visibleText.length >= limit) return;
       if (!isVisible(el)) continue;
       if (skipChrome && el.closest(chromeSel)) continue;
+      if (el.tagName === 'TR') {
+        const row = rowLine(el);
+        if (row && !seen.has(row)) { seen.add(row); visibleText.push(row.slice(0, 300)); }
+        continue;
+      }
       let insideInteractive = false;
       let p = el.parentElement;
       while (p) {
@@ -188,7 +213,8 @@ DEFAULT_MAX_TEXT_NODES = 40
 
 
 async def extract_observation(page: Any, max_chars: int, max_visible_text_items: int,
-                              max_text_nodes: int = DEFAULT_MAX_TEXT_NODES) -> PageObservation:
+                              max_text_nodes: int = DEFAULT_MAX_TEXT_NODES,
+                              text_selector: str = CANONICAL_TEXT_SELECTOR) -> PageObservation:
     """`page` is a playwright.async_api.Page. Returns a fully-populated PageObservation,
     including its state_hash, computed here so callers never forget to hash.
 
@@ -199,7 +225,7 @@ async def extract_observation(page: Any, max_chars: int, max_visible_text_items:
     than never see the paragraph that answers the question."""
     raw: dict = await page.evaluate(
         _EXTRACTION_JS,
-        [CANONICAL_INTERACTIVE_SELECTOR, CANONICAL_TEXT_SELECTOR, CANONICAL_MODAL_SELECTOR,
+        [CANONICAL_INTERACTIVE_SELECTOR, text_selector, CANONICAL_MODAL_SELECTOR,
          max_text_nodes],
     )
 

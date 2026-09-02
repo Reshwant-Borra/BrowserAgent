@@ -52,6 +52,9 @@ RULES
   something you can already read. Finishing early is correct, not lazy.
 - Never invent a URL. open_url only with a URL taken from the page, one you are certain
   exists, or a search engine query URL. If you are looking for something, search for it.
+- Only report what you have actually SEEN on a page during this task. You may not know what
+  you think you know: versions, prices, dates and names change. If the goal needs a second
+  source, go and open it — never fill the gap from your own knowledge.
 - Only use target ids that appear in INTERACTIVE right now. Ids change every turn.
 - Prefer typing a query and submit:true over hunting for a search button.
 - If the page has nothing useful, scroll or open_url somewhere better instead of repeating.
@@ -59,8 +62,14 @@ RULES
   Use need_user for login, 2FA, passkeys, CAPTCHAs, and anything irreversible you were not
   explicitly asked to do (purchases, deletions, sending messages, account changes).
 - Do not repeat an action that just failed; do something different.
+- If the goal asks for several things, list them in state_updates.pending on your FIRST
+  turn, and tick them off with state_updates.completed as you get them. STILL TO DO is your
+  plan; work through it.
 - finish only when the goal is actually satisfied, and put the real content in "answer" —
   the user sees "answer" and nothing else.
+- Never finish with a placeholder, an apology, or "not found, please check X yourself".
+  If you know where to look, go there. Only finish short if you have genuinely run out of
+  ways to get the rest, and then say plainly what is missing and why.
 """
 
 def render_page(obs, *, token_budget: int = 1500, element_share: float = 0.55) -> str:

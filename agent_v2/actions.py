@@ -132,14 +132,21 @@ class DecisionError(Exception):
         super().__init__(f"{kind}: {message}")
 
 
-def decision_json_schema() -> dict[str, Any]:
+def decision_json_schema(exclude: Optional[set["V2Action"]] = None) -> dict[str, Any]:
     """JSON Schema handed to Ollama's `format`. Kept hand-written rather than generated from
     `RawDecision` so the property descriptions stay short — every character here is decoded
-    into the grammar and paid for on every single step."""
+    into the grammar and paid for on every single step.
+
+    `exclude` removes actions from the enum for a single call. Constrained decoding then
+    makes the excluded action literally unemittable, which is the only reliable way to stop
+    a small model that has decided to do something the loop has already refused: asking it
+    in prose not to do that again is advice, removing the token is a guarantee.
+    """
+    actions = [a.value for a in V2Action if not exclude or a not in exclude]
     return {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": [a.value for a in V2Action]},
+            "action": {"type": "string", "enum": actions},
             "target": {"type": ["integer", "null"]},
             "text": {"type": ["string", "null"]},
             "url": {"type": ["string", "null"]},
@@ -163,6 +170,30 @@ def decision_json_schema() -> dict[str, Any]:
         },
         "required": ["action", "reason"],
     }
+
+
+def plan_json_schema() -> dict[str, Any]:
+    """First-turn variant that *requires* a non-empty `pending` list.
+
+    Plan-as-data (V2 spec §19) only works if a plan actually gets written, and asking an 8B
+    model in prose to "list the parts of the goal first" reliably produces no list at all —
+    it dives at the first page and then declares victory halfway through a two-part task.
+    Requiring the field in the schema makes the grammar unable to emit a decision without
+    one. It is applied on the first turn only: after that the model revises its own plan
+    freely, which is the exploratory behaviour the spec asks for.
+    """
+    schema = decision_json_schema()
+    schema["properties"]["state_updates"] = {
+        "type": "object",
+        "properties": {
+            "add_facts": {"type": "array", "items": {"type": "string"}},
+            "completed": {"type": "array", "items": {"type": "string"}},
+            "pending": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        },
+        "required": ["pending"],
+    }
+    schema["required"] = ["action", "reason", "state_updates"]
+    return schema
 
 
 def validate_decision(raw: RawDecision, obs: PageObservation) -> Decision:

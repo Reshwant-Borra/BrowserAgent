@@ -97,7 +97,13 @@ class TaskState:
     current_url: str = ""
     current_title: str = ""
     current_tab_id: Optional[int] = None
+    #: Every domain this task actually loaded a page from. Not decoration: it is the only
+    #: cheap way to tell "reported from a source" apart from "recited from memory".
+    domains: list[str] = field(default_factory=list)
     answer: str = ""
+    #: Figures the final answer asserts that appear on no page this task opened. Surfaced
+    #: to the user rather than silently shipped (see BrowserAgentV2._unsupported_figures).
+    unsupported_claims: list[str] = field(default_factory=list)
     pause_message: str = ""
     metrics: Metrics = field(default_factory=Metrics)
 

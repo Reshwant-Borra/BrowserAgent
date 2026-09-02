@@ -83,6 +83,13 @@ def check(expect: dict[str, Any], state: TaskState) -> list[str]:
     if pattern and not re.search(pattern, answer, re.I):
         problems.append(f"answer does not match /{pattern}/")
 
+    # A positive pattern alone is easy to satisfy accidentally — "Python is higher than
+    # Node.js" contains both "higher" and "Node". Where a task has a wrong answer that is
+    # as fluent as the right one, the wrong one gets named explicitly.
+    forbidden = expect.get("answer_not_matches")
+    if forbidden and re.search(forbidden, answer, re.I):
+        problems.append(f"answer matches the known-wrong pattern /{forbidden}/")
+
     min_chars = expect.get("min_answer_chars")
     if min_chars and len(answer.strip()) < int(min_chars):
         problems.append(f"answer is only {len(answer.strip())} chars, wanted {min_chars}")
@@ -94,6 +101,13 @@ def check(expect: dict[str, Any], state: TaskState) -> list[str]:
     domain = expect.get("final_domain")
     if domain and domain not in state.current_url:
         problems.append(f"ended on {state.current_url}, expected {domain}")
+
+    # The check that catches a confident answer recited from the model's own weights rather
+    # than read off a page: a multi-source task that never loaded the second source did not
+    # do the task, however plausible the sentence it produced.
+    for required in expect.get("visited_domains", []):
+        if not any(required in visited for visited in state.domains):
+            problems.append(f"never visited {required} (visited: {', '.join(state.domains) or 'nothing'})")
 
     return problems
 

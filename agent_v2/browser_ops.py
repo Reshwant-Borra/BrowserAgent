@@ -155,13 +155,14 @@ class BrowserSession:
         """Observing races navigation: a page that redirects, or JS that replaces the
         document, destroys the execution context mid-`evaluate`. That is a normal event on
         the real web, not a task-ending error, so it is waited out and retried once."""
-        from browser.observer import extract_observation
+        from browser.observer import EXTENDED_TEXT_SELECTOR, extract_observation
 
         for attempt in (1, 2):
             try:
                 return await extract_observation(
                     self.backend.page, self.backend.max_page_chars,
                     self.backend.max_visible_text_items, self.MAX_TEXT_NODES,
+                    EXTENDED_TEXT_SELECTOR,
                 )
             except Exception:
                 if attempt == 2:

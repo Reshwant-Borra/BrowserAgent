@@ -13,6 +13,7 @@ runtime — nothing in this file branches on the identity of a website.
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from agent_v2.actions import (
     RawDecision,
     V2Action,
     decision_json_schema,
+    plan_json_schema,
     validate_decision,
 )
 from agent_v2.browser_ops import ActionOutcome, BrowserSession, Verification
@@ -85,8 +87,12 @@ class BrowserAgentV2:
         self.on_step = on_step
         self.memory_top_k = memory_top_k
         self.schema = decision_json_schema()
+        self.plan_schema = plan_json_schema()
         self._domains_seen: list[str] = []
         self._procedure_id: Optional[int] = None
+        self._pushed_back = False
+        self._challenges = 0
+        self._seen_figures: set[str] = set()
 
     # ---- entry points ----------------------------------------------------------------
 
@@ -111,6 +117,7 @@ class BrowserAgentV2:
         consecutive_failures = 0
         no_change_streak = 0
         steps_this_run = 0
+        block_finish = False
 
         await self.session.adopt_existing_tabs()
 
@@ -123,15 +130,19 @@ class BrowserAgentV2:
             state.metrics.observe_ms += (time.monotonic() - observe_started) * 1000
             tabs = await self.session.sync_tabs()
             state.note_page(obs.url, obs.title, self.session.current_tab_id())
-            self._note_domain(obs.url)
+            self._note_domain(state, obs.url)
 
+            self._remember_figures(obs)
             memory_render = self._retrieve(state, obs)
             hint = _combine(pending_hint, self._page_hints(obs),
-                            _budget_hint(limit - steps_this_run))
+                            _first_turn_hint(state), _budget_hint(limit - steps_this_run))
             pending_hint = ""
 
             decision = await self._decide(state, obs, memory_render,
-                                          BrowserSession.render_tabs(tabs), hint)
+                                          BrowserSession.render_tabs(tabs), hint,
+                                          block_finish=block_finish,
+                                          require_plan=(state.step == 1 and not state.pending))
+            block_finish = False
             if decision is None:
                 state.record_failure("could not produce a usable action for this page")
                 consecutive_failures += 1
@@ -143,7 +154,39 @@ class BrowserAgentV2:
             if decision.action is V2Action.FINISH:
                 state.apply_updates(decision.state_updates.add_facts, decision.state_updates.completed,
                                     decision.state_updates.pending, self._spill_path(state))
+                if self._premature_finish(state, limit - steps_this_run):
+                    # Asked once, never twice: a model that gives up with unfinished plan
+                    # items and most of its budget left is usually one nudge away from doing
+                    # the rest, but nagging repeatedly would just be a different way to loop.
+                    self._pushed_back = True
+                    block_finish = True
+                    pending_hint = (
+                        f"You tried to finish, but STILL TO DO still has {len(state.pending)} item(s) "
+                        f"and you have {limit - steps_this_run} steps left. This turn you MUST take a "
+                        "browser action instead: open_url or open_tab the page that has the missing "
+                        "piece, or click through to it."
+                    )
+                    continue
+                unsupported = self._unsupported_figures(state, decision.answer or "")
+                if unsupported and self._challenges < 2:
+                    self._challenges += 1
+                    block_finish = True
+                    pending_hint = (
+                        f"Your answer states {', '.join(unsupported[:3])}, but no page you have "
+                        "opened in this task showed that — you are reciting it from memory, and it "
+                        "may well be wrong. This turn you MUST take a browser action: open_url the "
+                        "official page that has this figure and read it there."
+                    )
+                    continue
                 state.answer = decision.answer or ""
+                if unsupported:
+                    # Challenged and it stood by the claim. The honest outcome is to hand the
+                    # answer over with the defect labelled, not to quietly ship an unsourced
+                    # number as though it were read off a page.
+                    state.unsupported_claims = unsupported[:5]
+                    state.answer += ("\n\n[not verified: " + ", ".join(unsupported[:5]) +
+                                     " — these figures appear on no page this task opened]")
+                    state.record_failure(f"answer contains unverified figures: {', '.join(unsupported[:3])}")
                 state.status = TaskStatus.DONE.value
                 self._record(state, decision, ActionOutcome(True, "finished"),
                              Verification(True), obs)
@@ -207,11 +250,18 @@ class BrowserAgentV2:
     # ---- one model decision ----------------------------------------------------------
 
     async def _decide(self, state: TaskState, obs: PageObservation, memory_render: str,
-                      tabs_render: str, hint: str) -> Optional[Decision]:
+                      tabs_render: str, hint: str,
+                      block_finish: bool = False, require_plan: bool = False) -> Optional[Decision]:
         """Ask, validate, and give the model up to `max_invalid_per_step` corrections. The
         correction text is the validation error itself, which is why validation errors are
         written as instructions rather than as diagnostics."""
         page_render = render_page(obs, token_budget=self.budget.limit("page"))
+        if block_finish:
+            schema = decision_json_schema({V2Action.FINISH})
+        elif require_plan:
+            schema = self.plan_schema
+        else:
+            schema = self.schema
         for attempt in range(self.limits.max_invalid_per_step + 1):
             context = build_context(
                 goal=state.goal,
@@ -227,7 +277,7 @@ class BrowserAgentV2:
             started = time.monotonic()
             try:
                 result = await self.client.complete(
-                    context.prompt, max_tokens=self.max_output_tokens, json_schema=self.schema
+                    context.prompt, max_tokens=self.max_output_tokens, json_schema=schema
                 )
             except Exception as exc:
                 state.record_failure(f"model call failed: {type(exc).__name__}")
@@ -243,6 +293,15 @@ class BrowserAgentV2:
                 decision = validate_decision(raw, obs)
             except DecisionError as exc:
                 state.metrics.invalid_decisions += 1
+                self._log(state, {"event": "rejected", "step": state.step, "kind": exc.kind,
+                                  "detail": exc.message[:160], "url": obs.url})
+                if exc.kind == "missing_answer" and attempt == self.limits.max_invalid_per_step:
+                    # It wants to stop but keeps omitting the answer field. Ending the task
+                    # with the facts already collected beats burning the remaining budget on
+                    # a formatting argument — the agent has the content, it just failed to
+                    # restate it.
+                    return Decision(action=V2Action.FINISH, reason=raw.reason or "",
+                                    answer=_partial_answer(state, "the model omitted its answer"))
                 if exc.kind == "sensitive_field":
                     # The model tried to fill a credential field. That is never retried as a
                     # browser action — it becomes a human takeover (V2 spec §7).
@@ -257,6 +316,8 @@ class BrowserAgentV2:
                 continue
             except Exception as exc:
                 state.metrics.invalid_decisions += 1
+                self._log(state, {"event": "rejected", "step": state.step, "kind": type(exc).__name__,
+                                  "detail": str(exc)[:160], "url": obs.url})
                 hint = _combine(hint, f"Your last reply was not valid JSON for one action ({type(exc).__name__}). "
                                       "Reply with a single JSON object.")
                 if attempt == self.limits.max_invalid_per_step:
@@ -406,6 +467,35 @@ class BrowserAgentV2:
                           "target": decision.target_name, "reason": decision.reason,
                           "ok": verification.passed, "note": verification.note, "url": obs.url})
 
+    def _remember_figures(self, obs: PageObservation) -> None:
+        """Every version/date/price-shaped token the agent has actually laid eyes on."""
+        if len(self._seen_figures) < 20000:
+            self._seen_figures.update(_figures(" ".join(obs.visible_text)))
+            self._seen_figures.update(_figures(obs.title))
+            self._seen_figures.update(_figures(" ".join(e.name for e in obs.elements)))
+
+    def _unsupported_figures(self, state: TaskState, answer: str) -> list[str]:
+        """Figures in the answer that appear on no page this task ever loaded.
+
+        This is verification (V2 spec §20) applied to the final answer rather than to a
+        click. A small model asked for "the current version of X" will happily produce a
+        plausible number from its weights when it cannot find one, and that is the single
+        most damaging failure mode for a research task — the answer looks right. Numbers are
+        checkable without another model call, so they are checked.
+
+        Deliberately conservative: only version/date/price-shaped tokens count, anything the
+        user themselves wrote in the goal is fair game, and it only ever pushes back once.
+        """
+        supported = set(self._seen_figures)
+        supported.update(_figures(state.goal))
+        supported.update(_figures(" ".join(state.facts)))
+        return [figure for figure in _figures(answer) if figure not in supported]
+
+    def _premature_finish(self, state: TaskState, steps_left: int) -> bool:
+        """Finishing with plan items outstanding and most of the budget unspent."""
+        return (not self._pushed_back and bool(state.pending)
+                and steps_left > max(3, self.limits.max_steps // 4))
+
     def _pointless_repeat(self, state: TaskState, decision: Decision) -> str:
         """"You just did exactly this and the page did not change." Returns the correction to
         show the model, or "" if the action is fine. `finish`/`need_user` are exempt: ending
@@ -457,10 +547,13 @@ class BrowserAgentV2:
             hints.append("The page listing was truncated — scroll or extract if you need more.")
         return " ".join(hints)
 
-    def _note_domain(self, url: str) -> None:
+    def _note_domain(self, state: TaskState, url: str) -> None:
         domain = domain_of(url)
         if domain and domain not in self._domains_seen:
             self._domains_seen.append(domain)
+        if domain and domain not in state.domains:
+            state.domains.append(domain)
+            del state.domains[:-12]
 
     async def _fail(self, state: TaskState, reason: str, started: float) -> TaskState:
         """A failed task still goes through `_finalize`: the lesson from a failure is one of
@@ -548,6 +641,25 @@ def _partial_answer(state: TaskState, reason: str) -> str:
         lines.append("What was found:")
         lines.extend(f"- {f}" for f in state.facts)
     return "\n".join(lines)
+
+
+#: Version/date/price-shaped tokens: "3.14.7", "1889", "8,849", "26.8.1". Deliberately not
+#: every number — a bare "3" or "10" is far too common to be evidence of anything.
+_FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)+|\b\d{3,}\b")
+
+
+def _figures(text: str) -> set[str]:
+    return {match.group(0).replace(",", "") for match in _FIGURE_RE.finditer(text or "")}
+
+
+def _first_turn_hint(state: TaskState) -> str:
+    """Plan-as-data has to be prompted into existence on turn one — left to itself, a small
+    model dives at the first page and never writes a plan, then "finishes" halfway (V2 §19)."""
+    if state.step > 1 or state.pending:
+        return ""
+    return ("This is your first turn, so state_updates.pending is required. Break the goal "
+            "into the concrete pieces you must actually collect — one entry per item, site or "
+            "question the goal names. If the goal only asks for one thing, one entry is right.")
 
 
 def _budget_hint(steps_left: int) -> str:

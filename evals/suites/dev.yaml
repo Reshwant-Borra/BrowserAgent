@@ -43,8 +43,12 @@ tasks:
     start_url: "https://en.wikipedia.org/wiki/List_of_highest_mountains_on_Earth"
     max_steps: 14
     expect:
-      answer_contains_all: ["Everest"]
-      answer_matches: "8[,.]?8\\d\\d"
+      # The goal says three, so the check requires three — by height rather than by name,
+      # because "Kangchenjunga"/"Kanchenjunga" are both current transliterations and
+      # grading a spelling variant as a factual error would be wrong. The heights are not
+      # ambiguous: 8,848 (Everest), 8,611 (K2), 8,586 (Kangchenjunga).
+      answer_contains_all: ["Everest", "K2", "8611", "8586"]
+      answer_matches: "884[89]"
 
   - id: dynamic-listing
     capability: dynamic SPA / lists
@@ -71,6 +75,9 @@ tasks:
     expect:
       answer_matches: "3\\.\\d+"
       answer_contains_any: ["node", "Node"]
+      # Both numbers must have been READ, not recalled: without this the agent can produce a
+      # perfectly plausible Node version it never looked at, and the check would not notice.
+      visited_domains: ["python.org", "nodejs.org"]
 
   - id: multi-tab
     capability: multi-tab
@@ -78,7 +85,11 @@ tasks:
     start_url: "https://www.python.org/downloads/"
     max_steps: 20
     expect:
-      min_answer_chars: 20
+      # Objectively checkable: Node's major version is in the 20s, Python's is 3. Anything
+      # that says Python is higher is wrong, however fluently it is phrased.
+      answer_matches: '(?i)node[^;]{0,45}(higher|greater|larger|bigger)'
+      answer_not_matches: '(?i)python[^;]{0,45}(higher|greater|larger|bigger)'
+      visited_domains: ["python.org", "nodejs.org"]
 
   - id: recover-from-dead-end
     capability: error recovery
