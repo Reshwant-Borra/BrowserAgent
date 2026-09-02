@@ -91,7 +91,8 @@ async def main_async(args: argparse.Namespace) -> int:
         task_dir=None,
         budget=ContextBudget(max_total_tokens=config.v2.max_total_tokens, blocks={
             "goal": 120, "memory": config.v2.memory_tokens, "state": config.v2.state_tokens,
-            "recent": 260, "tabs": 140, "page": config.v2.page_tokens, "hint": 260,
+            "evidence": config.v2.evidence_tokens, "recent": 260, "tabs": 140,
+            "page": config.v2.page_tokens, "hint": 260,
         }),
         limits=LoopLimits(max_steps=args.max_steps or config.v2.max_steps),
         max_output_tokens=config.v2.max_output_tokens,
@@ -99,6 +100,7 @@ async def main_async(args: argparse.Namespace) -> int:
         takeover=_takeover(),
         on_step=None if args.quiet else _print_step,
         memory_top_k=config.v2.memory_top_k,
+        evidence_top_k=config.v2.evidence_top_k,
     )
 
     try:

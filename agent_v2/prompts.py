@@ -36,15 +36,35 @@ open_tab    {"action":"open_tab","url":"https://..."}           new tab, keeps t
 switch_tab  {"action":"switch_tab","tab_id":N}                  N is an id from TABS
 close_agent_created_tab {"action":"close_agent_created_tab","tab_id":N}   only tabs you opened
 wait        {"action":"wait","ms":1000}                         only after something is loading
+compute     {"action":"compute","operation":"subtract","operands":["159.00","89.00"],
+             "labels":["Widget A","Widget B"],"evidence_ids":["ev_1","ev_2"]}
+            BrowserAgent does the arithmetic and hands you the exact answer. Never work a
+            number out in your head — ask for it. Operations: compare, min, max, sort_asc,
+            sort_desc, add, subtract, multiply, divide, percent_of, percent_change, count,
+            date_compare, version_compare.
 need_user   {"action":"need_user","message":"what the human must do"}
-finish      {"action":"finish","answer":"the complete answer for the user"}
+finish      {"action":"finish","answer":"the complete answer for the user",
+             "claims":[{"text":"Widget A costs $159.00","evidence_ids":["ev_1"],"kind":"source"}]}
 
 EVERY action also takes:
   "reason"  one short clause on why this action now
   "expect"  optional: text you expect to see afterwards, used to verify the action worked
   "state_updates": {"add_facts":[],"completed":[],"pending":[]}
     add_facts = concrete findings worth keeping. THIS IS THE ONLY MEMORY YOU HAVE between
-    steps, so record every result the goal asks for the moment you see it.
+    steps, so record every result the goal asks for the moment you see it. Write them so
+    they match the page you are looking at: a fact BrowserAgent cannot find on that page is
+    kept, but marked (unverified), and cannot support your final answer.
+
+EVIDENCE
+Each line under EVIDENCE is something BrowserAgent recorded from a page you really opened,
+or a calculation it really performed, and starts with the id it was given. In finish.claims
+you may cite those ids and only those ids. You cannot invent an id, and an id from another
+task will be rejected. kind is one of:
+  source     — read off a page. Needs evidence_ids.
+  derived    — a compute result. Cite the compute evidence id.
+  synthesis  — your own judgement ("B looks like better value"). No id needed, but any
+               number in it must still come from a page or a compute result.
+  meta       — about the run itself ("two of the three pages loaded").
 
 RULES
 - FIRST, every turn: if CURRENT PAGE or FACTS already contain what the goal asks for,
@@ -55,6 +75,11 @@ RULES
 - Only report what you have actually SEEN on a page during this task. You may not know what
   you think you know: versions, prices, dates and names change. If the goal needs a second
   source, go and open it — never fill the gap from your own knowledge.
+- Every number, price, version, date, quotation and website name in "answer" must come from
+  a page you opened in this task or from a compute result. Naming a site you did not open,
+  as though you had read it, is the worst thing you can do here — worse than an incomplete
+  answer. If you could not get something, say plainly which part is missing and why.
+- Do not do arithmetic or compare numbers yourself. Use compute and report its result.
 - Only use target ids that appear in INTERACTIVE right now. Ids change every turn.
 - Prefer typing a query and submit:true over hunting for a search button.
 - If the page has nothing useful, scroll or open_url somewhere better instead of repeating.
@@ -146,6 +171,7 @@ _DEFAULT_BUDGETS = {
     "goal": 120,
     "memory": 380,
     "state": 700,
+    "evidence": 340,
     "recent": 260,
     "tabs": 140,
     "page": 1500,
@@ -156,9 +182,13 @@ _DEFAULT_BUDGETS = {
 @dataclass
 class ContextBudget:
     """Per-block ceilings, plus a total ceiling that is enforced by squeezing the page block
-    (the only block that is both large and reconstructible on the next observation)."""
+    (the only block that is both large and reconstructible on the next observation).
 
-    max_total_tokens: int = 3600
+    The evidence block is a *selection* — never the whole ledger. Grounding must not be
+    bought by letting the prompt grow with the run (V2 hardening §18/§19), so the ceiling
+    here is what keeps a fifteen-step task's last prompt the same size as its third."""
+
+    max_total_tokens: int = 3900
     blocks: dict[str, int] = field(default_factory=lambda: dict(_DEFAULT_BUDGETS))
 
     def limit(self, name: str) -> int:
@@ -183,6 +213,7 @@ def build_context(
     memory_render: str = "",
     tabs_render: str = "",
     hint: str = "",
+    evidence_render: str = "",
     budget: Optional[ContextBudget] = None,
 ) -> BuiltContext:
     budget = budget or ContextBudget()
@@ -191,6 +222,7 @@ def build_context(
         ("goal", "GOAL", goal.strip()),
         ("memory", "WHAT YOU LEARNED IN EARLIER TASKS", memory_render.strip()),
         ("state", "TASK STATE", state.render()),
+        ("evidence", "EVIDENCE YOU MAY CITE", evidence_render.strip()),
         ("recent", "YOUR LAST FEW ACTIONS", state.render_recent_actions()),
         ("tabs", "TABS", tabs_render.strip()),
         ("hint", "IMPORTANT", hint.strip()),
@@ -214,7 +246,7 @@ def build_context(
         rendered["page"] = trim_to_token_budget(rendered["page"], allowed)
         block_tokens["page"] = count_tokens(rendered["page"])
 
-    order = ["goal", "memory", "state", "recent", "tabs", "hint", "page"]
+    order = ["goal", "memory", "state", "evidence", "recent", "tabs", "hint", "page"]
     body = "\n\n".join(rendered[name] for name in order if name in rendered)
     prompt = f"{SYSTEM}\n\n{body}\n\nReply with one JSON action.\n"
     return BuiltContext(prompt=prompt, block_tokens=block_tokens)
@@ -273,12 +305,19 @@ WHAT WENT WRONG:
 {problems}
 
 Keep ONLY durable knowledge:
-  preference / user_fact — something lasting about the user
+  preference / user_fact — something lasting about THE USER (not about you)
   site      — how a website behaves ("results only load when you scroll")
   strategy  — an approach that worked and would work again
   lesson    — a failure and what to do instead
-Reject anything task-specific ("found 7 results", "clicked Search"), anything about page
-mechanics that will not recur, and anything containing a password, code, or personal secret.
+
+Never write a sentence about yourself. "I successfully retrieved X", "I can compare version
+numbers", "I need to open both pages" are all worthless later: they are true of every task and
+tell a future task nothing. Write about the user, the site, or the technique instead.
+Never write down a value you happened to read — a price, a count, a version number, a date,
+a search result. Those change, and a memory that has quietly gone stale is worse than no
+memory at all. "Python 3.14.7 is the latest" is wrong within months; "python.org lists the
+latest version on the downloads page" stays true.
+Never write anything containing a password, code, or personal secret.
 Return an empty list if nothing here is durable — that is a normal and correct answer.
 
 Also return "procedure" (or null) if a repeatable sequence worked: a short goal_pattern, the

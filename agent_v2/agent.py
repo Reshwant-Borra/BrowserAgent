@@ -31,10 +31,26 @@ from agent_v2.actions import (
     V2Action,
     decision_json_schema,
     finish_json_schema,
+    finish_with_claims_schema,
     plan_json_schema,
     validate_decision,
 )
 from agent_v2.browser_ops import ActionOutcome, BrowserSession, Verification
+from agent_v2.compute import run_compute
+from agent_v2.grounding import (
+    GroundingReport,
+    check_answer,
+    classify_outcome,
+    source_coverage,
+)
+from agent_v2.ledger import (
+    EvidenceLedger,
+    EvidenceRecord,
+    ObservationRef,
+    all_figure_keys,
+    quoted_spans,
+    significant_figures,
+)
 from agent_v2.memory import MemoryStore, domain_of
 from agent_v2.prompts import (
     MEMORY_EXTRACTION_SCHEMA,
@@ -75,6 +91,7 @@ class BrowserAgentV2:
         takeover: Optional[TakeoverFn] = None,
         on_step: Optional[Callable[[dict], None]] = None,
         memory_top_k: int = 6,
+        evidence_top_k: int = 6,
     ):
         self.session = session
         self.client = client
@@ -87,6 +104,7 @@ class BrowserAgentV2:
         self.takeover = takeover
         self.on_step = on_step
         self.memory_top_k = memory_top_k
+        self.evidence_top_k = evidence_top_k
         self.schema = decision_json_schema()
         self.plan_schema = plan_json_schema()
         self.finish_schema = finish_json_schema()
@@ -96,15 +114,22 @@ class BrowserAgentV2:
         self._challenges = 0
         self._takeovers_done = 0
         self._refused_repeat_takeover = False
-        self._seen_figures: set[str] = set()
-        self._seen_text: list[str] = []
-        self._seen_chars = 0
+        self._claims_reasked = False
+        #: What actually happened, as opposed to what the model says happened. Created per
+        #: task; never shared between tasks (V2 hardening §2/§3/§17).
+        self.ledger: EvidenceLedger = EvidenceLedger("uninitialised")
+        #: The URL the last navigation asked for, so a redirect can be filed as an alias of
+        #: the page that actually loaded rather than as a page that was never seen.
+        self._requested_url = ""
 
     # ---- entry points ----------------------------------------------------------------
 
     async def run(self, goal: str, *, task_id: Optional[str] = None,
                   max_steps: Optional[int] = None) -> TaskState:
         state = TaskState(task_id=task_id or f"v2-{uuid.uuid4().hex[:10]}", goal=goal.strip())
+        self.ledger = EvidenceLedger(state.task_id)
+        self.ledger.goal = state.goal
+        self.ledger.requested_sources = _sources_named_in(state.goal)
         return await self._drive(state, max_steps=max_steps)
 
     async def resume(self, state: TaskState, *, max_steps: Optional[int] = None) -> TaskState:
@@ -112,6 +137,13 @@ class BrowserAgentV2:
         prompt history is replayed (V2 spec §32)."""
         state.status = TaskStatus.RUNNING.value
         state.pause_message = ""
+        if self.ledger.task_id != state.task_id:
+            path = self._ledger_path()
+            self.ledger = (EvidenceLedger.load(path, state.task_id) if path and path.exists()
+                           else EvidenceLedger(state.task_id))
+            self.ledger.goal = state.goal
+            if not self.ledger.requested_sources:
+                self.ledger.requested_sources = _sources_named_in(state.goal)
         return await self._drive(state, max_steps=max_steps)
 
     # ---- the loop --------------------------------------------------------------------
@@ -125,6 +157,7 @@ class BrowserAgentV2:
         steps_this_run = 0
         block_finish = False
         block_need_user = False
+        require_claims = False
 
         await self.session.adopt_existing_tabs()
 
@@ -139,7 +172,13 @@ class BrowserAgentV2:
             state.note_page(obs.url, obs.title, self.session.current_tab_id())
             self._note_domain(state, obs.url)
 
-            self._remember_figures(obs)
+            # The one place a resource becomes "observed". Everything downstream — what may
+            # be cited, what may be claimed, which sources the answer may name — is derived
+            # from this call and never from anything the model asserts (V2 hardening §3).
+            ref = self.ledger.note_observation(obs, state.step, requested_url=self._requested_url)
+            self._requested_url = ""
+            state.metrics.resources_observed = len(self.ledger.resources)
+
             memory_render = self._retrieve(state, obs)
             hint = _combine(pending_hint, self._page_hints(obs), self._takeover_hint(),
                             _first_turn_hint(state), _budget_hint(limit - steps_this_run))
@@ -149,7 +188,8 @@ class BrowserAgentV2:
                                           BrowserSession.render_tabs(tabs), hint,
                                           block_finish=block_finish,
                                           block_need_user=block_need_user,
-                                          require_plan=(state.step == 1 and not state.pending))
+                                          require_plan=(state.step == 1 and not state.pending),
+                                          require_claims=require_claims)
             block_finish = block_need_user = False
             if decision is None:
                 state.record_failure("could not produce a usable action for this page")
@@ -160,12 +200,7 @@ class BrowserAgentV2:
                 continue
 
             if decision.action is V2Action.FINISH:
-                # Snapshot the evidence *before* this decision's own state_updates land: a
-                # finish that both asserts a fabricated fact and files it under add_facts
-                # would otherwise certify itself.
-                evidence = list(state.facts)
-                state.apply_updates(decision.state_updates.add_facts, decision.state_updates.completed,
-                                    decision.state_updates.pending, self._spill_path(state))
+                self._absorb_updates(state, decision, ref)
                 if self._premature_finish(state, limit - steps_this_run):
                     # Asked once, never twice: a model that gives up with unfinished plan
                     # items and most of its budget left is usually one nudge away from doing
@@ -179,27 +214,53 @@ class BrowserAgentV2:
                         "piece, or click through to it."
                     )
                     continue
-                unsupported = self._unsupported_claims(state, decision.answer or "", evidence)
-                if unsupported and self._challenges < 2:
+
+                report = check_answer(answer=decision.answer or "", claims=decision.claims,
+                                      ledger=self.ledger, goal=state.goal,
+                                      meta_figures=self._meta_figures(state))
+                self._log(state, {
+                    "event": "grounding", "step": state.step,
+                    "claims": [{"text": c.text[:120], "evidence_ids": c.evidence_ids,
+                                "kind": c.kind} for c in decision.claims],
+                    "supported_claims": report.supported_claims,
+                    "problems": report.problems[:8],
+                })
+                if report.problems and self._may_challenge(limit - steps_this_run):
+                    # Challenged, not blocked. A small model that guessed will usually go and
+                    # look when told exactly which part of its answer has no source; one that
+                    # is right about something the checks cannot see gets to say so again, and
+                    # then the disclosure below carries the disagreement to the user.
+                    #
+                    # The shortfall also goes back into the plan. Observed on a three-source
+                    # research task: the model marked every plan item complete, invented the
+                    # third version, and once challenged had nothing left in STILL TO DO to
+                    # remind it what was actually missing on the following turns. An
+                    # ungrounded claim *is* unfinished work, so it is filed as such.
                     self._challenges += 1
+                    state.metrics.grounding_challenges += 1
                     block_finish = True
-                    pending_hint = (
-                        f"Your answer states {', '.join(unsupported[:3])}, but no page you have "
-                        "opened in this task showed that — you are reciting it from memory, and it "
-                        "may well be wrong. This turn you MUST take a browser action: open_url the "
-                        "page that actually has it and read it there."
-                    )
+                    require_claims = True
+                    # …and the "you still have plan items left" nudge is spent here rather
+                    # than fired separately for the same shortfall. Both say "you are not
+                    # done"; saying it twice costs a step and teaches nothing.
+                    self._pushed_back = True
+                    for item in self._outstanding(report):
+                        state.add_pending(item)
+                    pending_hint = self._grounding_hint(report)
                     continue
+
                 state.answer = decision.answer or ""
-                if unsupported:
-                    # Challenged and it stood by the claim. The honest outcome is to hand the
-                    # answer over with the defect labelled, not to quietly ship an unsourced
-                    # number as though it were read off a page.
-                    state.unsupported_claims = unsupported[:5]
-                    state.answer += ("\n\n[not verified: " + ", ".join(unsupported[:5]) +
-                                     " — these figures appear on no page this task opened]")
-                    state.record_failure(f"answer contains unverified figures: {', '.join(unsupported[:3])}")
+                if report.problems:
+                    # It stood by the answer. The honest outcome is to hand it over with the
+                    # unsupported parts named, never to present them as though they had been
+                    # read off a page (V2 hardening §29).
+                    state.unsupported_claims = report.problems[:5]
+                    state.answer += "\n\n" + report.label()
+                    state.record_failure("answer contains unsupported claims: "
+                                         + "; ".join(report.problems[:3]))
                 state.status = TaskStatus.DONE.value
+                state.outcome = classify_outcome(done=True, report=report,
+                                                 labelled=bool(report.label()) or report.clean)
                 self._record(state, decision, ActionOutcome(True, "finished"),
                              Verification(True), obs)
                 return await self._finalize(state, started)
@@ -215,6 +276,10 @@ class BrowserAgentV2:
                 continue
 
             if decision.action is V2Action.NEED_USER:
+                # Findings recorded on the way to asking for help are still findings. Dropping
+                # them meant a model that read the page and *then* hit a login lost what it
+                # had read, and had to go back for it after the human was done.
+                self._absorb_updates(state, decision, ref)
                 resumed = await self._pause_for_user(state, decision.message or "Your input is needed.", obs)
                 if not resumed:
                     state.metrics.total_s = time.time() - started
@@ -223,12 +288,36 @@ class BrowserAgentV2:
                 pending_hint = "The human has finished. Re-read the page before deciding."
                 continue
 
+            if decision.action is V2Action.COMPUTE:
+                # No browser involved: the model named an operation, BrowserAgent performs it,
+                # and the result becomes evidence with lineage back to the prices it used
+                # (V2 hardening §10/§12).
+                # Facts first, then the computation: the operands' evidence must exist before
+                # the record that cites it, and the ids the model sees next turn then read in
+                # the order it collected them.
+                self._absorb_updates(state, decision, ref)
+                outcome, verification = self._compute(state, decision, ref)
+                self._record(state, decision, outcome, verification, obs)
+                if verification.passed:
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    state.record_failure(f"compute failed — {verification.note}")
+                    pending_hint = (f"Your compute did not run: {verification.note}. "
+                                    "Fix the operands or choose a different operation.")
+                    if consecutive_failures >= self.limits.max_consecutive_failures:
+                        return await self._fail(state, "too many consecutive failed actions", started)
+                self._save(state)
+                continue
+
             allowed, note = await self._gate(decision, obs)
             if not allowed:
                 state.record_failure(f"not allowed: {note}")
                 pending_hint = f"That action was not permitted: {note}. Choose a different action."
                 continue
 
+            if decision.action in (V2Action.OPEN_URL, V2Action.OPEN_TAB):
+                self._requested_url = decision.url or ""
             outcome = await self.session.execute(decision, obs)
             state.metrics.browser_ms += outcome.browser_ms
             state.metrics.actions_executed += 1
@@ -238,11 +327,19 @@ class BrowserAgentV2:
             state.metrics.observe_ms += (time.monotonic() - observe_started) * 1000
             verification = self.session.verify(decision, outcome, obs, after)
 
-            state.apply_updates(decision.state_updates.add_facts, decision.state_updates.completed,
-                                decision.state_updates.pending, self._spill_path(state))
+            after_ref = self.ledger.note_observation(after, state.step,
+                                                     requested_url=self._requested_url)
+            self._requested_url = ""
+            state.metrics.resources_observed = len(self.ledger.resources)
+            self._absorb_updates(state, decision, ref, after_ref)
             if outcome.data.get("extracted"):
-                state.add_fact(f"From {domain_of(after.url)}: {outcome.data['extracted'][:280]}",
-                               self._spill_path(state))
+                # Text the browser itself returned. Its provenance is certain by construction,
+                # so it is filed against the page it was read from without a containment check.
+                text = f"From {domain_of(after.url)}: {outcome.data['extracted'][:280]}"
+                record, _why = self.ledger.record_observed(text, after_ref, state.step, trusted=True)
+                if record is not None:
+                    state.metrics.evidence_records += 1
+                state.add_fact(text, self._spill_path(state))
             self._record(state, decision, outcome, verification, after)
 
             if verification.passed:
@@ -274,11 +371,13 @@ class BrowserAgentV2:
     async def _decide(self, state: TaskState, obs: PageObservation, memory_render: str,
                       tabs_render: str, hint: str,
                       block_finish: bool = False, block_need_user: bool = False,
-                      require_plan: bool = False) -> Optional[Decision]:
+                      require_plan: bool = False,
+                      require_claims: bool = False) -> Optional[Decision]:
         """Ask, validate, and give the model up to `max_invalid_per_step` corrections. The
         correction text is the validation error itself, which is why validation errors are
         written as instructions rather than as diagnostics."""
         page_render = render_page(obs, token_budget=self.budget.limit("page"))
+        evidence_render = self._evidence_render(state)
         blocked = {V2Action.FINISH} if block_finish else set()
         if block_need_user:
             blocked.add(V2Action.NEED_USER)
@@ -296,6 +395,7 @@ class BrowserAgentV2:
                 memory_render=memory_render,
                 tabs_render=tabs_render,
                 hint=hint,
+                evidence_render=evidence_render,
                 budget=self.budget,
             )
             state.metrics.prompt_chars_max = max(state.metrics.prompt_chars_max, len(context.prompt))
@@ -352,6 +452,22 @@ class BrowserAgentV2:
                                       "Reply with a single JSON object.")
                 if attempt == self.limits.max_invalid_per_step:
                     return None
+                continue
+
+            if (require_claims and decision.action is V2Action.FINISH and not decision.claims
+                    and not self._claims_reasked and _needs_citation(decision.answer or "")
+                    and attempt < self.limits.max_invalid_per_step):
+                # Only for an answer that actually asserts something checkable. An honest
+                # "I could not reach the third source" needs no citations, and charging it a
+                # model call to say so would penalise exactly the outcome §29 prefers.
+                self._claims_reasked = True
+                # It has already had one answer rejected for grounding. Asking again in prose
+                # for citations is advice; a schema that cannot express a finish without them
+                # is the thing that actually produces them.
+                schema = finish_with_claims_schema()
+                hint = _combine(hint, "Your finish listed no claims. Put every factual "
+                                      "statement in your answer into `claims` with the "
+                                      "evidence id it came from.")
                 continue
 
             repeat = self._pointless_repeat(state, decision)
@@ -436,6 +552,12 @@ class BrowserAgentV2:
 
     async def _finalize(self, state: TaskState, started: float) -> TaskState:
         state.metrics.total_s = time.time() - started
+        coverage = source_coverage(self.ledger, state.answer)
+        state.source_coverage = coverage.render()
+        self._log(state, {"event": "source_coverage", "requested": coverage.requested,
+                          "visited": coverage.visited, "with_evidence": coverage.with_evidence,
+                          "named_in_answer": coverage.named_in_answer,
+                          "requested_but_unvisited": coverage.requested_but_unvisited})
         if self._procedure_id is not None and self.memory is not None:
             self.memory.record_procedure_outcome(
                 self._procedure_id, state.status == TaskStatus.DONE.value
@@ -468,8 +590,13 @@ class BrowserAgentV2:
                 domain=str(item.get("domain") or ""),
                 importance=float(item.get("importance") or 0.5),
                 source_task=state.task_id,
+                goal=state.goal,
             )
-            saved += 1 if memory_id else 0
+            if memory_id:
+                saved += 1
+            else:
+                self._log(state, {"event": "memory_rejected", "step": state.step,
+                                  "reason": self.memory.last_rejection})
         procedure = payload.get("procedure")
         if isinstance(procedure, dict) and state.status == TaskStatus.DONE.value:
             self.memory.save_procedure(
@@ -508,47 +635,139 @@ class BrowserAgentV2:
                           "target": decision.target_name, "reason": decision.reason,
                           "ok": verification.passed, "note": verification.note, "url": obs.url})
 
-    def _remember_figures(self, obs: PageObservation) -> None:
-        """Everything the agent has actually laid eyes on: the figure-shaped tokens, and a
-        bounded normalized corpus of the page text used to check quotations."""
-        page_text = " ".join(obs.visible_text) + " " + obs.title + " " + \
-                    " ".join(e.name for e in obs.elements)
-        if len(self._seen_figures) < 20000:
-            self._seen_figures.update(_figures(page_text))
-        if self._seen_chars < 1_000_000:
-            normalized = _normalize_prose(page_text)
-            self._seen_text.append(normalized)
-            self._seen_chars += len(normalized)
+    # ---- evidence --------------------------------------------------------------------
 
-    def _unsupported_claims(self, state: TaskState, answer: str,
-                            evidence: list[str]) -> list[str]:
-        """Claims in the answer that appear on no page this task ever loaded.
+    def _absorb_updates(self, state: TaskState, decision: Decision,
+                        *refs: ObservationRef) -> None:
+        """Apply the model's state edits, turning the ones that hold up into evidence.
 
-        This is verification (V2 spec §20) applied to the final answer rather than to a
-        click. Asked for something it could not find, a small model will produce a plausible
-        version number or an authoritative-sounding title straight from its weights — the
-        single most damaging failure mode for a research task, because the answer *looks*
-        right. Both are checkable without another model call, so both are checked:
-
-        - figure-shaped tokens (versions, years, prices, counts)
-        - quoted spans, which is precisely where the model asserts verbatim page content
-
-        Deliberately conservative. Anything the user wrote in the goal is fair game, short
-        quotes are ignored, and a flagged answer is challenged rather than blocked. `evidence`
-        is the facts list as it stood *before* this decision's own updates were applied —
-        passing the post-update list would let a fabrication vouch for itself.
+        `add_facts` is the whole evidence channel, and it costs nothing extra: the model was
+        already writing down what it found, and the only new thing is that BrowserAgent
+        checks each note against the page it was written against before minting a record
+        (V2 hardening §2). A note that does not hold up is still kept — it may be a legitimate
+        inference — but it is marked, and no record exists for it, so it can never support a
+        final claim. This is what closes the hole the old check had: a fabrication filed under
+        `add_facts` at step 3 used to become its own evidence by step 9.
         """
-        corpus = " ".join(self._seen_text) + " " + _normalize_prose(state.goal + " " + " ".join(evidence))
-        supported_figures = set(self._seen_figures)
-        supported_figures.update(_figures(state.goal))
-        supported_figures.update(_figures(" ".join(evidence)))
+        def verify(fact: str) -> bool:
+            # Both the page the model was reading when it wrote the note and the page it
+            # landed on afterwards. A model that writes "Widget A costs $159" on the step that
+            # opens Widget A's page is not fabricating — it is a step ahead, and the page it
+            # arrives at does show the figure. Either way the record is bound to a real
+            # observation, so provenance is unchanged.
+            why = "no observation to check against"
+            for candidate in refs:
+                record, why = self.ledger.record_observed(fact, candidate, state.step)
+                if record is not None:
+                    state.metrics.evidence_records += 1
+                    self._log(state, {"event": "evidence", "step": state.step,
+                                      "evidence_id": record.evidence_id,
+                                      "source": record.source_url})
+                    return True
+            state.metrics.evidence_rejected += 1
+            self._log(state, {"event": "evidence_rejected", "step": state.step,
+                              "reason": why, "fact_chars": len(fact)})
+            return False
 
-        claims = [f for f in _figures(answer) if f not in supported_figures]
-        for quote in _quoted_spans(answer):
-            normalized = _normalize_prose(quote)
-            if len(normalized) >= 12 and len(normalized.split()) >= 3 and normalized not in corpus:
-                claims.append(f'"{quote[:60]}"')
-        return claims
+        state.apply_updates(decision.state_updates.add_facts, decision.state_updates.completed,
+                            decision.state_updates.pending, self._spill_path(state),
+                            verify=verify)
+
+    def _compute(self, state: TaskState, decision: Decision,
+                 ref: ObservationRef) -> tuple[ActionOutcome, Verification]:
+        """Run one deterministic operation and file its result as derived evidence."""
+        result = run_compute(decision.operation or "", decision.operands, decision.labels)
+        state.metrics.computations += 1
+        if not result.ok:
+            state.metrics.compute_errors += 1
+            self._log(state, {"event": "compute", "step": state.step, "ok": False,
+                              "operation": decision.operation, "error": result.error})
+            return ActionOutcome(False, result.error), Verification(False, result.error)
+
+        sources: list[EvidenceRecord] = []
+        for raw in decision.evidence_ids:
+            citation = self.ledger.resolve(raw)
+            if citation.ok:
+                sources.append(citation.record)
+        record = self.ledger.record_derived(text=result.text, operation=result.operation,
+                                            sources=sources, step=state.step,
+                                            operands=result.operands)
+        state.metrics.evidence_records += 1
+        state.add_fact(f"{result.text} [{record.evidence_id}]", self._spill_path(state))
+        self._log(state, {"event": "compute", "step": state.step, "ok": True,
+                          "operation": result.operation, "operands": result.operands,
+                          "result": result.text, "evidence_id": record.evidence_id,
+                          "derived_from": record.derived_from})
+        return ActionOutcome(True, result.text), Verification(True, "", changed=False)
+
+    def _evidence_render(self, state: TaskState) -> str:
+        """The bounded evidence block. A selection relevant to the goal and the active
+        subgoal — never the whole ledger, which is what keeps the prompt flat over a long
+        run (V2 hardening §18/§19)."""
+        query = " ".join([state.goal, state.pending[0] if state.pending else ""])
+        records = self.ledger.select(query=query, limit=self.evidence_top_k,
+                                     token_budget=self.budget.limit("evidence"))
+        rendered = EvidenceLedger.render(records)
+        sources = self.ledger.render_sources()
+        if sources:
+            rendered += ("\n" if rendered else "") + "PAGES YOU HAVE ACTUALLY OPENED:\n" + sources
+        return rendered
+
+    def _meta_figures(self, state: TaskState) -> set[str]:
+        """Numbers a statement about the run itself may legitimately use, because
+        BrowserAgent knows them exactly."""
+        counts = [len(self.ledger.resources), state.step, state.metrics.actions_executed,
+                  len(state.facts) + state.spilled_facts, len(state.completed),
+                  len(state.pending), len(self.ledger.records)]
+        return all_figure_keys(" ".join(str(c) for c in counts)) | {str(c) for c in counts}
+
+    def _may_challenge(self, steps_left: int) -> bool:
+        """Challenging an ungrounded answer is worth a step only while there is budget to act
+        on the challenge. Two is the floor; a third is allowed when the run still has room,
+        because on real multi-source tasks the second challenge is often the one that sends
+        the model to the page it skipped. Beyond that it is arguing, not working."""
+        if self._challenges < 2:
+            return True
+        return self._challenges < 3 and steps_left > 4
+
+    @staticmethod
+    def _outstanding(report: GroundingReport) -> list[str]:
+        """The grounding shortfall, written as plan items the model can work through."""
+        items = [f"actually open {source} and read it there"
+                 for source in report.unvisited_sources[:2]]
+        items += [f"find {figure} on a real page, or drop it from the answer"
+                  for figure in report.unsupported_figures[:2]]
+        return items[:3]
+
+    @staticmethod
+    def _grounding_hint(report: GroundingReport) -> str:
+        """The challenge shown to the model. Names the exact defect rather than restating the
+        rule, because a small model corrects a specific fault and ignores a general one."""
+        parts: list[str] = []
+        if report.unsupported_figures:
+            parts.append("no page you opened in this task shows "
+                         + ", ".join(report.unsupported_figures[:4]))
+        if report.unvisited_sources:
+            parts.append("you have not opened " + ", ".join(report.unvisited_sources[:3])
+                         + ", so you cannot report what it says")
+        if report.unsupported_quotes:
+            parts.append("these quotations are on no page you opened: "
+                         + ", ".join(report.unsupported_quotes[:2]))
+        if report.invalid_citations:
+            parts.append("these evidence ids do not exist in this task: "
+                         + ", ".join(report.invalid_citations[:3]))
+        if report.unsupported_claims:
+            parts.append("; ".join(report.unsupported_claims[:2]))
+        return (
+            "Your answer was rejected: " + "; ".join(parts) + ". "
+            "This turn you MUST take a browser action — open_url the page that actually has "
+            "the missing piece and read it there. If you genuinely cannot get it, finish "
+            "instead with only what you did read, say plainly which part is missing, and cite "
+            "an evidence id from EVIDENCE for every fact you keep."
+        )
+
+    def _ledger_path(self) -> Optional[Path]:
+        return (self.task_dir / "evidence.json") if self.task_dir else None
 
     def _premature_finish(self, state: TaskState, steps_left: int) -> bool:
         """Finishing with plan items outstanding and most of the budget unspent."""
@@ -597,6 +816,14 @@ class BrowserAgentV2:
     def _page_hints(self, obs: PageObservation) -> str:
         """Generic, structural observations about the page — never about which site it is."""
         hints: list[str] = []
+        if not obs.elements:
+            # A plain-text document, a raw RFC, a rendered PDF. Observed on rfc-editor.org:
+            # the model tried to click element 1 sixteen times in a row on a page that has no
+            # elements at all, and burned the whole step budget on it. Saying so once is
+            # cheaper than sixteen stale-target rejections.
+            hints.append("This page has NO elements at all — it is plain text. Do not click, "
+                         "type, or extract a target here. Read what is in VISIBLE TEXT, "
+                         "scroll for more, or open_url somewhere else.")
         if any(el.sensitive for el in obs.elements):
             hints.append("This page has a password field. You cannot fill it. If signing in is "
                          "required, use need_user.")
@@ -622,6 +849,15 @@ class BrowserAgentV2:
         state.record_failure(reason)
         if not state.answer:
             state.answer = _partial_answer(state, reason)
+        # A partial answer is assembled from facts, and an unverified fact carries its marker
+        # into it — so the same grounding check applies here as to a model-authored finish.
+        report = check_answer(answer=state.answer, claims=[], ledger=self.ledger,
+                              goal=state.goal, meta_figures=self._meta_figures(state))
+        if report.problems:
+            state.unsupported_claims = report.problems[:5]
+            state.answer += "\n\n" + report.label()
+        state.outcome = classify_outcome(done=False, report=report,
+                                         labelled=bool(report.label()) or report.clean)
         return await self._finalize(state, started)
 
     def _spill_path(self, state: TaskState) -> Optional[Path]:
@@ -630,6 +866,7 @@ class BrowserAgentV2:
     def _save(self, state: TaskState) -> None:
         if self.task_dir is not None:
             state.save(self.task_dir / "state.json")
+            self.ledger.save(self.task_dir / "evidence.json")
 
     def _log(self, state: TaskState, payload: dict) -> None:
         """Compact JSONL. Never carries page dumps or field values (V2 spec §31)."""
@@ -702,27 +939,34 @@ def _partial_answer(state: TaskState, reason: str) -> str:
     return "\n".join(lines)
 
 
-#: Version/date/price-shaped tokens: "3.14.7", "1889", "8,849", "26.8.1". Deliberately not
-#: every number — a bare "3" or "10" is far too common to be evidence of anything.
-_FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)+|\b\d{3,}\b")
+#: A URL or bare host written into the goal. These are the sources the *user* asked for; the
+#: ledger tracks them purely so the final report can say which of them were actually reached
+#: (V2 hardening §8). Naming one here never counts as having visited it.
+_GOAL_SOURCE_RE = re.compile(
+    r"\b(?:https?://\S+|(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,24}(?:/\S*)?)", re.I)
 
 
-#: Quotation marks a model actually uses, straight and curly, single and double.
-_QUOTE_RE = re.compile(r"[\"“‘']([^\"“”‘’']{8,160})[\"”’']")
+def _sources_named_in(goal: str) -> list[str]:
+    out: list[str] = []
+    for match in _GOAL_SOURCE_RE.finditer(goal or ""):
+        source = match.group(0).rstrip(".,;:)!?\"'")
+        host = source.split("://")[-1].split("/")[0].lower()
+        if host.rsplit(".", 1)[-1] in _NOT_A_TLD:
+            continue
+        if source not in out:
+            out.append(source)
+    return out[:10]
 
 
-def _figures(text: str) -> set[str]:
-    return {match.group(0).replace(",", "") for match in _FIGURE_RE.finditer(text or "")}
+_NOT_A_TLD = {"js", "py", "ts", "html", "htm", "json", "md", "txt", "css", "pdf", "csv"}
 
 
-def _quoted_spans(text: str) -> list[str]:
-    return [m.group(1).strip() for m in _QUOTE_RE.finditer(text or "")]
-
-
-def _normalize_prose(text: str) -> str:
-    """Lowercase, alphanumeric-only, single-spaced — so a quotation still matches the page
-    when punctuation, capitalisation or whitespace differ."""
-    return " ".join("".join(c.lower() if c.isalnum() else " " for c in text or "").split())
+def _needs_citation(answer: str) -> bool:
+    """Does this answer assert anything a page could confirm? Figures, quotations and named
+    sites do; "I could not find it" does not."""
+    from agent_v2.grounding import hosts_mentioned
+    return bool(significant_figures(answer) or hosts_mentioned(answer)
+                or any(len(q.split()) >= 3 for q in quoted_spans(answer)))
 
 
 def _first_turn_hint(state: TaskState) -> str:

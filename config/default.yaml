@@ -85,9 +85,11 @@ v2:                                   # BrowserAgent V2 (agent_v2/) — see docs
   memory_db: "./runtime/v2/memory.sqlite3"
   memory_enabled: true
   memory_top_k: 6
-  max_total_tokens: 3600              # hard ceiling on the whole prompt
+  evidence_top_k: 6                   # evidence records shown per step, never the whole ledger
+  max_total_tokens: 3900              # hard ceiling on the whole prompt
   page_tokens: 1500
   memory_tokens: 380
+  evidence_tokens: 340
   state_tokens: 700
   max_output_tokens: 400
   keep_alive: "30m"                   # keep the model resident between steps

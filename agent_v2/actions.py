@@ -24,10 +24,15 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, Field
 
 from browser.page_model import PageObservation
+from agent_v2.compute import MAX_OPERAND_CHARS, MAX_OPERANDS, ComputeOp
+from agent_v2.grounding import Claim, ClaimKind
 
 REASON_MAX_CHARS = 160
 TEXT_MAX_CHARS = 400
 ANSWER_MAX_CHARS = 4000
+CLAIM_MAX_CHARS = 300
+MAX_CLAIMS = 20
+MAX_EVIDENCE_IDS = 12
 
 
 class V2Action(str, Enum):
@@ -42,6 +47,7 @@ class V2Action(str, Enum):
     SWITCH_TAB = "switch_tab"
     CLOSE_AGENT_CREATED_TAB = "close_agent_created_tab"
     WAIT = "wait"
+    COMPUTE = "compute"
     FINISH = "finish"
     NEED_USER = "need_user"
 
@@ -49,7 +55,10 @@ class V2Action(str, Enum):
 #: Actions that address an element id in the current observation.
 TARGETED = {V2Action.CLICK, V2Action.TYPE, V2Action.SELECT}
 #: Actions that never change the page and therefore never need verification beyond re-observing.
-READ_ONLY = {V2Action.EXTRACT, V2Action.SCROLL, V2Action.WAIT, V2Action.FINISH, V2Action.NEED_USER}
+READ_ONLY = {V2Action.EXTRACT, V2Action.SCROLL, V2Action.WAIT, V2Action.FINISH,
+             V2Action.NEED_USER, V2Action.COMPUTE}
+#: Actions that never touch the browser at all.
+OFFLINE = {V2Action.COMPUTE}
 
 _TEXT_INPUT_ROLES = {"textbox", "searchbox", "combobox", "spinbutton"}
 _SELECTABLE_ROLES = {"select", "combobox", "listbox"}
@@ -62,6 +71,17 @@ class StateUpdates(BaseModel):
     add_facts: list[str] = Field(default_factory=list)
     completed: list[str] = Field(default_factory=list)
     pending: list[str] = Field(default_factory=list)
+
+
+class RawClaim(BaseModel):
+    """One statement in the final answer, with the evidence the model says it rests on.
+
+    `evidence_ids` are *selected*, never authored: the only ids that resolve are ones
+    BrowserAgent minted and showed in this task's context (V2 hardening §4)."""
+
+    text: str = ""
+    evidence_ids: list[str] = Field(default_factory=list)
+    kind: Optional[str] = None
 
 
 class RawDecision(BaseModel):
@@ -82,6 +102,11 @@ class RawDecision(BaseModel):
     expect: Optional[str] = None
     reason: Optional[str] = None
     state_updates: Optional[StateUpdates] = None
+    operation: Optional[str] = None
+    operands: Optional[list[str]] = None
+    labels: Optional[list[str]] = None
+    evidence_ids: Optional[list[str]] = None
+    claims: Optional[list[RawClaim]] = None
 
 
 class Decision(BaseModel):
@@ -101,6 +126,15 @@ class Decision(BaseModel):
     expect: Optional[str] = None
     reason: str = ""
     state_updates: StateUpdates = Field(default_factory=StateUpdates)
+    #: `compute` only: a fixed operation from `agent_v2.compute` over literal operands. The
+    #: model names the operation; BrowserAgent performs it (V2 hardening §9/§11).
+    operation: Optional[str] = None
+    operands: list[str] = Field(default_factory=list)
+    labels: list[str] = Field(default_factory=list)
+    #: `compute` only: the evidence the operands were read from, so the result keeps lineage.
+    evidence_ids: list[str] = Field(default_factory=list)
+    #: `finish` only: the claim -> evidence contract.
+    claims: list[Claim] = Field(default_factory=list)
     #: Accessible name of the targeted element, captured at validation time — used for risk
     #: classification, loop signatures and logs so none of those re-resolve a stale id later.
     target_name: Optional[str] = None
@@ -119,6 +153,8 @@ class Decision(BaseModel):
             detail = _normalize_url(self.url or "")
         elif self.action is V2Action.SCROLL:
             detail = self.direction
+        elif self.action is V2Action.COMPUTE:
+            detail = f"{self.operation}({','.join(self.operands)})"
         return f"{self.action.value}:{name}:{detail}"
 
 
@@ -159,6 +195,23 @@ def decision_json_schema(exclude: Optional[set["V2Action"]] = None) -> dict[str,
             "message": {"type": ["string", "null"]},
             "expect": {"type": ["string", "null"]},
             "reason": {"type": ["string", "null"]},
+            "operation": {"type": ["string", "null"],
+                          "enum": [o.value for o in ComputeOp] + [None]},
+            "operands": {"type": ["array", "null"], "items": {"type": "string"}},
+            "labels": {"type": ["array", "null"], "items": {"type": "string"}},
+            "evidence_ids": {"type": ["array", "null"], "items": {"type": "string"}},
+            "claims": {
+                "type": ["array", "null"],
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                        "kind": {"type": "string", "enum": list(ClaimKind.ALL)},
+                    },
+                    "required": ["text", "kind"],
+                },
+            },
             "state_updates": {
                 "type": ["object", "null"],
                 "properties": {
@@ -281,10 +334,16 @@ def validate_decision(raw: RawDecision, obs: PageObservation) -> Decision:
     elif raw.target is not None and action is V2Action.EXTRACT:
         element = obs.element_by_id(raw.target)
         if element is None:
-            raise DecisionError("stale_target", f"element id {raw.target} is not on the current page")
-        decision.target = raw.target
-        decision.target_name = element.name
-        decision.target_role = element.role
+            # Reading a whole page is a reasonable reading of "extract element 11" when there
+            # is no element 11, and it is what the model wanted anyway. Rejecting it instead
+            # produced a genuine stall on a plain-text document — a page with no interactive
+            # elements at all, where the model asked for the same absent id on every one of
+            # the remaining steps and the task ran out of budget arguing about it.
+            decision.target = None
+        else:
+            decision.target = raw.target
+            decision.target_name = element.name
+            decision.target_role = element.role
 
     if action in (V2Action.OPEN_URL, V2Action.OPEN_TAB):
         url = (raw.url or "").strip()
@@ -312,6 +371,29 @@ def validate_decision(raw: RawDecision, obs: PageObservation) -> Decision:
         decision.ms = max(200, min(int(raw.ms or 1000), 3000))
         decision.text = raw.text  # optional "wait until this text appears"
 
+    if action is V2Action.COMPUTE:
+        # Everything about a compute action is checked here, before anything is executed:
+        # the operation must be one of a fixed set, the operands must be literals, and there
+        # must not be too many of them. There is no path from model output to code
+        # execution — `agent_v2.compute` only ever dispatches on this enum (V2 hardening §11).
+        operation = (raw.operation or "").strip().lower()
+        if not operation:
+            raise DecisionError("missing_operation",
+                                "compute requires `operation`, one of: "
+                                + ", ".join(o.value for o in ComputeOp))
+        if operation not in {o.value for o in ComputeOp}:
+            raise DecisionError("invalid_operation",
+                                f"'{operation}' is not a supported operation. Use one of: "
+                                + ", ".join(o.value for o in ComputeOp))
+        operands = [" ".join(str(o).split())[:MAX_OPERAND_CHARS] for o in (raw.operands or [])]
+        if len(operands) > MAX_OPERANDS:
+            raise DecisionError("too_many_operands",
+                                f"compute takes at most {MAX_OPERANDS} operands, got {len(operands)}")
+        decision.operation = operation
+        decision.operands = operands
+        decision.labels = [" ".join(str(l).split())[:80] for l in (raw.labels or [])][:MAX_OPERANDS]
+        decision.evidence_ids = [str(e).strip()[:48] for e in (raw.evidence_ids or [])][:MAX_EVIDENCE_IDS]
+
     if action is V2Action.FINISH:
         answer = (raw.answer or raw.text or "").strip()
         if not answer:
@@ -320,11 +402,44 @@ def validate_decision(raw: RawDecision, obs: PageObservation) -> Decision:
                 "finish requires `answer` containing the actual result for the user",
             )
         decision.answer = answer[:ANSWER_MAX_CHARS]
+        decision.claims = _claims(raw.claims)
 
     if action is V2Action.NEED_USER:
         decision.message = (raw.message or raw.reason or "Your input is needed in the browser.")[:REASON_MAX_CHARS * 2]
 
     return decision
+
+
+def _claims(raw_claims: Optional[list[RawClaim]]) -> list[Claim]:
+    """Bound and normalize the claim list. Nothing is rejected here — an unknown evidence id
+    is not a malformed action, it is an ungrounded answer, and that is decided against the
+    ledger in `agent_v2.grounding` where the answer as a whole is checked."""
+    out: list[Claim] = []
+    for raw in (raw_claims or [])[:MAX_CLAIMS]:
+        text = " ".join(str(raw.text or "").split())[:CLAIM_MAX_CHARS]
+        if not text:
+            continue
+        kind = (raw.kind or ClaimKind.SOURCE).strip().lower()
+        out.append(Claim(
+            text=text,
+            evidence_ids=[str(e).strip()[:48] for e in (raw.evidence_ids or [])][:MAX_EVIDENCE_IDS],
+            kind=kind if kind in ClaimKind.ALL else ClaimKind.SOURCE,
+        ))
+    return out
+
+
+def finish_with_claims_schema() -> dict[str, Any]:
+    """A `finish` that must carry its claim list.
+
+    Used only when the loop has already rejected an ungrounded answer: at that point asking
+    in prose for citations has demonstrably not worked, so the grammar stops being able to
+    express a finish without them (the same device `plan_json_schema` uses for the plan)."""
+    schema = finish_json_schema()
+    schema["required"] = ["action", "answer", "reason", "claims"]
+    claims = schema["properties"]["claims"]
+    claims["type"] = "array"
+    claims["minItems"] = 1
+    return schema
 
 
 def normalize_url(url: str, base_url: str) -> str:

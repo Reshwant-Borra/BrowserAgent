@@ -176,9 +176,13 @@ class V2Config:
     memory_db: str = "./runtime/v2/memory.sqlite3"
     memory_enabled: bool = True
     memory_top_k: int = 6
-    max_total_tokens: int = 3600
+    #: Evidence is retrieved into the prompt the same way memory is: a bounded selection, so
+    #: that grounding does not cost a prompt that grows with the run (V2 hardening §18).
+    evidence_top_k: int = 6
+    max_total_tokens: int = 3900
     page_tokens: int = 1500
     memory_tokens: int = 380
+    evidence_tokens: int = 340
     state_tokens: int = 700
     max_output_tokens: int = 400
     keep_alive: str = "30m"

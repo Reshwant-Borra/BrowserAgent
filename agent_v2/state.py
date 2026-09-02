@@ -20,12 +20,18 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent.token_budget import count_tokens
 
 MAX_FACT_CHARS = 300
 MAX_LINE_CHARS = 200
+
+#: Prefix on a fact the evidence ledger could not tie to the page it was written against.
+#: The fact is still kept — the model may be reasoning legitimately — but it is marked, so
+#: the model can see which of its own notes will not stand behind a final answer, and so a
+#: later restatement of the same fact does not read as a second, independent one.
+UNVERIFIED = "(unverified)"
 
 
 class TaskStatus(str, Enum):
@@ -76,6 +82,13 @@ class Metrics:
     memory_hits: int = 0
     procedure_hits: int = 0
     human_interventions: int = 0
+    #: Grounding (V2 hardening §2/§4/§9).
+    evidence_records: int = 0
+    evidence_rejected: int = 0
+    resources_observed: int = 0
+    computations: int = 0
+    compute_errors: int = 0
+    grounding_challenges: int = 0
     started_at: float = field(default_factory=time.time)
     total_s: float = 0.0
 
@@ -101,9 +114,13 @@ class TaskState:
     #: cheap way to tell "reported from a source" apart from "recited from memory".
     domains: list[str] = field(default_factory=list)
     answer: str = ""
-    #: Figures the final answer asserts that appear on no page this task opened. Surfaced
-    #: to the user rather than silently shipped (see BrowserAgentV2._unsupported_figures).
+    #: Everything in the final answer that the evidence ledger could not account for.
+    #: Surfaced to the user rather than silently shipped (see agent_v2.grounding).
     unsupported_claims: list[str] = field(default_factory=list)
+    #: FULL_SUCCESS / PARTIAL_GROUNDED / SAFE_FAILURE / UNSUPPORTED_SUCCESS (§29).
+    outcome: str = ""
+    #: One line of deterministic source accounting, for the run report.
+    source_coverage: str = ""
     pause_message: str = ""
     metrics: Metrics = field(default_factory=Metrics)
 
@@ -118,17 +135,32 @@ class TaskState:
     # ---- mutation -------------------------------------------------------------------
 
     def apply_updates(self, add_facts: list[str], completed: list[str], pending: list[str],
-                      spill_path: Optional[Path] = None) -> None:
+                      spill_path: Optional[Path] = None,
+                      verify: Optional[Callable[[str], bool]] = None) -> None:
+        """`verify` is the evidence ledger's opinion of each proposed fact: True when the
+        page the fact was written against actually showed it. A fact that fails is still
+        kept — the model needs its own notes — but it is marked, and no evidence record
+        exists for it, so it can never support a final claim."""
         for fact in add_facts:
-            self.add_fact(fact, spill_path)
+            self.add_fact(fact, spill_path, verified=True if verify is None else verify(fact))
         for item in completed:
             self.mark_completed(item)
         for item in pending:
             self.add_pending(item)
 
-    def add_fact(self, fact: str, spill_path: Optional[Path] = None) -> None:
+    def add_fact(self, fact: str, spill_path: Optional[Path] = None,
+                 verified: bool = True) -> None:
         fact = _clean(fact, MAX_FACT_CHARS)
-        if not fact or _dupe(fact, self.facts):
+        if not fact:
+            return
+        if not verified and not fact.startswith(UNVERIFIED):
+            fact = f"{UNVERIFIED} {fact}"
+        existing = _index_of(fact, self.facts)
+        if existing is not None:
+            # The model went and read the page it had previously only asserted from memory.
+            # Upgrading in place is the whole point of marking rather than dropping.
+            if verified and self.facts[existing].startswith(UNVERIFIED):
+                self.facts[existing] = fact
             return
         self.facts.append(fact)
         if len(self.facts) > self.max_facts:
@@ -249,8 +281,17 @@ def _dupe(text: str, existing: list[str]) -> bool:
     return _key(text) in {_key(e) for e in existing}
 
 
+def _index_of(text: str, existing: list[str]) -> Optional[int]:
+    key = _key(text)
+    for index, item in enumerate(existing):
+        if _key(item) == key:
+            return index
+    return None
+
+
 def _key(text: str) -> str:
-    return " ".join("".join(c.lower() if c.isalnum() else " " for c in text).split())
+    key = " ".join("".join(c.lower() if c.isalnum() else " " for c in text).split())
+    return key.removeprefix("unverified ").strip()
 
 
 def _append_line(path: Path, line: str) -> None:

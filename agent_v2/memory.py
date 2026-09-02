@@ -51,6 +51,103 @@ _SECRET_PATTERNS = [
     re.compile(r"\bcvv\b|\bcard number\b|\bssn\b", re.I),
 ]
 
+#: Things that were true of one page at one moment. Long-term memory is for how the world
+#: works, not for what it happened to say (V2 hardening §14). Each pattern below was written
+#: against a row the extractor actually produced during the dev and holdout suites — see
+#: `evals/audit_memory.py`, which is what the thresholds here are answerable to.
+_TRANSIENT_PATTERNS = [
+    # A price. Prices are the single most common thing the extractor tried to make durable,
+    # and the one least likely to still be true.
+    (re.compile(r"[$£€¥₹]\s?\d"), "a price"),
+    (re.compile(r"\b\d+(?:[.,]\d+)?\s*(?:usd|eur|gbp|dollars?|euros?|pounds?)\b", re.I), "a price"),
+    # The result of one search.
+    (re.compile(r"\b\d+\s+(results?|items?|products?|options?|listings?|entries|rows|"
+                r"matches|stories|articles|hits)\b", re.I), "a one-off count"),
+    # "the latest X is 3.13.1" — true today, wrong next quarter, and stated with the same
+    # confidence either way. The `v?` matters: "v26.8.1" is how half the web writes a version,
+    # and without it the audit found this rule silently missing every Node release.
+    (re.compile(r"\b(current|latest|newest|stable|released?|version)\b[^.]{0,40}?"
+                r"\bv?\d+\.\d+", re.I), "a version number that will change"),
+    (re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b[^.]{0,30}?\b(is|was)\s+(the\s+)?"
+                r"(current|latest|newest|stable)\b", re.I), "a version number that will change"),
+    # A specific date or time this task happened to see.
+    (re.compile(r"\b(as of|on)\s+\d{1,2}\s+\w+\s+\d{4}\b", re.I), "a point-in-time reading"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}\b"), "a point-in-time reading"),
+    # Where something sat in one listing on one day. The spec names candidate rankings
+    # explicitly, and this is the shape they take: an ordinal pointing at page furniture.
+    (re.compile(r"\b(first|second|third|fourth|fifth|top|last|next)\s+"
+                r"(row|result|item|entry|option|candidate|listing|link|match|hit|product)s?\b",
+                re.I), "where something sat in one listing"),
+]
+
+#: The run narrating itself. "I clicked Search and found seven results" is a description of
+#: one episode; nothing in it will help a different task weeks from now. The `(?:\w+\s+){0,2}`
+#: is there because the extractor overwhelmingly writes "I successfully retrieved…" rather
+#: than "I retrieved…", and the adverb was enough to slip the whole class past the filter.
+_EPISODIC_PATTERNS = [
+    re.compile(r"\b(i|we)\s+(?:\w+\s+){0,2}(found|clicked|opened|navigated|searched|typed|"
+               r"selected|scrolled|extracted|visited|checked|read|saw|used|located|"
+               r"discovered|confirmed|identified|retrieved|completed|reported|quoted|"
+               r"verified|compared|obtained)\b", re.I),
+    # Capability and intent narration: "I can compare version numbers", "I need to open both
+    # download pages". True of every task and therefore informative about none.
+    re.compile(r"\b(i|we)\s+(can|could|will|should|must|need to|needed to|am able|are able|"
+               r"was able|were able|have to|had to)\b", re.I),
+    re.compile(r"\bthe (search|page|site|query|click|task)\s+(returned|showed|gave|listed|"
+               r"produced|yielded)\b", re.I),
+    re.compile(r"\b(in|for|during|after)\s+(this|the current|the last)\s+task\b", re.I),
+    re.compile(r"\bthe (user'?s?\s+)?(goal|task|objective|request)\s+"
+               r"(was|is|required|involved|asked|needed)\b", re.I),
+]
+
+
+class WritePolicy:
+    """Why a proposed memory was or was not made durable."""
+
+    ACCEPT = "accept"
+    SECRET = "secret"
+    TRANSIENT = "transient"
+    EPISODIC = "episodic"
+    LOW_INFORMATION = "low_information"
+    GOAL_ECHO = "goal_echo"
+
+
+def classify_write(text: str, *, type: str = "", goal: str = "") -> tuple[str, str]:
+    """Deterministic long-term-memory admission. Returns `(verdict, reason)`.
+
+    Called on every write, whatever the model asked for. The extraction prompt asks for
+    durable knowledge and mostly complies; this is what happens when it does not. The rules
+    are generic — none of them names a website — and each rejects a *shape* of statement
+    rather than a topic, so a genuinely reusable fact about prices ("this shop shows prices
+    only after you choose a country") still gets through while "the vacuum costs $159" does
+    not.
+    """
+    text = " ".join(str(text or "").split())
+    if not text:
+        return WritePolicy.LOW_INFORMATION, "empty"
+    if contains_secret(text):
+        return WritePolicy.SECRET, "contains a credential, code or card detail"
+    # Shape before size. "The latest release is 3.13.1" is short *and* transient, and the
+    # reason a row was refused is what the audit reads, so the more specific verdict wins.
+    for pattern, why in _TRANSIENT_PATTERNS:
+        if pattern.search(text):
+            return WritePolicy.TRANSIENT, f"records {why}"
+    for pattern in _EPISODIC_PATTERNS:
+        if pattern.search(text):
+            return WritePolicy.EPISODIC, "describes what happened in one task"
+    if len(text) < 20 or len(_terms(text)) < 3:
+        return WritePolicy.LOW_INFORMATION, "too short to be useful later"
+    # A near-restatement of the goal is the extractor summarizing the task rather than
+    # learning from it. Only rejected when it also carries a figure, so a real lesson that
+    # happens to share the goal's vocabulary survives.
+    goal_terms = _terms(goal)
+    if goal_terms:
+        own = _terms(text)
+        overlap = len(own & goal_terms) / max(len(own), 1)
+        if overlap >= 0.7 and re.search(r"\d", text):
+            return WritePolicy.GOAL_ECHO, "restates this task's goal and its numbers"
+    return WritePolicy.ACCEPT, ""
+
 
 @dataclass(frozen=True)
 class Memory:
@@ -144,6 +241,10 @@ class MemoryStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
+        #: Why writes were refused, by verdict. Read by `evals/audit_memory.py`; never
+        #: written to disk, since a refused memory is exactly the thing not to persist.
+        self.rejections: dict[str, int] = {}
+        self.last_rejection: str = ""
         with self.conn:
             self.conn.executescript(_SCHEMA)
 
@@ -153,13 +254,18 @@ class MemoryStore:
     # ---- writing --------------------------------------------------------------------
 
     def save(self, type: str, text: str, *, domain: str = "", importance: float = 0.5,
-             source_task: str = "") -> Optional[int]:
-        """Store one durable memory. Returns the new row id, or None if the text was
-        rejected (empty, secret-bearing, or an exact duplicate of an active row)."""
+             source_task: str = "", goal: str = "") -> Optional[int]:
+        """Store one durable memory, or refuse.
+
+        Returns the new row id, or None when `classify_write` declined it. The refusal is the
+        boundary the credential and transient-data guarantees rest on: it is enforced here,
+        on the way in, not audited afterwards on the database (V2 hardening §14/§15).
+        """
         text = " ".join(str(text or "").split())[:400]
-        if not text or len(text) < 8:
-            return None
-        if contains_secret(text):
+        verdict, reason = classify_write(text, type=type, goal=goal)
+        self.last_rejection = "" if verdict == WritePolicy.ACCEPT else f"{verdict}: {reason}"
+        if verdict != WritePolicy.ACCEPT:
+            self.rejections[verdict] = self.rejections.get(verdict, 0) + 1
             return None
         if type not in MEMORY_TYPES:
             type = "site" if domain else "strategy"
