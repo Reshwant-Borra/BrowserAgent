@@ -68,8 +68,9 @@ def check(expect: dict[str, Any], state: TaskState) -> list[str]:
     lowered = answer.lower()
     problems: list[str] = []
 
-    if state.status != TaskStatus.DONE.value:
-        problems.append(f"status={state.status}")
+    wanted_status = expect.get("status", TaskStatus.DONE.value)
+    if state.status != wanted_status:
+        problems.append(f"status={state.status}, expected {wanted_status}")
 
     for needle in expect.get("answer_contains_all", []):
         if needle.lower() not in lowered:
@@ -150,7 +151,12 @@ async def run_task(task: dict, config, memory: Optional[MemoryStore], out_dir: P
 
     try:
         if task.get("start_url"):
-            await backend.open_url(task["start_url"])
+            # A blip opening the start page must not zero out the task: the agent is
+            # perfectly capable of navigating there itself as its first action.
+            try:
+                await agent.session._goto(backend.page, task["start_url"])
+            except Exception as exc:
+                result.error = f"start_url did not load ({type(exc).__name__}); agent started anyway"
         state = await agent.run(task["goal"], task_id=task["id"])
     except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"

@@ -30,6 +30,7 @@ from agent_v2.actions import (
     RawDecision,
     V2Action,
     decision_json_schema,
+    finish_json_schema,
     plan_json_schema,
     validate_decision,
 )
@@ -88,11 +89,16 @@ class BrowserAgentV2:
         self.memory_top_k = memory_top_k
         self.schema = decision_json_schema()
         self.plan_schema = plan_json_schema()
+        self.finish_schema = finish_json_schema()
         self._domains_seen: list[str] = []
         self._procedure_id: Optional[int] = None
         self._pushed_back = False
         self._challenges = 0
+        self._takeovers_done = 0
+        self._refused_repeat_takeover = False
         self._seen_figures: set[str] = set()
+        self._seen_text: list[str] = []
+        self._seen_chars = 0
 
     # ---- entry points ----------------------------------------------------------------
 
@@ -118,6 +124,7 @@ class BrowserAgentV2:
         no_change_streak = 0
         steps_this_run = 0
         block_finish = False
+        block_need_user = False
 
         await self.session.adopt_existing_tabs()
 
@@ -134,15 +141,16 @@ class BrowserAgentV2:
 
             self._remember_figures(obs)
             memory_render = self._retrieve(state, obs)
-            hint = _combine(pending_hint, self._page_hints(obs),
+            hint = _combine(pending_hint, self._page_hints(obs), self._takeover_hint(),
                             _first_turn_hint(state), _budget_hint(limit - steps_this_run))
             pending_hint = ""
 
             decision = await self._decide(state, obs, memory_render,
                                           BrowserSession.render_tabs(tabs), hint,
                                           block_finish=block_finish,
+                                          block_need_user=block_need_user,
                                           require_plan=(state.step == 1 and not state.pending))
-            block_finish = False
+            block_finish = block_need_user = False
             if decision is None:
                 state.record_failure("could not produce a usable action for this page")
                 consecutive_failures += 1
@@ -152,6 +160,10 @@ class BrowserAgentV2:
                 continue
 
             if decision.action is V2Action.FINISH:
+                # Snapshot the evidence *before* this decision's own state_updates land: a
+                # finish that both asserts a fabricated fact and files it under add_facts
+                # would otherwise certify itself.
+                evidence = list(state.facts)
                 state.apply_updates(decision.state_updates.add_facts, decision.state_updates.completed,
                                     decision.state_updates.pending, self._spill_path(state))
                 if self._premature_finish(state, limit - steps_this_run):
@@ -167,7 +179,7 @@ class BrowserAgentV2:
                         "piece, or click through to it."
                     )
                     continue
-                unsupported = self._unsupported_figures(state, decision.answer or "")
+                unsupported = self._unsupported_claims(state, decision.answer or "", evidence)
                 if unsupported and self._challenges < 2:
                     self._challenges += 1
                     block_finish = True
@@ -175,7 +187,7 @@ class BrowserAgentV2:
                         f"Your answer states {', '.join(unsupported[:3])}, but no page you have "
                         "opened in this task showed that — you are reciting it from memory, and it "
                         "may well be wrong. This turn you MUST take a browser action: open_url the "
-                        "official page that has this figure and read it there."
+                        "page that actually has it and read it there."
                     )
                     continue
                 state.answer = decision.answer or ""
@@ -191,6 +203,16 @@ class BrowserAgentV2:
                 self._record(state, decision, ActionOutcome(True, "finished"),
                              Verification(True), obs)
                 return await self._finalize(state, started)
+
+            if decision.action is V2Action.NEED_USER and self._takeovers_done and                     not self._refused_repeat_takeover:
+                # The human already handed control back once. Interrupting them again for the
+                # same thing is a bug, not a request — so it is refused once, in the grammar,
+                # rather than merely discouraged in prose. If the model still needs a human on
+                # the next turn (a genuine second factor, say), it gets one.
+                self._refused_repeat_takeover = True
+                block_need_user = True
+                pending_hint = _combine(pending_hint, self._takeover_hint())
+                continue
 
             if decision.action is V2Action.NEED_USER:
                 resumed = await self._pause_for_user(state, decision.message or "Your input is needed.", obs)
@@ -251,13 +273,17 @@ class BrowserAgentV2:
 
     async def _decide(self, state: TaskState, obs: PageObservation, memory_render: str,
                       tabs_render: str, hint: str,
-                      block_finish: bool = False, require_plan: bool = False) -> Optional[Decision]:
+                      block_finish: bool = False, block_need_user: bool = False,
+                      require_plan: bool = False) -> Optional[Decision]:
         """Ask, validate, and give the model up to `max_invalid_per_step` corrections. The
         correction text is the validation error itself, which is why validation errors are
         written as instructions rather than as diagnostics."""
         page_render = render_page(obs, token_budget=self.budget.limit("page"))
-        if block_finish:
-            schema = decision_json_schema({V2Action.FINISH})
+        blocked = {V2Action.FINISH} if block_finish else set()
+        if block_need_user:
+            blocked.add(V2Action.NEED_USER)
+        if blocked:
+            schema = decision_json_schema(blocked)
         elif require_plan:
             schema = self.plan_schema
         else:
@@ -295,13 +321,17 @@ class BrowserAgentV2:
                 state.metrics.invalid_decisions += 1
                 self._log(state, {"event": "rejected", "step": state.step, "kind": exc.kind,
                                   "detail": exc.message[:160], "url": obs.url})
-                if exc.kind == "missing_answer" and attempt == self.limits.max_invalid_per_step:
-                    # It wants to stop but keeps omitting the answer field. Ending the task
-                    # with the facts already collected beats burning the remaining budget on
-                    # a formatting argument — the agent has the content, it just failed to
-                    # restate it.
-                    return Decision(action=V2Action.FINISH, reason=raw.reason or "",
-                                    answer=_partial_answer(state, "the model omitted its answer"))
+                if exc.kind == "missing_answer":
+                    # It wants to stop but left `answer` out. Re-ask once under a schema that
+                    # cannot omit it; if even that fails, end the task with the facts already
+                    # collected rather than burning the budget arguing about a field.
+                    schema = self.finish_schema
+                    if attempt == self.limits.max_invalid_per_step:
+                        return Decision(action=V2Action.FINISH, reason=raw.reason or "",
+                                        answer=_partial_answer(state, "the model omitted its answer"))
+                    hint = _combine(hint, "Your finish had no `answer`. Put the complete result "
+                                          "for the user in the `answer` field.")
+                    continue
                 if exc.kind == "sensitive_field":
                     # The model tried to fill a credential field. That is never retried as a
                     # browser action — it becomes a human takeover (V2 spec §7).
@@ -372,8 +402,19 @@ class BrowserAgentV2:
         if resumed:
             state.status = TaskStatus.RUNNING.value
             state.pause_message = ""
-            state.mark_completed("the human completed a step in the browser")
+            self._takeovers_done += 1
+            state.mark_completed("the human signed in / completed a step in the browser")
         return resumed
+
+    def _takeover_hint(self) -> str:
+        """Interrupting the user once is necessary; interrupting them again for the same
+        thing is a bug. Observed on a real login: after the human signed in, the agent
+        wandered back to the form and asked a second and third time."""
+        if not self._takeovers_done:
+            return ""
+        return ("The human has ALREADY signed in for you in this browser. Do not use need_user "
+                "again for login. If you are looking at a login form, you have navigated to the "
+                "wrong page — go to where the task actually needs to be.")
 
     # ---- memory ----------------------------------------------------------------------
 
@@ -468,28 +509,46 @@ class BrowserAgentV2:
                           "ok": verification.passed, "note": verification.note, "url": obs.url})
 
     def _remember_figures(self, obs: PageObservation) -> None:
-        """Every version/date/price-shaped token the agent has actually laid eyes on."""
+        """Everything the agent has actually laid eyes on: the figure-shaped tokens, and a
+        bounded normalized corpus of the page text used to check quotations."""
+        page_text = " ".join(obs.visible_text) + " " + obs.title + " " + \
+                    " ".join(e.name for e in obs.elements)
         if len(self._seen_figures) < 20000:
-            self._seen_figures.update(_figures(" ".join(obs.visible_text)))
-            self._seen_figures.update(_figures(obs.title))
-            self._seen_figures.update(_figures(" ".join(e.name for e in obs.elements)))
+            self._seen_figures.update(_figures(page_text))
+        if self._seen_chars < 1_000_000:
+            normalized = _normalize_prose(page_text)
+            self._seen_text.append(normalized)
+            self._seen_chars += len(normalized)
 
-    def _unsupported_figures(self, state: TaskState, answer: str) -> list[str]:
-        """Figures in the answer that appear on no page this task ever loaded.
+    def _unsupported_claims(self, state: TaskState, answer: str,
+                            evidence: list[str]) -> list[str]:
+        """Claims in the answer that appear on no page this task ever loaded.
 
         This is verification (V2 spec §20) applied to the final answer rather than to a
-        click. A small model asked for "the current version of X" will happily produce a
-        plausible number from its weights when it cannot find one, and that is the single
-        most damaging failure mode for a research task — the answer looks right. Numbers are
-        checkable without another model call, so they are checked.
+        click. Asked for something it could not find, a small model will produce a plausible
+        version number or an authoritative-sounding title straight from its weights — the
+        single most damaging failure mode for a research task, because the answer *looks*
+        right. Both are checkable without another model call, so both are checked:
 
-        Deliberately conservative: only version/date/price-shaped tokens count, anything the
-        user themselves wrote in the goal is fair game, and it only ever pushes back once.
+        - figure-shaped tokens (versions, years, prices, counts)
+        - quoted spans, which is precisely where the model asserts verbatim page content
+
+        Deliberately conservative. Anything the user wrote in the goal is fair game, short
+        quotes are ignored, and a flagged answer is challenged rather than blocked. `evidence`
+        is the facts list as it stood *before* this decision's own updates were applied —
+        passing the post-update list would let a fabrication vouch for itself.
         """
-        supported = set(self._seen_figures)
-        supported.update(_figures(state.goal))
-        supported.update(_figures(" ".join(state.facts)))
-        return [figure for figure in _figures(answer) if figure not in supported]
+        corpus = " ".join(self._seen_text) + " " + _normalize_prose(state.goal + " " + " ".join(evidence))
+        supported_figures = set(self._seen_figures)
+        supported_figures.update(_figures(state.goal))
+        supported_figures.update(_figures(" ".join(evidence)))
+
+        claims = [f for f in _figures(answer) if f not in supported_figures]
+        for quote in _quoted_spans(answer):
+            normalized = _normalize_prose(quote)
+            if len(normalized) >= 12 and len(normalized.split()) >= 3 and normalized not in corpus:
+                claims.append(f'"{quote[:60]}"')
+        return claims
 
     def _premature_finish(self, state: TaskState, steps_left: int) -> bool:
         """Finishing with plan items outstanding and most of the budget unspent."""
@@ -648,8 +707,22 @@ def _partial_answer(state: TaskState, reason: str) -> str:
 _FIGURE_RE = re.compile(r"\d+(?:[.,]\d+)+|\b\d{3,}\b")
 
 
+#: Quotation marks a model actually uses, straight and curly, single and double.
+_QUOTE_RE = re.compile(r"[\"“‘']([^\"“”‘’']{8,160})[\"”’']")
+
+
 def _figures(text: str) -> set[str]:
     return {match.group(0).replace(",", "") for match in _FIGURE_RE.finditer(text or "")}
+
+
+def _quoted_spans(text: str) -> list[str]:
+    return [m.group(1).strip() for m in _QUOTE_RE.finditer(text or "")]
+
+
+def _normalize_prose(text: str) -> str:
+    """Lowercase, alphanumeric-only, single-spaced — so a quotation still matches the page
+    when punctuation, capitalisation or whitespace differ."""
+    return " ".join("".join(c.lower() if c.isalnum() else " " for c in text or "").split())
 
 
 def _first_turn_hint(state: TaskState) -> str:
@@ -659,7 +732,9 @@ def _first_turn_hint(state: TaskState) -> str:
         return ""
     return ("This is your first turn, so state_updates.pending is required. Break the goal "
             "into the concrete pieces you must actually collect — one entry per item, site or "
-            "question the goal names. If the goal only asks for one thing, one entry is right.")
+            "question the goal names. If the goal only asks for one thing, one entry is right. "
+            "Also: you are already on a page. If it holds any part of the answer, put that in "
+            "state_updates.add_facts NOW — once you navigate away it is gone.")
 
 
 def _budget_hint(steps_left: int) -> str:

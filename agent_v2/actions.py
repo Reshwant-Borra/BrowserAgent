@@ -172,6 +172,19 @@ def decision_json_schema(exclude: Optional[set["V2Action"]] = None) -> dict[str,
     }
 
 
+def finish_json_schema() -> dict[str, Any]:
+    """Forces a well-formed `finish`: the action is fixed and `answer` is required.
+
+    `answer` cannot be conditionally required in a flat schema, so a model that has decided
+    to stop can emit `{"action":"finish"}` with nothing in it — and then does so again on
+    every retry, burning the budget arguing about a field. Re-asking once under a schema
+    that cannot express the malformed version resolves it in a single call.
+    """
+    schema = decision_json_schema({a for a in V2Action if a is not V2Action.FINISH})
+    schema["required"] = ["action", "answer", "reason"]
+    return schema
+
+
 def plan_json_schema() -> dict[str, Any]:
     """First-turn variant that *requires* a non-empty `pending` list.
 

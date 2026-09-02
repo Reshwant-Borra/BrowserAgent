@@ -171,6 +171,20 @@ _EXTRACTION_JS = """
         if (row && !seen.has(row)) { seen.add(row); visibleText.push(row.slice(0, 300)); }
         continue;
       }
+      // A plain-text document (an RFC, a changelog, a log file) is one enormous <pre>, and
+      // collapsing it to a single 200-character snippet keeps the header and throws away
+      // everything the reader actually wants. Inside <pre> the newlines are the structure,
+      // so each line becomes its own item.
+      if (el.tagName === 'PRE') {
+        for (const rawLine of (el.textContent || '').split('\\n')) {
+          if (visibleText.length >= limit) return;
+          const line = rawLine.replace(/\\s+/g, ' ').trim();
+          if (!line || seen.has(line)) continue;
+          seen.add(line);
+          visibleText.push(line.slice(0, 200));
+        }
+        continue;
+      }
       let insideInteractive = false;
       let p = el.parentElement;
       while (p) {

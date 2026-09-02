@@ -237,3 +237,20 @@ the metrics this implementation now collects (see `docs/PHASE1_REPORT.md`).
 experimentation, make changes, commit, and push directly to `main` rather than opening a new
 `feature/*`/`fix/*` branch. See `docs/BROWSERAGENT_MASTER_STATUS.md` Section 29 for the full
 policy and Section 28 for the repository-consolidation pass that made `main` canonical.
+
+## BrowserAgent V2
+
+A smaller, general-purpose agent that drives the Chrome you already have open:
+
+```bash
+ollama serve
+chrome.exe --remote-debugging-port=9222 --user-data-dir="%CD%untimerowseragent_persistent_profile"
+python -m agent_v2 "your task, in plain language"
+```
+
+One loop, bounded prompts, durable cross-task memory, and human takeover for anything that
+needs a password. Your browser, profile and tabs are never closed. See **[docs/V2.md](docs/V2.md)**
+for setup, human takeover, memory, tests and the real-web evaluation harness.
+
+The original agent (`agent/`, `browser-agent …`) is unchanged and remains the default;
+`agent.version` in `config/default.yaml` selects between them.

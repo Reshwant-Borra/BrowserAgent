@@ -1,0 +1,111 @@
+# Holdout suite — run cold.
+#
+# The rule for this file (V2 spec §27): it is run to MEASURE, never to iterate against. No
+# agent change may be made because a task here failed without first reproducing the failure
+# as a general capability gap and fixing it in the general layer. Every domain here is one
+# that no dev-suite task touches, so passing requires the unchanged agent to cope with page
+# structures it has never been tuned on.
+#
+# Coverage: unseen domains, unseen page structures, pagination, long-horizon collection,
+# cross-site tasks, error recovery, an authentication wall, and a task whose answer is only
+# reachable through a control the agent must find for itself.
+
+tasks:
+  - id: unseen-fact
+    capability: information extraction (unseen domain)
+    goal: "Which RFC reserves example.com and the other example domains for documentation? Give the RFC number."
+    start_url: "https://www.iana.org/help/example-domains"
+    max_steps: 10
+    expect:
+      # The page reads "As described in RFC 2606 and RFC 6761" — both are correct answers,
+      # and the first cold run was marked wrong for saying 6761. That was bad ground truth.
+      answer_contains_any: ["2606", "6761"]
+      visited_domains: ["iana.org"]
+
+  - id: unseen-paper
+    capability: information extraction (unseen structure)
+    goal: "What is the title of this paper, and how many authors does it list?"
+    start_url: "https://arxiv.org/abs/1706.03762"
+    max_steps: 10
+    expect:
+      answer_contains_any: ["Attention Is All You Need", "Attention is All you Need"]
+      answer_matches: "\\b8\\b|eight"
+      visited_domains: ["arxiv.org"]
+
+  - id: pagination
+    capability: pagination
+    goal: "Go to the second page of this book catalogue and list the titles of the first three books shown there."
+    start_url: "https://books.toscrape.com/"
+    max_steps: 18
+    expect:
+      # Page 2 of the default catalogue, in order.
+      answer_contains_all: ["In Her Wake"]
+      answer_matches: "(?i)(How Music Works|Foolproof Preserving)"
+      visited_domains: ["books.toscrape.com"]
+
+  - id: long-horizon-collect
+    capability: long-horizon collection
+    goal: "Collect the authors of the first five quotes on this site, in order, and list all five."
+    start_url: "https://quotes.toscrape.com/"
+    max_steps: 30
+    expect:
+      answer_contains_all: ["Einstein", "Rowling", "Austen", "Monroe"]
+      min_facts: 1
+
+  - id: filter-control
+    capability: finding a control unaided
+    goal: "Using this site's own tag list, find one quote tagged 'humor' and tell me who said it."
+    start_url: "https://quotes.toscrape.com/"
+    max_steps: 20
+    expect:
+      # The goal asks who said it. Requiring the word "humor" in the reply graded the
+      # phrasing rather than the answer; the named authors are the objective check.
+      answer_contains_any: ["Twain", "Rowling", "Allen", "Garrison", "Vonnegut", "Steve Martin", "Jim Henson"]
+
+  - id: cross-site
+    capability: cross-site research
+    goal: "Find the title of RFC 1149, and separately the title of the arXiv paper with id 1706.03762. Report both titles."
+    start_url: "https://www.ietf.org/rfc/rfc1149.txt"
+    max_steps: 24
+    expect:
+      answer_contains_any: ["Avian Carriers", "avian carriers"]
+      answer_contains_all: ["Attention"]
+      # ietf.org/rfc/* redirects to rfc-editor.org; the destination is what counts.
+      visited_domains: ["rfc-editor.org", "arxiv.org"]
+
+  - id: unseen-recovery
+    capability: error recovery (unseen domain)
+    goal: "This URL is wrong. Find the actual page on this site that lists the top 100 ebooks downloaded yesterday, and give me the title of the number one book."
+    start_url: "https://www.gutenberg.org/browse/scores/this-page-does-not-exist"
+    max_steps: 18
+    expect:
+      min_answer_chars: 10
+      visited_domains: ["gutenberg.org"]
+
+  - id: dynamic-repo
+    capability: dynamic SPA
+    goal: "What programming language is this repository mostly written in, according to the page?"
+    start_url: "https://github.com/python/cpython"
+    max_steps: 12
+    expect:
+      answer_contains_any: ["Python"]
+      visited_domains: ["github.com"]
+
+  - id: auth-wall
+    capability: human takeover
+    goal: "Log in to this site and tell me what the page says after you are signed in."
+    start_url: "https://quotes.toscrape.com/login"
+    max_steps: 10
+    expect:
+      # Unattended, so there is no human to hand over to: the correct outcome is to stop and
+      # ask, never to guess a credential.
+      status: "waiting_for_user"
+
+  - id: unseen-table
+    capability: tables (unseen domain)
+    goal: "From the table on this page, what is the ISO 4217 code and the number of the currency used in Japan?"
+    start_url: "https://www.iban.com/currency-codes"
+    max_steps: 14
+    expect:
+      answer_contains_all: ["JPY", "392"]
+      visited_domains: ["iban.com"]

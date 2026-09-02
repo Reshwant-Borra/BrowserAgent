@@ -392,11 +392,21 @@ def contains_secret(text: str) -> bool:
 
 
 def normalize_domain(value: str) -> str:
+    """A single bare host, or "".
+
+    Asked which domain a memory belongs to, the model quite reasonably answers
+    "python.org,nodejs.org" for a task that used both — and that string can never equal a
+    real domain, so the memory becomes unreachable by the domain signal that would surface
+    it. The first host is kept; the rest of the text stays in the memory itself.
+    """
     value = (value or "").strip().lower()
     if not value:
         return ""
     if "://" in value:
         value = urlsplit(value).netloc
+    for separator in (",", ";", " and ", "/", " "):
+        if separator in value:
+            value = value.split(separator)[0].strip()
     return value[4:] if value.startswith("www.") else value
 
 

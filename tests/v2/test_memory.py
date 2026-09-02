@@ -108,3 +108,24 @@ def test_use_counts_increase_when_a_memory_is_injected(memory_store: MemoryStore
 def test_domain_normalization():
     assert domain_of("https://www.Example.com/a/b?c=1") == "example.com"
     assert domain_of("") == ""
+
+
+def test_a_multi_domain_answer_is_reduced_to_one_host(memory_store: MemoryStore):
+    """Asked which domain a memory belongs to, the model answers "python.org,nodejs.org" for
+    a two-site task. Stored verbatim that never equals a real domain again, so the memory
+    becomes unreachable by the domain signal."""
+    memory_store.save("strategy", "Open each project's download page in its own tab",
+                      domain="python.org,nodejs.org")
+    stored = memory_store.all_active()[0]
+    assert stored.domain == "python.org"
+
+    result = memory_store.retrieve("compare downloads", domain="python.org")
+    assert result.memories and result.memories[0].id == stored.id
+
+
+def test_domain_normalization_handles_the_shapes_a_model_produces():
+    from agent_v2.memory import normalize_domain
+    assert normalize_domain("https://www.Example.com/a") == "example.com"
+    assert normalize_domain("python.org, nodejs.org") == "python.org"
+    assert normalize_domain("python.org and nodejs.org") == "python.org"
+    assert normalize_domain("") == ""

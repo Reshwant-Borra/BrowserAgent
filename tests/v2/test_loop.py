@@ -436,3 +436,43 @@ async def test_cdp_attach_run_leaves_the_users_browser_and_tabs_intact(fixture_s
     finally:
         await users_chrome.close()
         await pw.stop()
+
+
+async def test_the_human_is_not_asked_to_sign_in_twice(backend, make_agent, fixture_site_url):
+    """Interrupting the user once is necessary; asking again for the same thing is a bug.
+    Seen on a real login page: after the human signed in, the agent wandered back to the
+    form and asked twice more."""
+    handovers: list[str] = []
+
+    async def takeover(message, obs):
+        handovers.append(message)
+        return True  # the human deals with it and hands control back
+
+    agent, client = make_agent(backend, [
+        {"action": "open_url", "url": f"{fixture_site_url}/v2_login.html", "reason": "go"},
+        {"action": "need_user", "message": "Please sign in", "reason": "auth wall"},
+        {"action": "need_user", "message": "Please sign in again", "reason": "auth wall"},
+        {"action": "finish", "answer": "signed in", "reason": "done"},
+    ], takeover=takeover)
+    state = await agent.run("Sign in and read the report")
+
+    assert len(handovers) == 1, f"the human was interrupted {len(handovers)} times"
+    assert "ALREADY signed in" in client.decision_prompts[-1]
+    assert state.metrics.human_interventions == 1
+
+
+async def test_a_finish_cannot_certify_its_own_fabrication(backend, make_agent, fixture_site_url):
+    """The grounding check must not treat facts asserted *by the finish being checked* as
+    evidence for it — otherwise a model that invents a number and files it under add_facts
+    in the same breath passes its own audit."""
+    agent, client = make_agent(backend, [
+        {"action": "open_url", "url": f"{fixture_site_url}/index.html", "reason": "go"},
+        {"action": "finish", "answer": "The current version is 9.8.7654",
+         "reason": "done",
+         "state_updates": {"add_facts": ["The current version is 9.8.7654"]}},
+        {"action": "finish", "answer": "I could not find a version on this site.", "reason": "honest"},
+    ])
+    state = await agent.run("What version does this site list?")
+
+    assert "9.8.7654" not in state.answer          # the invented figure was challenged away
+    assert "could not find" in state.answer

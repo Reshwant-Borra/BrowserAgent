@@ -190,7 +190,7 @@ class BrowserSession:
         backend = self.backend
 
         if action is V2Action.OPEN_URL:
-            await backend.open_url(decision.url)
+            await self._goto(backend.page, decision.url)
             return ActionOutcome(True, decision.url)
 
         if action is V2Action.CLICK:
@@ -240,7 +240,7 @@ class BrowserSession:
             page = await context.new_page()
             page.set_default_timeout(backend.action_timeout_ms)
             tab_id = self._register(page, owner="agent")
-            await page.goto(decision.url, wait_until="domcontentloaded")
+            await self._goto(page, decision.url)
             backend.page = page
             backend.context = page.context
             return ActionOutcome(True, f"opened tab {tab_id}", data={"tab_id": tab_id})
@@ -287,6 +287,30 @@ class BrowserSession:
             return ActionOutcome(True, f"waited {decision.ms}ms")
 
         return ActionOutcome(True, "")
+
+    #: Loading a page is not the same kind of operation as clicking a button, and giving both
+    #: the same budget makes ordinary slow sites look like failures. Navigation gets its own.
+    NAVIGATION_TIMEOUT_MS = 30000
+
+    async def _goto(self, page: Any, url: str) -> None:
+        """Navigate, with one retry on a transient failure.
+
+        Real networks produce blips — a dropped handshake, a proxy hiccup, a site that takes
+        longer than usual under load. Observed on this machine as an intermittent certificate
+        error that succeeded on the very next attempt. Retrying once with `commit` (which
+        resolves as soon as the navigation is committed rather than waiting for the document)
+        turns a task-ending error into a step that simply took a moment longer.
+        """
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.NAVIGATION_TIMEOUT_MS)
+            return
+        except Exception:
+            await asyncio.sleep(0.5)
+        await page.goto(url, wait_until="commit", timeout=self.NAVIGATION_TIMEOUT_MS)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass
 
     async def _new_pages_since(self, before: set[int], url_before: str) -> list[Any]:
         """Pages that appeared as a result of the last action.
