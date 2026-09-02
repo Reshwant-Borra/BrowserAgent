@@ -28,6 +28,7 @@ from agent.loop_detector import (
 )
 from agent.recovery import RetryDecision, idempotency_decision, next_recovery_level, requires_approval
 from agent.runtime_policy import BatchRuntimePolicy, post_navigation_violation, pre_action_violation
+from agent.security_policy import domain_permission_violation
 from agent.schemas import (
     ActionType,
     DecisionValidationError,
@@ -484,6 +485,8 @@ class AgentLoop:
             return await self._handle_finish(task, state, step_no, decision, observation)
 
         violation = pre_action_violation(self.runtime_policy, decision, element)
+        if violation is None:
+            violation = domain_permission_violation(self.config.security, decision, element, observation.url)
         if violation is not None:
             return self._block_by_runtime_policy(state, step_no, violation.category, violation.reason)
 

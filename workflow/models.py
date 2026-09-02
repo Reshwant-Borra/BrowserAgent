@@ -49,3 +49,11 @@ class WorkflowPolicy:
     read_only: bool = False
     navigation_scope: NavigationScope = NavigationScope.SAME_ORIGIN
     worker_id: str = "local"
+    # Phase 5 (architecture doc section 12: "Data-flow policy... never allow arbitrary 'read
+    # from A, type into B' when data is marked sensitive"). Gates a verified fact whose key
+    # looks like a credential (agent/security_policy.py::is_sensitive_fact_key) being seeded
+    # into a later step on a DIFFERENT origin than the one it was discovered on — via the same
+    # approval callback consequential actions already use, never a silent pass-through. True
+    # by default; a caller with no approval_callback and this left True fails the step closed
+    # (blocks) rather than transferring silently.
+    cross_origin_sensitive_transfer_requires_approval: bool = True

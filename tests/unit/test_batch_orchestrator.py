@@ -30,6 +30,7 @@ class FakeRunner:
         max_steps: int,
         resume_task_id: str | None = None,
         runtime_policy=None,
+        approval_callback=None,
     ) -> str:
         self.calls.append({"item": work_item["id"], "goal": child_goal, "resume_task_id": resume_task_id})
         outcome = self.outcomes.pop(0)
@@ -50,6 +51,7 @@ class PolicyCapturingRunner(FakeRunner):
         max_steps: int,
         resume_task_id: str | None = None,
         runtime_policy=None,
+        approval_callback=None,
     ) -> str:
         self.calls.append({"item": work_item["id"], "runtime_policy": runtime_policy})
         outcome = self.outcomes.pop(0)

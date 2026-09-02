@@ -103,6 +103,7 @@ class BatchOrchestrator:
         runner: ChildRunner | None = None,
         item_completed_callback: Callable[[dict[str, Any]], None] | None = None,
         parent_task_id: str | None = None,
+        approval_callback: Optional[Callable[[Any, Any], Awaitable[bool]]] = None,
     ):
         self.config = config
         self.store = store
@@ -117,6 +118,13 @@ class BatchOrchestrator:
         # pre-existing caller (ui/jobs.py, benchmarks) leaves this None and gets identical
         # output to before this field existed.
         self.parent_task_id = parent_task_id
+        # Phase 5: threaded into every child's own AgentLoop exactly like
+        # WorkflowOrchestrator's own approval_callback already is (agent/loop.py's
+        # `_request_approval` falls back to a blocking `input()` prompt when this is None —
+        # never safe inside an async UI server, so a caller driving batch children from a live
+        # UI/general-controller context must supply one). None (every pre-existing caller,
+        # since batch items already default to read_only=True) is unchanged.
+        self.approval_callback = approval_callback
 
     async def run(self) -> dict[str, Any]:
         started = time.monotonic()
@@ -189,6 +197,7 @@ class BatchOrchestrator:
                     self.policy.max_steps_per_item,
                     resume_task_id=task_id,
                     runtime_policy=self._runtime_policy(item),
+                    approval_callback=self.approval_callback,
                 ),
                 timeout=self.policy.max_seconds_per_item,
             )

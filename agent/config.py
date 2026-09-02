@@ -88,6 +88,29 @@ class LoggingConfig:
 
 
 @dataclass
+class SecurityConfig:
+    """Phase 5 (BrowserAgent_General_Autonomous_Agent_Architecture_REVISED.pdf, section 17):
+    "zero trust for page content" boundaries that sit alongside, never instead of,
+    agent/schemas.py::classify_risk's existing approval gate.
+
+    `default_domain_permission` is the baseline every domain gets absent a future per-domain
+    override table (not built yet — no caller sets one, so this is currently a global default
+    only): "browser_control" is today's existing behavior (read+write gated by classify_risk/
+    approval, unchanged); "read_only" additionally forces every action's risk to never exceed
+    READ_ONLY regardless of classify_risk's own verdict; "no_access" blocks navigating to the
+    domain at all. `block_local_schemes` documents an invariant `agent/decision.py::
+    validate_semantics` already enforces unconditionally (open_url only ever accepts http(s)
+    or a same-origin-relative path) — kept here as a read-only documented flag, not a toggle,
+    since disabling it would have no legitimate use and Section 29's own policy is "explicit
+    invariant over silent behavior."
+    """
+
+    default_domain_permission: str = "browser_control"  # "read_only" | "browser_control" | "no_access"
+    block_local_schemes: bool = True
+    cross_origin_sensitive_transfer_requires_approval: bool = True
+
+
+@dataclass
 class RoutingConfig:
     """See router/policy.py's module docstring for what each mode does. Default is "hybrid":
     deterministic fast paths stay an optimization, everything else goes through the semantic
@@ -143,6 +166,7 @@ class AppConfig:
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     routing: RoutingConfig = field(default_factory=RoutingConfig)
     agent: AgentControlConfig = field(default_factory=AgentControlConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 
 
 def _apply_env_overrides(raw: dict[str, Any]) -> dict[str, Any]:
@@ -204,6 +228,7 @@ def load_config(path: str | Path | None = None) -> AppConfig:
         logging=_coerce(LoggingConfig, raw.get("logging", {})),
         routing=_coerce(RoutingConfig, raw.get("routing", {})),
         agent=_coerce(AgentControlConfig, raw.get("agent", {})),
+        security=_coerce(SecurityConfig, raw.get("security", {})),
     )
     _resolve_runtime_paths(config)
     return config

@@ -50,7 +50,7 @@ from agent.workspace_models import (
 from batch.models import BatchPolicy, ResultContract
 from batch.orchestrator import BatchOrchestrator, ChildRunner
 from batch.store import BatchStore
-from browser.page_model import PageObservation
+from browser.page_model import ElementRef, PageObservation
 from browser.playwright_backend import urls_match
 from inference.llama_client import InferenceClient, create_inference_client
 from memory.event_store import Event, EventStore, EventType
@@ -118,6 +118,7 @@ class GeneralAgentController:
         llama_client: Optional[InferenceClient] = None,
         child_llama_client_factory: Optional[Callable[[], InferenceClient]] = None,
         child_runner: Optional[ChildRunner] = None,
+        approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
     ):
         self.config = config
         self.control_task_id = control_task_id or uuid.uuid4().hex[:12]
@@ -138,6 +139,11 @@ class GeneralAgentController:
         # None (the default, every pre-existing caller) is unchanged: both orchestrators
         # already default to AgentLoopChildRunner() themselves when `runner` is None.
         self._child_runner = child_runner
+        # Phase 5: threaded into every subgoal's AgentLoop and every delegate's own
+        # orchestrator (agent/loop.py's `_request_approval` falls back to a blocking `input()`
+        # prompt when this is None — never safe for a controller driven from an async UI
+        # server). None (every pre-existing caller/test) is unchanged.
+        self._approval_callback = approval_callback
         self._replans_used = 0
 
     def close(self) -> None:
@@ -150,10 +156,11 @@ class GeneralAgentController:
                     llama_client: Optional[InferenceClient] = None,
                     child_llama_client_factory: Optional[Callable[[], InferenceClient]] = None,
                     child_runner: Optional[ChildRunner] = None,
+                    approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
                     ) -> "GeneralAgentController":
         controller = cls(config, llama_client=llama_client,
                           child_llama_client_factory=child_llama_client_factory,
-                          child_runner=child_runner)
+                          child_runner=child_runner, approval_callback=approval_callback)
         controller.event_store.create_task(controller.control_task_id, goal, success_criteria)
         controller.event_store.append(controller.control_task_id, 0, EventType.TASK_CREATED,
                                        {"goal": goal, "success_criteria": success_criteria})
@@ -165,10 +172,11 @@ class GeneralAgentController:
                llama_client: Optional[InferenceClient] = None,
                child_llama_client_factory: Optional[Callable[[], InferenceClient]] = None,
                child_runner: Optional[ChildRunner] = None,
+               approval_callback: Optional[Callable[[ModelDecision, Optional[ElementRef]], Awaitable[bool]]] = None,
                ) -> "GeneralAgentController":
         controller = cls(config, control_task_id=control_task_id, llama_client=llama_client,
                           child_llama_client_factory=child_llama_client_factory,
-                          child_runner=child_runner)
+                          child_runner=child_runner, approval_callback=approval_callback)
         if not controller.event_store.task_exists(control_task_id):
             raise ValueError(f"no such control task: {control_task_id}")
         return controller
@@ -327,7 +335,8 @@ class GeneralAgentController:
                 satisfied=True, next_recommendation="finish",
             ), completion_claim=decision.completion_claim)
         if decision.decision == "ask_user":
-            return self._block(decision.clarification_question or "clarification needed to proceed")
+            return self._block(decision.clarification_question or "clarification needed to proceed",
+                                kind="ask_user")
         # Defensive only: every literal value of ControllerDecisionType is handled above: this
         # is unreachable via a schema-valid decision, kept as a fail-safe rather than a silent
         # no-op if the shared contract (agent/controller_models.py) ever grows a new value.
@@ -385,6 +394,7 @@ class GeneralAgentController:
         profile_dir = self.tasks_dir / self.control_task_id / "subgoal_browser_profile"
         loop = AgentLoop.create_new(
             self.config, goal_text, [], profile_dir=profile_dir, explicit_target_url=hub_url,
+            approval_callback=self._approval_callback,
         )
         if self._child_llama_client_factory is not None:
             loop.llama = self._child_llama_client_factory()
@@ -690,6 +700,7 @@ class GeneralAgentController:
             orchestrator = BatchOrchestrator(
                 self.config, store, batch_id, BatchPolicy(), ResultContract(),
                 runner=self._child_runner, parent_task_id=self.control_task_id,
+                approval_callback=self._approval_callback,
             )
             return await orchestrator.run()
         finally:
@@ -777,6 +788,7 @@ class GeneralAgentController:
             orchestrator = WorkflowOrchestrator(
                 self.config, store, workflow_id, policy,
                 runner=self._child_runner, parent_task_id=self.control_task_id,
+                approval_callback=self._approval_callback,
             )
             return await orchestrator.run()
         finally:
@@ -899,7 +911,7 @@ class GeneralAgentController:
             loop = AgentLoop(
                 self.config, self.control_task_id, explicit_target_url=hub_url,
                 event_store=self.event_store, state_store=self.state_store,
-                goal_override=goal_override,
+                goal_override=goal_override, approval_callback=self._approval_callback,
             )
             if self._child_llama_client_factory is not None:
                 loop.llama = self._child_llama_client_factory()
@@ -1419,7 +1431,7 @@ class GeneralAgentController:
         if substrate == "research_discovery":
             objective = event.payload.get("objective", subgoal)
             return await self._run_discovery_and_replan(task, subgoal, objective)
-        loop = AgentLoop.resume(self.config, child_task_id)
+        loop = AgentLoop.resume(self.config, child_task_id, approval_callback=self._approval_callback)
         if self._child_llama_client_factory is not None:
             loop.llama = self._child_llama_client_factory()
         child_state = await loop.run(max_steps=self.config.agent.max_steps_per_subgoal)
@@ -1518,10 +1530,32 @@ class GeneralAgentController:
         self.state_store.save(state)
         return state
 
-    def _block(self, reason: str) -> TaskState:
-        self._append(EventType.TASK_BLOCKED, {"reason": reason})
+    def _block(self, reason: str, kind: str = "failure") -> TaskState:
+        """`kind` (Phase 5, ui/jobs.py's own general-mode driver): additive TASK_BLOCKED
+        payload key distinguishing an `ask_user` block (the planner genuinely wants a
+        clarifying answer — the UI should offer a text box, mirroring the router's own
+        NeedsInput flow) from every other block (a real failure/exhausted-budget/declined-
+        approval stop — the UI should just report it). memory/replay.py already ignores
+        unrecognized payload keys, so this is inert for every reader that predates it; only
+        ui/jobs.py's new `_is_ask_user_block` helper reads it, straight from the event log."""
+        self._append(EventType.TASK_BLOCKED, {"reason": reason, "kind": kind})
         state = self.state_store.load(self.control_task_id)
         state.status = "blocked"
         state.blocked_reason = reason
         self.state_store.save(state)
         return state
+
+    def resume_after_clarification(self, answer: str) -> None:
+        """Phase 5: the general-controller analogue of router/policy.py's own
+        `route_with_answer` — records the user's answer as a workspace fact (so the next
+        planner call sees it in the WORKSPACE summary exactly like any other discovered fact)
+        and clears the block so the caller's next `run()` call resumes normally. Never resets
+        plan/completed_subgoals/replan budget — a clarification answer informs the *next*
+        planning decision, it does not restart the task."""
+        self.workspace_store.apply_patch(self.control_task_id, WorkspacePatch(
+            add_facts=[WorkspaceFact(key=f"user_clarification_{uuid.uuid4().hex[:6]}", value=answer)],
+        ))
+        state = self.state_store.load(self.control_task_id)
+        state.status = "running"
+        state.blocked_reason = None
+        self.state_store.save(state)

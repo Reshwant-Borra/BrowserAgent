@@ -15,9 +15,12 @@ import json
 import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
 from agent.config import AppConfig
 from agent.runtime_policy import BatchRuntimePolicy, NavigationScopePolicy
+from agent.schemas import REASON_MAX_CHARS, ActionType, ModelDecision
+from agent.security_policy import is_sensitive_fact_key
 from batch.orchestrator import AgentLoopChildRunner, ChildRunner, _load_child_state
 from batch.policies import classify_child_failure
 from memory.event_store import Event, EventType
@@ -63,7 +66,10 @@ class WorkflowOrchestrator:
     async def _run_step(self, step: dict[str, Any]) -> bool:
         """Returns True if the workflow is now blocked (stop advancing)."""
         self.store.start_step(step["id"])
-        facts = self.store.facts_so_far(self.workflow_id, step["ordinal"])
+        facts_with_origin = self.store.facts_so_far_with_origin(self.workflow_id, step["ordinal"])
+        if await self._maybe_block_cross_origin_transfer(step, facts_with_origin):
+            return True
+        facts = {key: info["value"] for key, info in facts_with_origin.items()}
         goal = self._step_goal(step, facts)
         profile_dir = self.workflow_dir / f"step_{step['ordinal']}_browser_profile"
         runtime_policy = BatchRuntimePolicy(
@@ -119,6 +125,45 @@ class WorkflowOrchestrator:
         )
         self._notify(step["id"])
         return False
+
+    async def _maybe_block_cross_origin_transfer(
+        self, step: dict[str, Any], facts_with_origin: dict[str, dict[str, Any]],
+    ) -> bool:
+        """Phase 5 (architecture doc section 12's data-flow policy): a verified fact whose key
+        looks like a credential must not silently cross into a step on a different origin than
+        the one it was discovered on — the same "read from A, type into B" the doc explicitly
+        names. Gated by the same approval callback consequential actions already use (never a
+        second, bespoke UI mechanism); declining or having no callback at all fails the step
+        closed rather than transferring silently. A same-origin reuse (e.g. re-entering a value
+        on a later page of the SAME site) is never gated — only genuine cross-origin transfer
+        is in scope, per the doc's own wording."""
+        if not self.policy.cross_origin_sensitive_transfer_requires_approval:
+            return False
+        target_origin = _origin(step["target"])
+        for key, info in facts_with_origin.items():
+            if not is_sensitive_fact_key(key):
+                continue
+            source_origin = _origin(info["source_target"])
+            if source_origin == target_origin:
+                continue
+            approved = await self._approve_cross_origin_transfer(key, info["source_target"], step["target"])
+            if not approved:
+                return self._handle_step_failure(
+                    step, "BLOCKED_CONSEQUENTIAL",
+                    f"cross-origin sensitive fact transfer declined: '{key}' from "
+                    f"{source_origin} to {target_origin}",
+                )
+        return False
+
+    async def _approve_cross_origin_transfer(self, key: str, source_target: str, target: str) -> bool:
+        if self.approval_callback is None:
+            return False  # fail closed: nothing to ask, so never transfer silently
+        decision = ModelDecision(
+            action=ActionType.TYPE, target=None, params={},
+            reason=(f"transfer sensitive fact '{key}' from {_origin(source_target)} "
+                    f"to {_origin(target)}")[:REASON_MAX_CHARS],
+        )
+        return await self.approval_callback(decision, None)
 
     def _handle_step_failure(self, step: dict[str, Any], category: str, error: str, browser_task_id: str | None = None) -> bool:
         retryable = category not in {"BLOCKED_CONSEQUENTIAL", "AUTH_REQUIRED", "SCOPE_BLOCKED", "READ_ONLY_BLOCKED"}
@@ -189,6 +234,11 @@ class WorkflowOrchestrator:
                 for s in steps
             ],
         }
+
+
+def _origin(url: str) -> str:
+    parts = urlsplit(url)
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
 
 
 def _extract_step_result(events: list[Event]) -> dict[str, Any]:

@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from agent.auth_detect import looks_like_login_page
 from agent.config import AppConfig, load_config
+from agent.controller import GeneralAgentController
 from agent.loop import AgentLoop
 from agent.schemas import ModelDecision
 from batch.models import ResultContract
@@ -19,7 +20,10 @@ from batch.orchestrator import BatchOrchestrator
 from batch.store import BatchStore
 from browser.page_model import ElementRef
 from inference.llama_client import InferenceClient, create_inference_client
+from memory.event_store import EventType
+from memory.models import TaskState
 from research.discovery import discover_sources
+from router.extract import try_deterministic_route
 from router.plan_schema import ReplanDecisionKind
 from router.policy import NeedsInput, RoutingError, route, route_with_answer, to_batch_policy
 from router.replanner import ReplanOutputError, decide_replan, finding_source_url
@@ -137,6 +141,9 @@ class JobRunner:
     async def _drive(self, job_id: str, prompt: str) -> None:
         control = self._control[job_id]
         try:
+            if self._should_run_general(prompt):
+                await self._run_general(job_id, prompt, control)
+                return
             client = create_inference_client(self.config)
             self.store.update(job_id, activity="Understanding task...")
             try:
@@ -218,6 +225,128 @@ class JobRunner:
             for t in (stop_wait, answer_wait):
                 if not t.done():
                     t.cancel()
+
+    # ---- general controller (Phase 5) --------------------------------------
+
+    def _should_run_general(self, prompt: str) -> bool:
+        """`config.agent.control_mode` (default "legacy"): "general" always drives the prompt
+        through GeneralAgentController instead of router-based dispatch; "hybrid" keeps the
+        obvious, already-proven deterministic fast path (a literal URL, no ambiguity —
+        router/extract.py::try_deterministic_route) on the existing legacy dispatch below and
+        sends everything else through the general controller — the same "cheap deterministic
+        case first, model/planner reasoning for the rest" shape router/policy.py's own hybrid
+        routing.mode already uses, one layer up. "legacy" (the default) never changes: zero
+        behavior change for every existing test/user unless this is explicitly opted into."""
+        mode = self.config.agent.control_mode
+        if mode == "general":
+            return True
+        if mode == "hybrid":
+            return try_deterministic_route(prompt) is None
+        return False
+
+    async def _run_general(self, job_id: str, prompt: str, control: _JobControl) -> None:
+        """Drives GeneralAgentController the same way _run_sweep/_run_workflow already drive
+        BatchOrchestrator/WorkflowOrchestrator: one big `.run()` call wrapped in
+        `_run_cancelable` for Stop support (state already persisted up to the last completed
+        subgoal/delegate is untouched by a cancel, matching Section 22's "no corrupted state"
+        requirement — GeneralAgentController.resume() already proves this durability). A
+        lightweight parallel poller surfaces subgoal/delegate progress into `activity` while
+        `.run()` is in flight, since — unlike AgentLoop's own step()-at-a-time single-site
+        loop above — the controller has no external per-step hook to piggyback on.
+        Approval/clarification reuse the exact same job-status/pending_* shapes and endpoints
+        every other job kind already uses (`_make_approval_callback`, `waiting_for_input` +
+        `pending_clarification`), so ui/static/index.html needs no changes at all to render a
+        general-mode job — Section: "Display... Do not expose hidden reasoning," satisfied by
+        reusing the existing plain-text activity field rather than adding a new one."""
+        controller = GeneralAgentController.create_new(
+            self.config, prompt, [], llama_client=create_inference_client(self.config),
+            approval_callback=self._make_approval_callback(job_id, control),
+        )
+        self.store.update(job_id, kind="general", task_id=controller.control_task_id, activity="Planning...")
+        try:
+            rounds = 0
+            state: Optional[TaskState] = None
+            while True:
+                progress_task = asyncio.ensure_future(self._poll_general_progress(job_id, controller))
+                try:
+                    state = await self._run_cancelable(controller.run(), control)
+                finally:
+                    progress_task.cancel()
+                    try:
+                        await progress_task
+                    except asyncio.CancelledError:
+                        pass
+                if state is None:
+                    self.store.update(job_id, status="stopped", activity="Stopped")
+                    return
+                if state.status == "blocked" and self._is_ask_user_block(controller):
+                    rounds += 1
+                    if rounds > MAX_CLARIFICATION_ROUNDS:
+                        self.store.update(
+                            job_id, status="failed",
+                            error="could not resolve the requested resource after repeated clarification",
+                            activity="Needs more specific input than provided",
+                            final_result={"blocked_reason": state.blocked_reason},
+                        )
+                        return
+                    future: asyncio.Future = asyncio.get_running_loop().create_future()
+                    control.clarification_future = future
+                    self.store.update(
+                        job_id, status="waiting_for_input", activity="Waiting for input...",
+                        pending_clarification={"question": state.blocked_reason},
+                    )
+                    answer = await self._wait_clarification_or_stop(control, future)
+                    control.clarification_future = None
+                    if control.stop_event.is_set() or answer is None:
+                        self.store.update(job_id, status="stopped", activity="Stopped while waiting for input",
+                                           pending_clarification=None)
+                        return
+                    self.store.update(job_id, status="running", pending_clarification=None,
+                                       activity="Got it, continuing...")
+                    controller.resume_after_clarification(answer)
+                    continue
+                break
+            self._finish_general(job_id, controller, state)
+        finally:
+            controller.close()
+
+    async def _poll_general_progress(self, job_id: str, controller: GeneralAgentController) -> None:
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                state = controller.state_store.load(controller.control_task_id)
+                self.store.update(job_id, activity=self._general_activity(state))
+        except asyncio.CancelledError:
+            pass
+
+    def _general_activity(self, state: TaskState) -> str:
+        if state.current_subgoal:
+            return f"Subgoal {len(state.completed_subgoals) + 1}: {state.current_subgoal}"
+        if state.plan:
+            return f"Completed {len(state.completed_subgoals)} / {len(state.plan)} subgoals"
+        return "Planning..."
+
+    def _is_ask_user_block(self, controller: GeneralAgentController) -> bool:
+        events = controller.event_store.all_events(controller.control_task_id)
+        for e in reversed(events):
+            if e.type == EventType.TASK_BLOCKED:
+                return e.payload.get("kind") == "ask_user"
+        return False
+
+    def _finish_general(self, job_id: str, controller: GeneralAgentController, state: TaskState) -> None:
+        if state.status == "completed":
+            events = controller.event_store.all_events(controller.control_task_id)
+            completed = next((e for e in reversed(events) if e.type == EventType.TASK_COMPLETED), None)
+            result_text = completed.payload.get("result", "") if completed else ""
+            self.store.update(
+                job_id, status="completed", activity="Completed",
+                final_result={"summary": result_text, "completed_subgoals": state.completed_subgoals},
+            )
+        elif state.status == "blocked":
+            self.store.update(job_id, status="failed", error=state.blocked_reason, activity="Blocked",
+                               final_result={"blocked_reason": state.blocked_reason})
+        else:
+            self.store.update(job_id, status="failed", error="step/replan budget exhausted", activity="Did not finish")
 
     # ---- single-site -----------------------------------------------------
 

@@ -142,6 +142,21 @@ class WorkflowStore:
             facts.update(json.loads(row["facts_out"] or "{}"))
         return facts
 
+    def facts_so_far_with_origin(self, workflow_id: str, before_ordinal: int) -> dict[str, dict[str, Any]]:
+        """Same accumulation as `facts_so_far`, additionally carrying which step's own
+        `target` each fact was discovered on (Phase 5's cross-origin sensitive-transfer gate —
+        `workflow/orchestrator.py::_run_step` needs to know a fact's *source* origin, not just
+        its value, to tell a same-origin re-use apart from a genuine cross-origin transfer)."""
+        facts: dict[str, dict[str, Any]] = {}
+        for row in self.conn.execute(
+            """SELECT target, facts_out FROM workflow_steps WHERE workflow_job_id = ? AND ordinal < ?
+               AND status = ? ORDER BY ordinal""",
+            (workflow_id, before_ordinal, WorkflowStepStatus.COMPLETED.value),
+        ):
+            for key, value in json.loads(row["facts_out"] or "{}").items():
+                facts[key] = {"value": value, "source_target": row["target"]}
+        return facts
+
     def start_step(self, step_id: int) -> None:
         step = self.get_step(step_id)
         with self.conn:

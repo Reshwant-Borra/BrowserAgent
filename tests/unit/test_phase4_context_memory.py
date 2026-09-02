@@ -93,7 +93,7 @@ def test_context_budgeting_records_blocks_and_keeps_prompt_bounded(tmp_path):
     )
     config = ContextConfig(
         recent_actions=3,
-        max_total_tokens=900,
+        max_total_tokens=1100,
         recent_window_tokens=80,
         summary_tokens=120,
         retrieved_memory_tokens=80,
@@ -103,7 +103,12 @@ def test_context_budgeting_records_blocks_and_keeps_prompt_bounded(tmp_path):
 
     context = build_tiered_context(task, state, _observation(), config, 3000, 12, store)
 
-    assert context.total_estimated_tokens <= 900
+    # max_total_tokens only bounds the trimmed sections (recent_window/page/summary/retrieved
+    # memory) via page_budget's own min() below — static_prefix (SYSTEM_BLOCK) + task_state
+    # are never trimmed, so this ceiling must stay comfortably above their own (untrimmed,
+    # Phase 5 grew SYSTEM_BLOCK with an explicit untrusted-content boundary) fixed cost; the
+    # per-block assertions below are what actually exercise the budgeting mechanism.
+    assert context.total_estimated_tokens <= 1100
     assert context.block_tokens["recent_window"] <= 80
     assert context.block_tokens["page"] <= 160
     assert set(context.block_tokens) >= {

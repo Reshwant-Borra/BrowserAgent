@@ -2,6 +2,8 @@
 malformed or nonsensical model output reach Playwright."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agent.decision import parse_model_output, validate_against_observation
@@ -155,3 +157,38 @@ def test_invalid_url_raises():
     with pytest.raises(DecisionValidationError) as exc:
         validate_against_observation(decision, obs)
     assert exc.value.kind == ValidationErrorKind.INVALID_URL
+
+
+@pytest.mark.parametrize("url", [
+    "file:///etc/passwd",
+    "file://C:/Windows/System32/config",
+    "javascript:alert(document.cookie)",
+    "data:text/html,<script>alert(1)</script>",
+    "chrome://settings",
+    "chrome-extension://abcdefg/page.html",
+    "about:blank",
+    "ftp://example.com/file",
+])
+def test_open_url_rejects_local_and_non_http_schemes(url):
+    """Phase 5 (architecture doc section 12: "Local-file access: Browser control should
+    reject file:// and other host-local schemes by default") — this invariant already held
+    unconditionally before Phase 5 (open_url only ever accepted http(s) or a same-origin-
+    relative path); this regression test exists so a future change can't silently widen it."""
+    decision = parse_model_output(json.dumps({
+        "action": "open_url", "target": None, "params": {"url": url},
+        "expected_result": {}, "confidence": 0.5,
+    }))
+    obs = make_observation()
+    with pytest.raises(DecisionValidationError) as exc:
+        validate_against_observation(decision, obs)
+    assert exc.value.kind == ValidationErrorKind.INVALID_URL
+
+
+@pytest.mark.parametrize("url", ["http://example.com", "https://example.com/page", "/relative/path"])
+def test_open_url_accepts_http_https_and_relative(url):
+    decision = parse_model_output(json.dumps({
+        "action": "open_url", "target": None, "params": {"url": url},
+        "expected_result": {}, "confidence": 0.5,
+    }))
+    obs = make_observation()
+    validate_against_observation(decision, obs)  # must not raise

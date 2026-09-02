@@ -70,3 +70,10 @@ agent:
   completion_check_after_subgoal: true
   max_workspace_entities_in_context: 12
   max_workspace_evidence_in_context: 8
+  batch_delegation_min_targets: 3
+  research_discovery_max_sources: 8
+
+security:
+  default_domain_permission: "browser_control"  # "read_only" | "browser_control" | "no_access"
+  block_local_schemes: true
+  cross_origin_sensitive_transfer_requires_approval: true

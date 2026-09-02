@@ -226,3 +226,134 @@ def test_workflow_login_required_blocks_without_burning_all_steps(tmp_path, tmp_
         assert len(runner.calls) == 1  # never retried a login wall, never advanced to step 2
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------------------
+# Phase 5: cross-origin sensitive-transfer gate (architecture doc section 12's data-flow
+# policy — "never allow arbitrary 'read from A, type into B' when data is marked sensitive").
+# ---------------------------------------------------------------------------------------
+
+def test_cross_origin_sensitive_transfer_approved_proceeds(tmp_path, tmp_config):
+    steps = [
+        {"ordinal": 1, "target": "http://a.test/lookup", "objective": "find the password"},
+        {"ordinal": 2, "target": "http://b.test/login", "objective": "enter the password"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "transfer credential", steps)
+    runner = FakeWorkflowRunner([
+        _verified("found it", {"password": "hunter2"}),
+        _verified("entered it"),
+    ])
+    approvals: list[str] = []
+
+    async def _approve(decision, element) -> bool:
+        approvals.append(decision.reason)
+        return True
+
+    try:
+        final = asyncio.run(
+            WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner, approval_callback=_approve).run()
+        )
+        assert final["status"] == "completed"
+        assert len(runner.calls) == 2
+        assert runner.calls[1]["seed_facts"] == {"password": "hunter2"}
+        assert len(approvals) == 1
+        assert "password" in approvals[0] and "a.test" in approvals[0] and "b.test" in approvals[0]
+    finally:
+        store.close()
+
+
+def test_cross_origin_sensitive_transfer_declined_blocks_step(tmp_path, tmp_config):
+    steps = [
+        {"ordinal": 1, "target": "http://a.test/lookup", "objective": "find the password"},
+        {"ordinal": 2, "target": "http://b.test/login", "objective": "enter the password"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "transfer credential", steps)
+    runner = FakeWorkflowRunner([_verified("found it", {"password": "hunter2"})])
+
+    async def _deny(decision, element) -> bool:
+        return False
+
+    try:
+        final = asyncio.run(
+            WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner, approval_callback=_deny).run()
+        )
+        assert final["status"] == "blocked"
+        assert "cross-origin sensitive fact transfer declined" in (final["blocked_reason"] or "")
+        # Step 2's own runner.run_child was never called at all — the gate fires before the
+        # step's child ever starts.
+        assert len(runner.calls) == 1
+    finally:
+        store.close()
+
+
+def test_cross_origin_sensitive_transfer_with_no_approval_callback_fails_closed(tmp_path, tmp_config):
+    steps = [
+        {"ordinal": 1, "target": "http://a.test/lookup", "objective": "find the api key"},
+        {"ordinal": 2, "target": "http://b.test/settings", "objective": "enter the api key"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "transfer credential", steps)
+    runner = FakeWorkflowRunner([_verified("found it", {"api_key": "sk-live-123"})])
+    try:
+        final = asyncio.run(WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner).run())
+        assert final["status"] == "blocked"
+        assert "declined" in (final["blocked_reason"] or "")
+        assert len(runner.calls) == 1
+    finally:
+        store.close()
+
+
+def test_same_origin_sensitive_fact_reuse_is_never_gated(tmp_path, tmp_config):
+    steps = [
+        {"ordinal": 1, "target": "http://a.test/lookup", "objective": "find the password"},
+        {"ordinal": 2, "target": "http://a.test/confirm", "objective": "re-enter the password"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "same site reuse", steps)
+    runner = FakeWorkflowRunner([
+        _verified("found it", {"password": "hunter2"}),
+        _verified("confirmed"),
+    ])
+    try:
+        # No approval_callback at all — a same-origin reuse must never even ask.
+        final = asyncio.run(WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner).run())
+        assert final["status"] == "completed"
+        assert len(runner.calls) == 2
+    finally:
+        store.close()
+
+
+def test_non_sensitive_fact_cross_origin_transfer_is_never_gated(tmp_path, tmp_config):
+    steps = [
+        {"ordinal": 1, "target": "http://a.test/lookup", "objective": "find the project code"},
+        {"ordinal": 2, "target": "http://b.test/config", "objective": "enter the project code"},
+    ]
+    store, workflow_id, policy = _make_store(tmp_path, "ordinary fact transfer", steps)
+    runner = FakeWorkflowRunner([
+        _verified("found it", {"project_code": "AX-42"}),
+        _verified("entered it"),
+    ])
+    try:
+        final = asyncio.run(WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner).run())
+        assert final["status"] == "completed"
+        assert len(runner.calls) == 2
+    finally:
+        store.close()
+
+
+def test_cross_origin_sensitive_transfer_gate_can_be_disabled(tmp_path, tmp_config):
+    steps = [
+        {"ordinal": 1, "target": "http://a.test/lookup", "objective": "find the password"},
+        {"ordinal": 2, "target": "http://b.test/login", "objective": "enter the password"},
+    ]
+    policy = WorkflowPolicy(cross_origin_sensitive_transfer_requires_approval=False)
+    store, workflow_id, _ = _make_store(tmp_path, "transfer credential", steps, policy)
+    runner = FakeWorkflowRunner([
+        _verified("found it", {"password": "hunter2"}),
+        _verified("entered it"),
+    ])
+    try:
+        # No approval_callback, gate disabled — must still proceed rather than fail closed.
+        final = asyncio.run(WorkflowOrchestrator(tmp_config, store, workflow_id, policy, runner).run())
+        assert final["status"] == "completed"
+        assert len(runner.calls) == 2
+    finally:
+        store.close()
