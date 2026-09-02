@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Weekly Inventory Report</title></head>
+<body>
+  <h1>Weekly Inventory Report</h1>
+
+  <table>
+    <thead>
+      <tr><th>Item</th><th>Mon</th><th>Tue</th><th>Wed</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Widgets</td><td>12</td><td>47</td><td>9</td></tr>
+      <tr><td>Gadgets</td><td>3</td><td>81</td><td>15</td></tr>
+    </tbody>
+  </table>
+
+  <section>
+    <h2>Product B</h2>
+    <p>Current status: pending review.</p>
+    <button id="detailsB">Details</button>
+  </section>
+
+  <section>
+    <h2>Product A</h2>
+    <p>Current status: approved.</p>
+    <button id="detailsA">Details</button>
+  </section>
+
+  <script>
+    document.getElementById('detailsA').addEventListener('click', function () {
+      document.title = 'Product A Details Opened';
+    });
+    document.getElementById('detailsB').addEventListener('click', function () {
+      document.title = 'Product B Details Opened';
+    });
+  </script>
+</body>
+</html>

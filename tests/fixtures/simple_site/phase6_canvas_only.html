@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Color Picker Challenge</title></head>
+<body>
+  <h1>Color Picker Challenge</h1>
+  <p>Click the button matching the color of the square shown above it. Nothing on this page names the color in text.</p>
+
+  <canvas id="swatch" width="120" height="120"></canvas>
+
+  <div>
+    <button id="btn-red">Option 1</button>
+    <button id="btn-green">Option 2</button>
+    <button id="btn-blue">Option 3</button>
+  </div>
+
+  <script>
+    const ctx = document.getElementById('swatch').getContext('2d');
+    ctx.fillStyle = '#2e8b57'; // sea green — deliberately not named anywhere in text/DOM/alt/aria
+    ctx.fillRect(0, 0, 120, 120);
+
+    document.getElementById('btn-red').addEventListener('click', () => { document.title = 'Chose red'; });
+    document.getElementById('btn-green').addEventListener('click', () => { document.title = 'Chose green'; });
+    document.getElementById('btn-blue').addEventListener('click', () => { document.title = 'Chose blue'; });
+  </script>
+</body>
+</html>

@@ -1,0 +1,65 @@
+{
+  "gpu_sampling_available": true,
+  "sample_count": 26,
+  "items_run": 6,
+  "overall_elapsed_s": 12.75,
+  "per_item_elapsed_s": [
+    1.89,
+    1.51,
+    1.49,
+    0.73,
+    1.21,
+    1.67
+  ],
+  "per_item_results": [
+    {
+      "index": 0,
+      "page": "candidate_alpha.html",
+      "status": "completed",
+      "steps": 3,
+      "elapsed_s": 1.89
+    },
+    {
+      "index": 1,
+      "page": "candidate_beta.html",
+      "status": "completed",
+      "steps": 3,
+      "elapsed_s": 1.51
+    },
+    {
+      "index": 2,
+      "page": "candidate_gamma.html",
+      "status": "completed",
+      "steps": 3,
+      "elapsed_s": 1.49
+    },
+    {
+      "index": 3,
+      "page": "workflow_site_a.html",
+      "status": "completed",
+      "steps": 2,
+      "elapsed_s": 0.73
+    },
+    {
+      "index": 4,
+      "page": "workflow_site_b.html",
+      "status": "running",
+      "steps": 4,
+      "elapsed_s": 1.21
+    },
+    {
+      "index": 5,
+      "page": "workflow_site_c.html",
+      "status": "running",
+      "steps": 4,
+      "elapsed_s": 1.67
+    }
+  ],
+  "avg_gpu_util_pct": 47.3,
+  "gpu_idle_fraction": 0.192,
+  "gpu_saturated_fraction": 0.346,
+  "peak_gpu_mem_mib": 8589.0,
+  "gate5_parallel_agents": {
+    "build_condition_met": false
+  }
+}

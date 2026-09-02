@@ -1,0 +1,85 @@
+{
+  "cases": [
+    {
+      "name": "cheapest_vs_lowest_price",
+      "memory_written": "Observed fact: Item price is $42.00, the lowest of the three listed",
+      "query": "which candidate has the lowest cost",
+      "top_k_retrieved": [
+        "Current subgoal set to: visit the next candidate detail page",
+        "Observed fact: Item price is $42.00, the lowest of the three listed"
+      ],
+      "target_memory_retrieved": true
+    },
+    {
+      "name": "due_date_vs_deadline",
+      "memory_written": "Observed fact: Assignment due date is March 3",
+      "query": "what is the deadline for this assignment",
+      "top_k_retrieved": [
+        "Observed fact: Assignment due date is March 3",
+        "Current subgoal set to: visit the next candidate detail page"
+      ],
+      "target_memory_retrieved": true
+    },
+    {
+      "name": "login_vs_signin",
+      "memory_written": "Blocked: login page detected, manual authentication required",
+      "query": "is the user required to sign in",
+      "top_k_retrieved": [
+        "Blocked: login page detected, manual authentication required",
+        "Current subgoal set to: visit the next candidate detail page"
+      ],
+      "target_memory_retrieved": true
+    },
+    {
+      "name": "cancel_vs_abort",
+      "memory_written": "Step 4 failed: click target=cancel_button at http://example.test/checkout",
+      "query": "did the abort action fail on the checkout page",
+      "top_k_retrieved": [
+        "Current subgoal set to: visit the next candidate detail page",
+        "Step 4 failed: click target=cancel_button at http://example.test/checkout"
+      ],
+      "target_memory_retrieved": true
+    },
+    {
+      "name": "download_vs_save",
+      "memory_written": "Downloaded artifact report.pdf to ./runtime/downloads/report.pdf",
+      "query": "where was the file saved on disk",
+      "top_k_retrieved": [
+        "Current subgoal set to: visit the next candidate detail page"
+      ],
+      "target_memory_retrieved": false
+    },
+    {
+      "name": "rating_vs_review_score",
+      "memory_written": "Observed fact: rating = 4.6 out of 5 based on 1200 reviews",
+      "query": "what was the review score for this product",
+      "top_k_retrieved": [
+        "Current subgoal set to: visit the next candidate detail page"
+      ],
+      "target_memory_retrieved": false
+    },
+    {
+      "name": "stipend_vs_pay",
+      "memory_written": "Observed fact: stipend_usd_per_week = 900",
+      "query": "how much does this internship pay per week",
+      "top_k_retrieved": [
+        "Observed fact: stipend_usd_per_week = 900"
+      ],
+      "target_memory_retrieved": true
+    },
+    {
+      "name": "unrelated_negative_control",
+      "memory_written": "Observed fact: shipping_cost_usd = 5.00",
+      "query": "what color options are available",
+      "top_k_retrieved": [],
+      "target_memory_retrieved": false
+    }
+  ],
+  "paraphrase_cases_total": 7,
+  "paraphrase_cases_retrieved": 5,
+  "paraphrase_miss_rate": 0.286,
+  "negative_control_correctly_not_retrieved": true,
+  "gate3_embeddings": {
+    "build_condition_met": false
+  }
+}

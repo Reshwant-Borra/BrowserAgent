@@ -1,0 +1,53 @@
+{
+  "deterministic_observation_check": {
+    "table_tuesday_widgets_value_present": false,
+    "product_headings_present_in_text": true,
+    "details_button_count_in_observation": 2,
+    "region_disambiguation_requires_ordinal_reasoning": true,
+    "canvas_color_word_leaked_into_observation": false,
+    "canvas_task_rendered_text": "PAGE\ntitle: Color Picker Challenge\nurl: http://127.0.0.1:37336/phase6_canvas_only.html\n\nINTERACTIVE\n[1] button \"Option 1\"\n[2] button \"Option 2\"\n[3] button \"Option 3\"\n\nVISIBLE TEXT\n\"Color Picker Challenge\"\n\"Click the button matching the color of the square shown above it. Nothing on this page names the color in text.\""
+  },
+  "live_tasks": [
+    {
+      "status": "running",
+      "blocked_reason": null,
+      "steps": 6,
+      "result_text": "",
+      "final_title": "Product A Details Opened",
+      "final_url": "http://127.0.0.1:37336/phase6_table_regions.html",
+      "scenario": "gate1_region_disambiguation",
+      "correct": true
+    },
+    {
+      "status": "running",
+      "blocked_reason": null,
+      "steps": 5,
+      "result_text": "",
+      "final_title": "Weekly Inventory Report",
+      "final_url": "http://127.0.0.1:37336/phase6_table_regions.html",
+      "scenario": "gate1_table_value_extraction",
+      "correct": false
+    },
+    {
+      "status": "completed",
+      "blocked_reason": null,
+      "steps": 3,
+      "result_text": "The requested result is visible.",
+      "final_title": "Chose red",
+      "final_url": "http://127.0.0.1:37336/phase6_canvas_only.html",
+      "scenario": "gate2_canvas_only_color_match",
+      "chose": "Chose red"
+    }
+  ],
+  "gate1_richer_observation": {
+    "required_info_present_in_observation": false,
+    "live_region_task_correct": true,
+    "live_table_task_correct": false,
+    "build_condition_met": true
+  },
+  "gate2_vision_fallback": {
+    "canvas_content_absent_from_observation": true,
+    "live_task_status": "completed",
+    "live_task_chose": "Chose red"
+  }
+}
