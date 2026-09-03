@@ -475,6 +475,20 @@ class EvidenceLedger:
         wanted = set(keys)
         return not wanted or wanted <= self.known_figures()
 
+    def numeric_evidence(self, limit: int = 4) -> list[EvidenceRecord]:
+        """Evidence records carrying a figure — the operands a computation could be built
+        from, oldest first.
+
+        Used to tell two shortfalls apart when an answer states a figure no page shows. If
+        the task holds no figures at all, the missing number can only be got by reading a
+        page. If it already holds several, the number may instead be something that follows
+        *from* them, and saying "go and open a page" is then advice for a page that does not
+        exist. Which of the two it is stays the model's call; this only decides whether
+        computing is worth naming as an option.
+        """
+        return [record for record in self.records.values()
+                if record.valid and record.grounded and record.figures][:limit]
+
     def supports_span(self, span: str) -> bool:
         needle = normalize(span)
         if not needle:

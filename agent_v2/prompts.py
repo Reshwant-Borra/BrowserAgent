@@ -69,7 +69,10 @@ task will be rejected. kind is one of:
 RULES
 - FIRST, every turn: if CURRENT PAGE or FACTS already contain what the goal asks for,
   finish NOW with that content in "answer". Do not navigate, extract or scroll to re-find
-  something you can already read. Finishing early is correct, not lazy.
+  something you can already read. Finishing early is correct, not lazy. But a figure the
+  goal wants worked out — a difference, a total, a percentage, a ranking, a span of time —
+  is not on the page: the page holds the inputs and compute produces the answer. Having the
+  inputs in front of you means you are ready to compute, not that you are ready to finish.
 - Never invent a URL. open_url only with a URL taken from the page, one you are certain
   exists, or a search engine query URL. If you are looking for something, search for it.
 - Only report what you have actually SEEN on a page during this task. You may not know what

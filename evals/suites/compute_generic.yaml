@@ -1,0 +1,79 @@
+# Generic exact-computation suite.
+#
+# Exists to answer one question the grounding suite cannot: when an answer needs arithmetic,
+# does BrowserAgent reach for the deterministic operation, or does it do the sum in the
+# model's head? The grounding suite has a single arithmetic task, so a change there is
+# indistinguishable from that one task's quirks. These are deliberately worded *unlike*
+# `comparison-with-arithmetic` — different operations, different figures, different phrasings,
+# and none of them reuses its sentence shape — so a pass here means the compute path works
+# rather than that one benchmark sentence has been learned.
+#
+# The operands are deliberately all reachable from the start page. That is not to make the
+# tasks easy: it is to isolate the thing under test. A run that never finds the second figure
+# fails for want of an operand, which says nothing about whether it would have computed with
+# one, and an earlier draft of this suite measured mostly that.
+#
+# Every task states `requires_computation`, which fails any answer whose arithmetic was not
+# done by `agent_v2/compute.py`, however right the number happens to be.
+
+tasks:
+  - id: subtract-two-prices
+    capability: exact arithmetic
+    goal: >-
+      Using the figures shown on this listing page, work out the exact gap between what
+      'Sharp Objects' costs and what 'Soumission' costs.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+
+  - id: add-two-prices
+    capability: exact arithmetic
+    goal: >-
+      From the figures on this listing page, if someone took both 'The Requiem Red' and
+      'The Black Maria', what would the pair of them come to altogether?
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+
+  - id: cheapest-of-three
+    capability: selection by computed order
+    goal: >-
+      Three titles on this listing page — 'Olio', 'Starving Hearts' and 'Set Me Free'.
+      Establish which of the three carries the lowest figure, and say what that figure is.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+
+  - id: percentage-between-prices
+    capability: percentage arithmetic
+    goal: >-
+      Taking the figures shown on this listing page for 'Set Me Free' and for
+      'Rip it Up and Start Again', express the difference between them as a percentage
+      rather than as an absolute amount.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 26
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+
+  - id: years-between-documents
+    capability: date arithmetic
+    goal: >-
+      RFC 1945 and RFC 2068 each carry a publication date on rfc-editor.org. Establish both
+      dates, then work out how far apart in time the two documents are.
+    start_url: "https://www.rfc-editor.org/rfc/rfc1945.txt"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_visited_sources: 2
+      no_unsupported_claims: true

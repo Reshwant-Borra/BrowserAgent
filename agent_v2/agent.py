@@ -739,10 +739,21 @@ class BrowserAgentV2:
                   for figure in report.unsupported_figures[:2]]
         return items[:3]
 
-    @staticmethod
-    def _grounding_hint(report: GroundingReport) -> str:
+    def _grounding_hint(self, report: GroundingReport) -> str:
         """The challenge shown to the model. Names the exact defect rather than restating the
-        rule, because a small model corrects a specific fault and ignores a general one."""
+        rule, because a small model corrects a specific fault and ignores a general one.
+
+        It also has to name the right *repair*. Telling a model to go and open the page that
+        has the missing number is sound advice when the number is written down somewhere, and
+        useless when the number is a difference between two figures the task already holds —
+        no page shows that, so the instruction sends the run browsing for something it can
+        only work out. Measured on the arithmetic suites: a challenged run would open pages it
+        had already read rather than compute, and settle for doing the sum in its head.
+
+        So when the ledger already holds figures, computing is offered alongside reading.
+        Which one applies is left to the model — this makes the deterministic operation
+        available at the moment it is needed, rather than deciding for it.
+        """
         parts: list[str] = []
         if report.unsupported_figures:
             parts.append("no page you opened in this task shows "
@@ -758,12 +769,27 @@ class BrowserAgentV2:
                          + ", ".join(report.invalid_citations[:3]))
         if report.unsupported_claims:
             parts.append("; ".join(report.unsupported_claims[:2]))
+
+        operands = self.ledger.numeric_evidence() if report.unsupported_figures else []
+        if len(operands) >= 2:
+            ids = ", ".join(record.evidence_id for record in operands)
+            repair = (
+                "This turn you MUST either open_url the page that actually has the missing "
+                "piece and read it there, or — if that figure is meant to follow from figures "
+                "you already have — use compute, giving the operands and their evidence_ids "
+                f"({ids}). A number you worked out yourself is not grounded however right it "
+                "is; the same number returned by compute is. "
+            )
+        else:
+            repair = (
+                "This turn you MUST take a browser action — open_url the page that actually "
+                "has the missing piece and read it there. "
+            )
         return (
-            "Your answer was rejected: " + "; ".join(parts) + ". "
-            "This turn you MUST take a browser action — open_url the page that actually has "
-            "the missing piece and read it there. If you genuinely cannot get it, finish "
-            "instead with only what you did read, say plainly which part is missing, and cite "
-            "an evidence id from EVIDENCE for every fact you keep."
+            "Your answer was rejected: " + "; ".join(parts) + ". " + repair
+            + "If you genuinely cannot get it, finish instead with only what you did read, "
+            "say plainly which part is missing, and cite an evidence id from EVIDENCE for "
+            "every fact you keep."
         )
 
     def _ledger_path(self) -> Optional[Path]:
