@@ -181,3 +181,97 @@ def test_retrieval_stays_bounded_even_with_a_large_store(memory_store: MemorySto
     result = memory_store.retrieve("read a section of the site", top_k=6, token_budget=380)
     assert len(result.memories) <= 6
     assert result.considered > 6
+
+
+# ---- BrowserAgent's own bookkeeping, mistaken for knowledge about the world ---------------
+
+@pytest.mark.parametrize("text", [
+    # The row that actually did the damage: written after a grounding challenge, retrieved
+    # into a later task, and read there as "distrust what you can see".
+    "Prices on this shop may include unverified data; verify critical values on the actual page.",
+    "Some figures on the site are unsupported and need checking",
+    "The listing data is not verified, so re-open each product page",
+    "Evidence ids from the previous task can be reused here",
+    "Grounding requires opening every source before answering",
+])
+def test_the_agents_own_verification_is_not_a_fact_about_the_world(memory_store: MemoryStore, text):
+    assert classify_write(text)[0] == WritePolicy.SELF_REFERENTIAL
+    assert memory_store.save("site", text) is None
+
+
+@pytest.mark.parametrize("text", [
+    "The product page shows a different price than the category listing",
+    "This shop shows prices only after you have chosen a delivery country",
+    "Search results only load once you scroll to the bottom",
+])
+def test_a_real_lesson_about_checking_a_page_still_survives(memory_store: MemoryStore, text):
+    """The rule is about BrowserAgent's vocabulary, not about the idea of checking things —
+    a genuine "look at the other page" lesson shares none of that vocabulary."""
+    assert classify_write(text)[0] == WritePolicy.ACCEPT
+    assert memory_store.save("site", text) is not None
+
+
+# ---- the same narration, in the third person ----------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "User navigated to the catalogue and listed the titles it showed",
+    "User attempted to find book prices on a catalogue site",
+    "The user needed to compare book prices on a catalog page",
+    "User clicked through to the product page to read the price",
+])
+def test_narration_is_refused_whoever_it_names(memory_store: MemoryStore, text):
+    """The extractor writes "User navigated…" as readily as "I navigated…". Same sentence,
+    same uselessness later."""
+    assert classify_write(text)[0] == WritePolicy.EPISODIC
+    assert memory_store.save("user_fact", text) is None
+
+
+@pytest.mark.parametrize("text", [
+    "The user prefers nonstop flights",
+    "The user prefers window seats on long journeys",
+    "The user wants prices shown including tax",
+])
+def test_a_real_user_preference_is_not_narration(memory_store: MemoryStore, text):
+    assert classify_write(text)[0] == WritePolicy.ACCEPT
+    assert memory_store.save("user_fact", text) is not None
+
+
+# ---- which page of a listing something sat on ---------------------------------------------
+
+@pytest.mark.parametrize("text", [
+    "Book titles are displayed on the second page of the catalogue",
+    "The remaining products appear on the third page of the listing",
+    "The contact details are on the last page of the results",
+])
+def test_which_page_of_a_listing_something_was_on_is_transient(memory_store: MemoryStore, text):
+    assert classify_write(text)[0] == WritePolicy.TRANSIENT
+    assert memory_store.save("site", text) is None
+
+
+def test_navigational_knowledge_about_paging_survives(memory_store: MemoryStore):
+    """"Results continue on the next page" is how the site works; "the titles are on the
+    second page" is what one listing looked like once."""
+    text = "Results continue on the next page of the listing"
+    assert classify_write(text)[0] == WritePolicy.ACCEPT
+    assert memory_store.save("site", text) is not None
+
+
+# ---- the policy applies on the way out as well as on the way in ---------------------------
+
+def test_rows_the_current_policy_rejects_are_not_retrieved(memory_store: MemoryStore):
+    """A store outlives the rules that filled it. A row admitted under an older policy is
+    exactly as harmful as one admitted today, so retrieval re-checks rather than trusting
+    that whatever is in the table was once allowed."""
+    good = "Search results only load once you scroll to the bottom"
+    bad = "Prices here may include unverified data; verify critical values on the actual page."
+    memory_store.save("site", good, domain="shop.example")
+    # Written straight past the write filter, standing in for a row from an older revision.
+    memory_store.conn.execute(
+        "INSERT INTO memories (type, text, domain, importance, created_at, updated_at)"
+        " VALUES ('site', ?, 'shop.example', 0.9, '2026-01-01T00:00:00+00:00',"
+        " '2026-01-01T00:00:00+00:00')", (bad,))
+    memory_store.conn.commit()
+
+    texts = [m.text for m in memory_store.retrieve("prices on the shop", domain="shop.example").memories]
+    assert good in texts
+    assert bad not in texts

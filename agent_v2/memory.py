@@ -78,21 +78,51 @@ _TRANSIENT_PATTERNS = [
     (re.compile(r"\b(first|second|third|fourth|fifth|top|last|next)\s+"
                 r"(row|result|item|entry|option|candidate|listing|link|match|hit|product)s?\b",
                 re.I), "where something sat in one listing"),
+    # The same mistake one level up: which *page* of a paginated listing something appeared
+    # on. "Book titles are displayed on the second page" is true of the catalogue this run
+    # happened to walk and of no other, and read back later it sends the next task paging
+    # around looking for content that is on the page in front of it. `next` and `top` are
+    # deliberately not here — "results continue on the next page" is real navigational
+    # knowledge, where "on the second page" is a snapshot of one listing.
+    (re.compile(r"\b(first|second|third|fourth|fifth|last)\s+page\b", re.I),
+     "which page of one listing something appeared on"),
+]
+
+#: BrowserAgent's own bookkeeping, mistaken by the extractor for a fact about the world.
+#: When a claim is challenged for lacking evidence, the model is told so — and then writes
+#: that down as though the *site* were the unreliable party: "prices here may include
+#: unverified data; verify critical values on the actual page". Nothing about the site is
+#: unverified; a claim of the model's was. Retrieved into a later task, this reads as an
+#: instruction to distrust what it can see, and the run spends its budget re-opening pages it
+#: has already read instead of answering. The vocabulary matched here is BrowserAgent's own —
+#: a genuine site lesson ("the listing price differs from the product page price") shares none
+#: of it.
+_SELF_REFERENTIAL_PATTERNS = [
+    re.compile(r"\bun(verified|supported)\b", re.I),
+    re.compile(r"\bnot\s+(verified|supported|grounded)\b", re.I),
+    re.compile(r"\bevidence\s+(id|ids|record|records|ledger)\b", re.I),
+    re.compile(r"\bgrounding\b", re.I),
+    re.compile(r"\bverify\s+(critical|key|important)\s+(value|figure|number|data)s?\b", re.I),
 ]
 
 #: The run narrating itself. "I clicked Search and found seven results" is a description of
 #: one episode; nothing in it will help a different task weeks from now. The `(?:\w+\s+){0,2}`
 #: is there because the extractor overwhelmingly writes "I successfully retrieved…" rather
 #: than "I retrieved…", and the adverb was enough to slip the whole class past the filter.
+#: The extractor narrates in the third person about as often as the first — "User navigated to
+#: the second page" is the same sentence as "I navigated to the second page" and just as
+#: useless later, so the subject group has to cover both. The verbs are what discriminate: a
+#: real preference ("the user prefers nonstop flights") uses none of them.
+_NARRATOR = r"(?:i|we|the user|user)"
 _EPISODIC_PATTERNS = [
-    re.compile(r"\b(i|we)\s+(?:\w+\s+){0,2}(found|clicked|opened|navigated|searched|typed|"
-               r"selected|scrolled|extracted|visited|checked|read|saw|used|located|"
+    re.compile(rf"\b{_NARRATOR}\s+(?:\w+\s+){{0,2}}(found|clicked|opened|navigated|searched|"
+               r"typed|selected|scrolled|extracted|visited|checked|read|saw|used|located|"
                r"discovered|confirmed|identified|retrieved|completed|reported|quoted|"
-               r"verified|compared|obtained)\b", re.I),
+               r"verified|compared|obtained|attempted|tried)\b", re.I),
     # Capability and intent narration: "I can compare version numbers", "I need to open both
     # download pages". True of every task and therefore informative about none.
-    re.compile(r"\b(i|we)\s+(can|could|will|should|must|need to|needed to|am able|are able|"
-               r"was able|were able|have to|had to)\b", re.I),
+    re.compile(rf"\b{_NARRATOR}\s+(can|could|will|should|must|need to|needed to|am able|"
+               r"are able|was able|were able|have to|had to)\b", re.I),
     re.compile(r"\bthe (search|page|site|query|click|task)\s+(returned|showed|gave|listed|"
                r"produced|yielded)\b", re.I),
     re.compile(r"\b(in|for|during|after)\s+(this|the current|the last)\s+task\b", re.I),
@@ -110,6 +140,7 @@ class WritePolicy:
     EPISODIC = "episodic"
     LOW_INFORMATION = "low_information"
     GOAL_ECHO = "goal_echo"
+    SELF_REFERENTIAL = "self_referential"
 
 
 def classify_write(text: str, *, type: str = "", goal: str = "") -> tuple[str, str]:
@@ -132,6 +163,10 @@ def classify_write(text: str, *, type: str = "", goal: str = "") -> tuple[str, s
     for pattern, why in _TRANSIENT_PATTERNS:
         if pattern.search(text):
             return WritePolicy.TRANSIENT, f"records {why}"
+    for pattern in _SELF_REFERENTIAL_PATTERNS:
+        if pattern.search(text):
+            return (WritePolicy.SELF_REFERENTIAL,
+                    "describes BrowserAgent's own verification, not the world")
     for pattern in _EPISODIC_PATTERNS:
         if pattern.search(text):
             return WritePolicy.EPISODIC, "describes what happened in one task"
@@ -379,6 +414,16 @@ class MemoryStore:
         selected: list[Memory] = []
         used = 0
         for _score, row in scored:
+            # The admission policy is the policy, not a note about the day a row was written.
+            # A store outlives the rules that filled it — these suites built one across
+            # several revisions of `classify_write` — and a row the current policy rejects is
+            # exactly as harmful whether it was written yesterday or last month. Checking on
+            # the way out costs a few regexes over the handful of rows that scored well, and
+            # it makes the store self-healing rather than permanently marked by whatever slipped
+            # through first.
+            verdict, _reason = classify_write(row["text"], type=row["type"])
+            if verdict != WritePolicy.ACCEPT:
+                continue
             memory = Memory(
                 id=row["id"], type=row["type"], text=row["text"], domain=row["domain"],
                 importance=row["importance"], created_at=row["created_at"], use_count=row["use_count"],
