@@ -88,6 +88,13 @@ class PlaywrightBackend:
         self._browser: Optional[Browser] = None  # only set in cdp_attach mode
         self.context = None
         self.page: Optional[Page] = None
+        # The page `start()` had to create because no existing tab could serve the target,
+        # or None when an existing tab was reused. Only this object knows the difference:
+        # by the time anything else looks at the browser, a tab created here is
+        # indistinguishable from one the user opened a moment earlier. Recording it is what
+        # lets a caller tell "the user's tab" from "the tab that exists because of this task"
+        # without resorting to URL guesswork. Nothing in the V1 loop reads it.
+        self.created_page: Optional[Page] = None
 
     async def start(self) -> None:
         if self.mode == "cdp_attach":
@@ -106,7 +113,11 @@ class PlaywrightBackend:
             accept_downloads=True,
             downloads_path=str(downloads_dir),
         )
-        self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+        if self.context.pages:
+            self.page = self.context.pages[0]
+        else:
+            self.page = await self.context.new_page()
+            self.created_page = self.page
         self.page.set_default_timeout(self.action_timeout_ms)
 
     async def _start_cdp_attach(self) -> None:
@@ -149,6 +160,7 @@ class PlaywrightBackend:
             # rather than launching a separate browser.
             context = self._browser.contexts[0] if self._browser.contexts else await self._browser.new_context()
             page = await context.new_page()
+            self.created_page = page
         self.page = page
         self.context = self.page.context
         self.page.set_default_timeout(self.action_timeout_ms)

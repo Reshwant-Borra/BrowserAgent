@@ -65,10 +65,23 @@ class BrowserSession:
     # ---- tabs -----------------------------------------------------------------------
 
     async def adopt_existing_tabs(self) -> None:
-        """Snapshot ownership once, right after attaching. Everything open now belongs to
-        the user and is off-limits for closing for the rest of the run."""
+        """Snapshot ownership once, right after attaching. Everything open now belongs to the
+        user and is off-limits for closing for the rest of the run — with one exception that
+        is the whole point of this method being careful.
+
+        Attaching is not always passive. When a task knows the page it wants and no open tab
+        is on it, `PlaywrightBackend.start()` creates that tab *before* anyone gets here, so
+        by the time this snapshot is taken the tab is already open and looks exactly like a
+        tab the user had open all along. Adopting it as the user's is how one tab per task
+        leaked into the profile until the browser fell over.
+
+        The backend records what it created, so ownership is read off that fact rather than
+        inferred from the page's URL or its position in the tab list.
+        """
+        created = getattr(self.backend, "created_page", None)
         for page in self._live_pages():
-            self._register(page, owner="user")
+            self._register(page, owner="agent" if created is not None and page is created
+                           else "user")
         self._baseline_taken = True
 
     async def sync_tabs(self) -> list[TabInfo]:
@@ -117,6 +130,12 @@ class BrowserSession:
             if owner != "agent":
                 continue
             page = self._pages.get(tab_id)
+            if page is not None and not page.is_closed() and len(self._live_pages()) <= 1:
+                # Chromium exits when its last tab closes. Tidying up is never worth taking
+                # the user's persistent browser down with it, so the final tab stays open —
+                # it keeps its agent ownership, so a later call still reclaims it once the
+                # user has a tab of their own again.
+                continue
             self._pages.pop(tab_id, None)
             self._owner.pop(tab_id, None)
             if page is None or page.is_closed():
