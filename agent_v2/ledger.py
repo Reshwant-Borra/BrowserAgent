@@ -282,8 +282,15 @@ def extract_bindings(obs) -> list[tuple[str, set[str]]]:
                     out.append((name, figures - numeric_keys(name)))
 
         elif len(item) <= LABEL_MAX_CHARS and index + 1 < len(items):
-            following = numeric_keys(items[index + 1])
-            if following and entity_terms(item):
+            # Both halves have to look the part. A label is short, and so is the value under
+            # it; a paragraph followed by a line carrying numbers is neither, and pairing
+            # those would scatter bindings across ordinary prose. Plain-text documents — an
+            # RFC, a changelog — are one long <pre> emitted a line at a time, so without this
+            # they would bind almost every line to the next one's figures.
+            following_item = items[index + 1]
+            following = numeric_keys(following_item)
+            if (following and entity_terms(item)
+                    and len(following_item) <= LABEL_MAX_CHARS):
                 out.append((item, following))
 
     return [(label, figures) for label, figures in out if figures]

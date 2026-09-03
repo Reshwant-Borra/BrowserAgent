@@ -37,7 +37,7 @@ tasks:
       min_evidence: 2
       no_unsupported_claims: true
       # Sharp Objects 47.82, Soumission 50.10. Either sign is a correct reading of "gap".
-      answer_matches: "2\.28"
+      answer_matches: '2\.28'
 
   - id: add-two-prices
     capability: exact arithmetic
@@ -51,9 +51,9 @@ tasks:
       min_evidence: 2
       no_unsupported_claims: true
       # The Requiem Red 22.65 + The Black Maria 52.15.
-      answer_matches: "74\.80|74\.8\b"
+      answer_matches: '74\.80|74\.8\b'
       # The failure this suite was blind to: both books read as 22.65.
-      answer_not_matches: "45\.30|45\.3\b"
+      answer_not_matches: '45\.30|45\.3\b'
 
   - id: cheapest-of-three
     capability: selection by computed order
@@ -67,8 +67,8 @@ tasks:
       min_evidence: 2
       no_unsupported_claims: true
       # Olio 23.88, Starving Hearts 13.99, Set Me Free 17.46.
-      answer_matches: "13\.99"
-      answer_not_matches: "(23\.88|17\.46)[^0-9]*$"
+      answer_matches: '13\.99'
+      answer_not_matches: '(23\.88|17\.46)[^0-9]*$'
 
   - id: percentage-between-prices
     capability: percentage arithmetic
@@ -84,7 +84,7 @@ tasks:
       no_unsupported_claims: true
       # Set Me Free 17.46, Rip it Up and Start Again 35.02. Which is the base is genuinely
       # open in the wording, so both readings of "the difference as a percentage" count.
-      answer_matches: "100\.5|100\.6|50\.1|50\.2"
+      answer_matches: '100\.5|100\.6|50\.1|50\.2'
 
   - id: years-between-documents
     capability: date arithmetic
@@ -98,6 +98,6 @@ tasks:
       min_visited_sources: 2
       no_unsupported_claims: true
       # RFC 1945 is May 1996 and RFC 2068 is January 1997: eight months apart.
-      answer_matches: "8 months|eight months"
+      answer_matches: '8 months|eight months'
       # The reading the runs actually produced, by adding a year that is not there.
-      answer_not_matches: "1 year and 8|1 year, 8|20 months"
+      answer_not_matches: '1 year and 8|1 year, 8|20 months'

@@ -348,3 +348,40 @@ async def test_detach_leaves_the_user_browser_running(user_browser, fixture_site
     assert not user_page.is_closed()
     assert user_page.url.endswith("index.html")
     assert cdp_tab_count() >= 1
+
+
+# --- the failure at the scale it was actually met ----------------------------------------
+
+async def test_thirty_sequential_tasks_leave_the_browser_exactly_as_they_found_it(
+        user_browser, fixture_site_url):
+    """The stress the leak was found by, at the length that made it obvious.
+
+    Six tasks is enough to show a drift; it is not enough to show that the drift is zero. The
+    reported failure only became visible over a long unattended run — ninety tasks against one
+    persistent profile left several hundred tabs and as many renderer processes behind, and
+    the browser fell over partway through the suite. So the invariant is asserted after every
+    single task rather than only at the end: a count that returns to baseline having wandered
+    in between is a different bug that happens to net out.
+
+    Every count goes through /json/list, the way a human counts by looking at the tab strip.
+    """
+    context, user_page = await _open_user_tab(user_browser, f"{fixture_site_url}/index.html")
+    second = await context.new_page()
+    await second.goto(f"{fixture_site_url}/docs.html")
+    baseline = cdp_tab_count()
+    user_urls = {user_page.url, second.url}
+
+    counts: list[int] = []
+    for index in range(30):
+        # A mix of the two shapes that decide ownership: a target that has to be opened, and
+        # one of the user's own tabs already sitting on the target.
+        target = (f"{fixture_site_url}/ground_{'abc'[index % 3]}.html" if index % 5
+                  else f"{fixture_site_url}/index.html")
+        await _run_task(explicit_target_url=target)
+        counts.append(cdp_tab_count())
+
+    assert counts == [baseline] * 30, f"tab count drifted: {counts}"
+    assert not user_page.is_closed(), "the user's first tab was taken"
+    assert not second.is_closed(), "the user's second tab was taken"
+    assert {user_page.url, second.url} == user_urls, "a user tab was navigated away"
+    assert user_browser.is_connected(), "the user's browser did not survive"
