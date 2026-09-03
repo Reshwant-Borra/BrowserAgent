@@ -223,6 +223,16 @@ def check_claim(claim: Claim, ledger: EvidenceLedger, *, goal_figures: set[str],
     figures = {k for token in significant_figures(claim.text) for k in figure_keys(token)}
     figures -= goal_figures
 
+    # Checked before anything else, and for every kind that asserts something about the world,
+    # because the citation test below cannot catch this one. A claim that gives Book B the
+    # price of Book A cites Book A's evidence quite happily — the figure really is in the
+    # record it points at, so provenance holds and attribution is still wrong. Only the page's
+    # own layout can settle which name the number sat next to.
+    if kind != ClaimKind.META:
+        wrong = ledger.misattribution(claim.text)
+        if wrong:
+            return ClaimVerdict(claim, False, wrong, records), invalid
+
     if kind == ClaimKind.META:
         # "I checked three pages" is not about the world, it is about the run — and the run is
         # something BrowserAgent knows exactly.

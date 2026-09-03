@@ -673,9 +673,43 @@ class BrowserAgentV2:
                             decision.state_updates.pending, self._spill_path(state),
                             verify=verify)
 
+    def _operand_mismatch(self, decision: Decision) -> str:
+        """Is the model computing with the figure it says it is?
+
+        `labels` already exists and already means "what this operand is" — it is what makes a
+        result read "Sharp Objects (47.82) is less than Soumission (50.10)" rather than naming
+        two bare numbers. That makes it the operand contract with no new schema: when the model
+        names an operand, BrowserAgent checks the name against what the page actually put that
+        figure next to, and refuses the computation if they disagree.
+
+        Unlabelled operands are not refused. Most computations name nothing, the ledger cannot
+        contradict a name it was not given, and demanding labels would turn a missing field
+        into a failed task rather than a checked one.
+        """
+        for index, operand in enumerate(decision.operands):
+            label = decision.labels[index] if index < len(decision.labels) else ""
+            if not label.strip():
+                continue
+            wrong = self.ledger.misattribution(f"{label} {operand}")
+            if wrong:
+                return (f"operand {index + 1} does not match its label: {wrong}. "
+                        "Read the figure you actually need, or correct the operand.")
+        return ""
+
     def _compute(self, state: TaskState, decision: Decision,
                  ref: ObservationRef) -> tuple[ActionOutcome, Verification]:
         """Run one deterministic operation and file its result as derived evidence."""
+        mismatch = self._operand_mismatch(decision)
+        if mismatch:
+            # The arithmetic would have been perfect and the answer still wrong. Refusing here
+            # rather than filing an ungrounded record keeps the failure in front of the model
+            # while it can still act on it: it gets the contradiction as the error text and can
+            # go and read the figure it actually needs (V2 hardening §12, condition 4).
+            state.metrics.compute_errors += 1
+            self._log(state, {"event": "compute", "step": state.step, "ok": False,
+                              "operation": decision.operation, "error": mismatch})
+            return ActionOutcome(False, mismatch), Verification(False, mismatch)
+
         result = run_compute(decision.operation or "", decision.operands, decision.labels)
         state.metrics.computations += 1
         if not result.ok:

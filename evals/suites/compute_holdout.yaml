@@ -1,0 +1,104 @@
+# Paraphrased arithmetic holdout.
+#
+# `compute_generic.yaml` measures whether the compute path works. This measures whether it
+# works on wordings nothing was tuned against: different operations, different operands,
+# different sentence shapes, and — deliberately — different *entities* from the ones the
+# development suite names, so a run cannot succeed by having learned which book is which.
+#
+# The categories here are the ones V2's arithmetic was weakest at, plus the two the
+# development suite never exercised at all: picking the largest of several, and ordering a
+# set by a numeric attribute.
+#
+# Same two gates as the development suite and for the same reason. `answer_matches` asks
+# whether the number is right; `outcome` asks whether the run was honest about how it got
+# there. A task that safely reports it could not find a figure fails the first and passes the
+# second, which is the outcome ranking working as intended — a grounded wrong number is the
+# thing being hunted, not an unfinished task.
+
+tasks:
+  - id: gap-between-two-other-titles
+    capability: exact arithmetic
+    goal: >-
+      This listing page prices 'The Black Maria' and 'Set Me Free'. How much more does the
+      dearer of the two cost than the cheaper one?
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+      # 52.15 - 17.46 = 34.69
+      answer_matches: "34\\.69"
+
+  - id: combined-cost-of-a-different-pair
+    capability: exact arithmetic
+    goal: >-
+      Suppose a reader picked up 'Soumission' and 'Olio' from this listing. Add the two
+      figures shown for them and report the combined outlay.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+      # 50.10 + 23.88 = 73.98
+      answer_matches: "73\\.98"
+
+  - id: dearest-of-three
+    capability: selection by computed order
+    goal: >-
+      Of 'Sharp Objects', 'The Requiem Red' and 'Starving Hearts' as priced on this listing
+      page, identify the one carrying the largest figure and state that figure.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+      # Sharp Objects 47.82, The Requiem Red 22.65, Starving Hearts 13.99.
+      answer_matches: "47\\.82"
+      answer_not_matches: "(22\\.65|13\\.99)[^0-9]*$"
+
+  - id: order-three-by-price
+    capability: ordering by a numeric attribute
+    goal: >-
+      Put these three from this listing page in order from cheapest to dearest, giving each
+      one's figure: 'Olio', 'Soumission' and 'The Requiem Red'.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 26
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+      # The Requiem Red 22.65 < Olio 23.88 < Soumission 50.10, and the answer has to carry
+      # all three figures for the ordering to mean anything.
+      answer_matches: "22\\.65[\\s\\S]*23\\.88[\\s\\S]*50\\.1"
+
+  - id: share-one-price-is-of-another
+    capability: percentage arithmetic
+    goal: >-
+      Using this listing page, work out what proportion of the 'Sharp Objects' figure the
+      'The Requiem Red' figure represents, given as a percentage.
+    start_url: "https://books.toscrape.com/"
+    max_steps: 26
+    expect:
+      requires_computation: true
+      min_evidence: 2
+      no_unsupported_claims: true
+      # 22.65 / 47.82 = 47.36%
+      answer_matches: "47\\.3|47\\.4"
+
+  - id: which-document-came-first
+    capability: date arithmetic
+    goal: >-
+      Two documents on rfc-editor.org: RFC 1945 and RFC 2068. Read the publication date on
+      each and say which one appeared earlier, and by what interval.
+    start_url: "https://www.rfc-editor.org/rfc/rfc2068.txt"
+    max_steps: 24
+    expect:
+      requires_computation: true
+      min_visited_sources: 2
+      no_unsupported_claims: true
+      # RFC 1945 (May 1996) precedes RFC 2068 (January 1997) by eight months.
+      answer_matches: "1945"
+      answer_not_matches: "2068 (appeared|came|was published) (first|earlier)"

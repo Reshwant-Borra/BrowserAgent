@@ -212,6 +212,83 @@ def distinctive_terms(text: str) -> set[str]:
     return out
 
 
+#: Longest a text item may be and still read as a *label* for the value in the next item.
+#: "Released" / "2024-01-05" is a label and its value; a paragraph that happens to be followed
+#: by a number is not, and pairing those would attach figures to arbitrary prose.
+LABEL_MAX_CHARS = 80
+#: Ceiling on bindings kept per task. Bindings are small, but a long crawl over listing pages
+#: would otherwise grow one per card per observation without limit.
+MAX_BINDINGS = 600
+
+
+def entity_terms(label: str) -> frozenset[str]:
+    """The tokens that identify a name.
+
+    Proper nouns and coined tokens first, because those are what make "The Black Maria"
+    different from "The Requiem Red". A label with none of them — "Released", "Rating" — is
+    still a perfectly good label, so it falls back to its content words rather than being
+    dropped for lacking a capital letter in the right place.
+    """
+    names = distinctive_terms(label)
+    return frozenset(names or content_terms(label))
+
+
+def extract_bindings(obs) -> list[tuple[str, set[str]]]:
+    """Which name each figure on this page actually belongs to.
+
+    Three readings of the observer's text items, each corresponding to a way real pages tie a
+    name to a number. None of them knows about any particular site:
+
+    1. **A row.** The observer already emits a `<tr>` as one "cell | cell" line precisely
+       because a table read as loose cells is a table with its rows shuffled. The leading cell
+       names the thing; the rest are its values.
+    2. **A card.** A listing item carries its own link, so an element's accessible name
+       appearing inside a text item that also carries figures marks that item as that entity's
+       card — which is exactly the `<li>` a product listing is built from.
+    3. **A label and its value.** A short item with no figures, immediately followed by one
+       with figures, is a `<dt>`/`<dd>` pair or a heading above its number.
+
+    Over-reading is deliberately the safe direction here: a binding only ever *widens* the set
+    of figures a name is allowed to carry, so a spurious one costs a missed detection and never
+    a false accusation. Under-reading costs nothing at all — a name with no binding is checked
+    exactly as it was before.
+    """
+    items = [" ".join(str(t or "").split()) for t in (getattr(obs, "visible_text", []) or [])]
+    names = sorted(
+        {" ".join(str(getattr(el, "name", "") or "").split())
+         for el in (getattr(obs, "elements", []) or [])},
+        key=len, reverse=True,
+    )
+    names = [n for n in names if len(n) >= 3 and entity_terms(n)]
+
+    out: list[tuple[str, set[str]]] = []
+    for index, item in enumerate(items):
+        if not item:
+            continue
+        figures = numeric_keys(item)
+
+        if " | " in item:
+            head, _, rest = item.partition(" | ")
+            head = head.strip()
+            if head and not numeric_keys(head) and entity_terms(head):
+                out.append((head, numeric_keys(rest)))
+                continue
+
+        if figures:
+            normalized_item = normalize(item)
+            for name in names:
+                needle = normalize(name)
+                if needle and needle in normalized_item:
+                    out.append((name, figures - numeric_keys(name)))
+
+        elif len(item) <= LABEL_MAX_CHARS and index + 1 < len(items):
+            following = numeric_keys(items[index + 1])
+            if following and entity_terms(item):
+                out.append((item, following))
+
+    return [(label, figures) for label, figures in out if figures]
+
+
 def canonical_url(url: str) -> str:
     """A conservative identity for a web resource.
 
@@ -294,6 +371,34 @@ class ObservationRef:
 
 
 @dataclass
+class FactBinding:
+    """One name seen *next to* one set of figures, in one real observation.
+
+    This is the smallest thing that distinguishes "Book A costs £22.65" from "Book B costs
+    £22.65" — and a ledger that records only "the page showed 22.65" cannot tell them apart.
+    Both sentences pass a containment check against a page carrying that price, which is how a
+    genuinely observed figure ends up attached to the wrong product and is then certified as
+    grounded.
+
+    Nothing here is declared by the model. A binding exists only because the page put the name
+    and the number in the same place, and "the same place" is read off structure the observer
+    already produces: a table row, a card, a label and the value beneath it.
+    """
+
+    entity: str
+    #: Normalized tokens that identify the entity — what a proposed sentence must contain for
+    #: this binding to be about it.
+    terms: frozenset[str]
+    figures: set[str]
+    observation_id: str = ""
+    resource_id: str = ""
+
+    @property
+    def key(self) -> str:
+        return " ".join(sorted(self.terms))
+
+
+@dataclass
 class EvidenceRecord:
     """One checkable thing, bound to where it came from.
 
@@ -372,6 +477,9 @@ class EvidenceLedger:
         #: Every word this task has actually seen, across all pages. Maintained incrementally
         #: because it is consulted on every proposed fact.
         self._known_terms: set[str] = set()
+        #: Which name each figure was actually printed next to. See `FactBinding`.
+        self.bindings: list[FactBinding] = []
+        self._binding_keys: set[tuple[str, str]] = set()
         #: The user's own wording. A name the user supplied is not an invention.
         self.goal = ""
         #: Sources the task set out to use but has not observed. Populated by the loop from
@@ -412,7 +520,8 @@ class EvidenceLedger:
         if obs.title and not resource.title:
             resource.title = obs.title
         state_hash = str(getattr(obs, "state_hash", "") or "")[:16] or f"step{step}"
-        if state_hash not in resource.seen_hashes:
+        first_sighting = state_hash not in resource.seen_hashes
+        if first_sighting:
             resource.seen_hashes.add(state_hash)
             resource.figures |= figures
             if len(resource.text) < RESOURCE_TEXT_CHARS and self._text_chars < LEDGER_TEXT_CHARS:
@@ -433,7 +542,26 @@ class EvidenceLedger:
         self.observations[observation_id] = ref
         resource.observation_ids.append(observation_id)
         del resource.observation_ids[:-40]
+        if first_sighting:
+            self._note_bindings(obs, ref)
         return ref
+
+    def _note_bindings(self, obs, ref: ObservationRef) -> None:
+        """File what this page put next to what. Deduplicated on (entity, figure) so
+        re-reading a listing does not grow the list, and bounded outright."""
+        for label, figures in extract_bindings(obs):
+            terms = entity_terms(label)
+            if not terms:
+                continue
+            key = " ".join(sorted(terms))
+            fresh = {f for f in figures if (key, f) not in self._binding_keys}
+            if not fresh or len(self.bindings) >= MAX_BINDINGS:
+                continue
+            self._binding_keys |= {(key, f) for f in fresh}
+            self.bindings.append(FactBinding(
+                entity=label[:120], terms=terms, figures=set(fresh),
+                observation_id=ref.observation_id, resource_id=ref.resource_id,
+            ))
 
     def observed(self, url: str) -> bool:
         """Did this task actually load this URL (or something it redirected to)?"""
@@ -489,6 +617,75 @@ class EvidenceLedger:
         return [record for record in self.records.values()
                 if record.valid and record.grounded and record.figures][:limit]
 
+    # ---- semantic identity -----------------------------------------------------------
+
+    def bindings_for(self, text: str) -> list[FactBinding]:
+        """The bindings this sentence is about: every entity all of whose identifying terms
+        the sentence contains."""
+        terms = content_terms(text) | {t for t in normalize(text).split()}
+        return [b for b in self.bindings if b.terms and b.terms <= terms]
+
+    def figures_of(self, entity: str) -> set[str]:
+        """Every figure this task saw printed next to that name."""
+        terms = entity_terms(entity)
+        if not terms:
+            return set()
+        out: set[str] = set()
+        for binding in self.bindings:
+            if binding.terms == terms:
+                out |= binding.figures
+        return out
+
+    def misattribution(self, text: str) -> str:
+        """Does this sentence give one entity a figure that belongs to a different one?
+
+        The check that the old containment test could not make. "The Black Maria price is
+        £22.65" contains a figure the page really showed and a name the task really saw, so
+        every containment check passes — and the sentence is false, because £22.65 is the
+        price of the book on the *other* card. Certified as observed evidence, it then vouches
+        for the final claim that cites it, and the answer comes out grounded and wrong.
+
+        Deliberately narrow, because a false accusation here would suppress true findings:
+
+        - The sentence must be about exactly one entity this task has bindings for. A summary
+          naming several ("A is £22.65 and B is £52.15") is left alone — attribution inside it
+          is genuinely ambiguous and §8 says do not guess.
+        - None of the figures it states may be one that entity was ever seen with. A page that
+          shows a list price and a sale price binds both, so quoting either is fine.
+        - Every figure it states must be one *another* entity was seen with. A figure nobody
+          was seen with is not a misattribution — it is a number read from somewhere this
+          reading did not reach, which the existing containment checks already judge.
+
+        Duplicate labels are the same abstention: two entities really called "Standard" share
+        an identity here, so their figures union and neither is contradicted.
+        """
+        claimed = {key for token in significant_figures(text) for key in figure_keys(token)}
+        if not claimed:
+            return ""
+        matched = self.bindings_for(text)
+        if not matched or len({b.key for b in matched}) != 1:
+            return ""
+        entity = matched[0]
+        allowed: set[str] = set()
+        for binding in self.bindings:
+            if binding.key == entity.key:
+                allowed |= binding.figures
+        if claimed & allowed:
+            return ""
+        owners: dict[str, str] = {}
+        for binding in self.bindings:
+            if binding.key == entity.key:
+                continue
+            for figure in binding.figures:
+                owners.setdefault(figure, binding.entity)
+        stolen = sorted({f for f in claimed if f in owners})
+        if not stolen or len(stolen) < len(claimed):
+            return ""
+        owner = owners[stolen[0]]
+        shown = ", ".join(sorted(allowed)[:3]) or "no figure"
+        return (f"{stolen[0]} is what this task saw next to \"{owner[:60]}\", not next to "
+                f"\"{entity.entity[:60]}\" (which showed {shown})")
+
     def supports_span(self, span: str) -> bool:
         needle = normalize(span)
         if not needle:
@@ -510,6 +707,11 @@ class EvidenceLedger:
                    if not (figure_keys(token) & ref.figures)]
         if missing:
             return False, f"figure(s) {', '.join(sorted(set(missing))[:4])} are not on this page"
+        # A figure being *on* the page is not the same as it belonging to the thing this
+        # sentence attaches it to, and that gap is where a grounded wrong answer comes from.
+        wrong = self.misattribution(text)
+        if wrong:
+            return False, wrong
         for span in quoted_spans(text):
             if len(normalize(span).split()) >= 3 and normalize(span) not in ref.text:
                 return False, f'the quoted "{span[:48]}" is not on this page'
